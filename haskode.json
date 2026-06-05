@@ -1,0 +1,12 @@
+{
+  "cfgProvider": {
+    "pcProvider": "openai",
+    "pcModel": "gpt-5.5",
+    "pcBaseUrl": "https://api.openai.com",
+    "pcApiKey": ""
+  },
+  "cfgMaxTokens": 4096,
+  "cfgVerbose": false,
+  "cfgWorkingDir": "."
+}
+
