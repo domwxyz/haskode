@@ -89,7 +89,7 @@ extractArgText key tc = case tcArgs tc of
 -- | Allow all read-only tools.
 allowReads :: Rule
 allowReads tc
-  | tcName tc `elem` ["read_file", "list_files", "search", "glob"] = Just Allow
+  | tcName tc `elem` ["read_file", "list_files", "search", "glob", "preview_patch"] = Just Allow
   | otherwise = Nothing
 
 -- | Deny obviously dangerous commands.

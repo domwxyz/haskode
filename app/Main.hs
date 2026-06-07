@@ -30,13 +30,14 @@ import Data.Text          (Text)
 import qualified Data.Text    as T
 import qualified Data.Text.IO as TIO
 import Options.Applicative
-import System.Exit        (exitFailure)
+import System.Exit        (exitFailure, exitSuccess)
 import System.IO          (hFlush, stdout, hSetBuffering, stdin, BufferMode (..))
 
 import Haskode.Config         (Config (..), ProviderConfig (..), loadConfig)
 import Haskode.Provider       (Provider, stubProvider)
 import Haskode.Provider.OpenAI (openaiProvider)
 import Haskode.Policy         (defaultPolicy)
+import Haskode.Session        (flushLog, flushLogOnException, summarizeSession, formatSessionSummary)
 import Haskode.Tools          (defaultRegistry)
 import Haskode.Agent          (AgentState (..), initState, runAgent, terminalApproval)
 
@@ -54,6 +55,7 @@ data Options = Options
   , optApiKey  :: !(Maybe String)    -- ^ API key override (bypasses env var)
   , optBaseUrl :: !(Maybe String)    -- ^ Base URL override
   , optVerbose :: !Bool              -- ^ Verbose output
+  , optShowSession :: !Bool          -- ^ Show session log summary and exit
   } deriving stock (Show)
 
 optionsParser :: Parser Options
@@ -97,6 +99,10 @@ optionsParser = Options
        <> short 'v'
        <> help "Print debug info (provider, model, config source)"
         )
+  <*> switch
+        ( long "show-session"
+       <> help "Print session log summary and exit (read-only, no replay)"
+        )
 
 -- ---------------------------------------------------------------------------
 -- Main
@@ -109,6 +115,13 @@ main = do
 
   -- Apply CLI overrides to the loaded config
   let cfg' = applyOverrides cfg opts'
+
+  -- --show-session: print summary and exit (read-only, no replay)
+  when (optShowSession opts') $ do
+    let dir = cfgWorkingDir cfg'
+    summary <- summarizeSession dir
+    TIO.putStrLn (formatSessionSummary summary)
+    exitSuccess
 
   -- Print banner
   putStrLn "┌─────────────────────────────────────┐"
@@ -134,10 +147,11 @@ main = do
   -- Single-shot or interactive mode
   case optPrompt opts' of
     Just prompt -> do
-      _ <- runAgent state prompt
-      pure ()
-    Nothing ->
-      interactiveLoop state
+      state' <- runAgentSafe state prompt
+      flushSession state'
+    Nothing -> do
+      finalState <- interactiveLoop state
+      flushSession finalState
   where
     opts = info (optionsParser <**> helper)
       ( fullDesc
@@ -221,14 +235,39 @@ applyOverrides cfg opts' = cfg
 -- ---------------------------------------------------------------------------
 
 -- | Read user input, run the agent, repeat.
-interactiveLoop :: AgentState -> IO ()
+--   Returns the final 'AgentState' so the caller can flush the log.
+--   The loop body is wrapped with 'flushLogOnException' so that an
+--   unexpected EOF (or other stdin IO failure) flushes the accumulated
+--   session events before the exception propagates.
+interactiveLoop :: AgentState -> IO AgentState
 interactiveLoop state = do
   hSetBuffering stdin LineBuffering
   putStr "You: "
   hFlush stdout
-  input <- TIO.getLine
-  if T.strip input `elem` ["/exit", "/quit", "exit", "quit"]
-    then putStrLn "Goodbye!"
-    else do
-      state' <- runAgent state input
-      interactiveLoop state'
+  let dir  = cfgWorkingDir (asConfig state)
+      maxB = cfgMaxSessionLogBytes (asConfig state)
+  flushLogOnException dir maxB (asSession state) $ do
+    input <- TIO.getLine
+    if T.strip input `elem` ["/exit", "/quit", "exit", "quit"]
+      then do
+        putStrLn "Goodbye!"
+        pure state
+      else do
+        state' <- runAgentSafe state input
+        interactiveLoop state'
+
+-- | Run the agent with exception-safe session flush.
+--   On exception the current session log is flushed before re-throwing.
+runAgentSafe :: AgentState -> Text -> IO AgentState
+runAgentSafe st input =
+  flushLogOnException (cfgWorkingDir (asConfig st))
+                      (cfgMaxSessionLogBytes (asConfig st))
+                      (asSession st)
+    (runAgent st input)
+
+-- | Flush the session log to @session.jsonl@ in the working directory.
+--   Called on normal exit (single-shot completion or interactive /exit).
+flushSession :: AgentState -> IO ()
+flushSession state = do
+  let dir = cfgWorkingDir (asConfig state)
+  flushLog dir (cfgMaxSessionLogBytes (asConfig state)) (asSession state)

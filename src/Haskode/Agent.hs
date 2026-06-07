@@ -31,6 +31,9 @@ module Haskode.Agent
   , processTurn
     -- * System prompt
   , buildSystemPrompt
+  , loadAgentsMd
+    -- * Context estimation
+  , estimateContextChars
     -- * Approval
   , ApprovalFunc
   , autoApprove
@@ -38,11 +41,16 @@ module Haskode.Agent
   , terminalApproval
   ) where
 
-import Data.Aeson       (Value, encode)
-import Data.Text        (Text)
-import qualified Data.Text    as T
-import qualified Data.Text.IO as TIO
-import System.IO        (hFlush, stdout)
+import Control.Exception  (IOException, try)
+import Control.Monad      (when)
+import Data.Aeson         (Value, encode)
+import qualified Data.ByteString.Lazy as LBS
+import Data.Text          (Text)
+import qualified Data.Text          as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO       as TIO
+import System.Directory   (doesFileExist, getFileSize)
+import System.IO          (hFlush, stdout)
 
 import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Core       (Conversation, Message (..), Role (..), ToolCall (..),
@@ -53,7 +61,10 @@ import Haskode.Provider   (Provider (..), CompletionRequest (..),
                            CompletionResponse (..))
 import Haskode.Session    (Event (..), EventType (..), SessionLog,
                            emptyLog, logEvent)
-import Haskode.Tools      (Tool (..), ToolRegistry, toolNames, lookupTool)
+import Haskode.Tools      (Tool (..), ToolRegistry, toolNames, lookupTool,
+                           safeCanonicalize, isUnderRoot,
+                           extractTextField, computePatchPreview,
+                           computeWriteFilePreview)
 import Data.Time.Clock    (getCurrentTime)
 
 -- ---------------------------------------------------------------------------
@@ -129,6 +140,52 @@ initState cfg prov pol reg approve = AgentState
 -- System prompt
 -- ---------------------------------------------------------------------------
 
+-- | Maximum size of AGENTS.md (in bytes) that will be included in the
+--   system prompt.  Files larger than this are silently skipped to
+--   avoid blowing up the context window.
+agentsMdMaxSize :: Integer
+agentsMdMaxSize = 32768  -- 32 KB
+
+-- | Load the contents of @AGENTS.md@ from the working directory, if
+--   present and readable.  Uses 'safeCanonicalize' and 'isUnderRoot'
+--   to guard against symlink escape and path-traversal tricks.
+--
+--   Returns 'Nothing' if the file is missing, unreadable, resolves
+--   outside the working directory, or exceeds 'agentsMdMaxSize'.
+loadAgentsMd :: IO (Maybe Text)
+loadAgentsMd = do
+  -- Resolve the working directory as the containment root.
+  rootResult <- safeCanonicalize "."
+  case rootResult of
+    Nothing -> pure Nothing
+    Just rootCanon -> do
+      -- Check whether AGENTS.md exists before canonicalizing, so that
+      -- canonicalizePath does not throw on a missing file.
+      exists <- doesFileExist ("AGENTS.md" :: FilePath)
+      if not exists
+        then pure Nothing
+        else do
+          -- Canonicalize and verify containment.
+          pathResult <- safeCanonicalize ("AGENTS.md" :: FilePath)
+          case pathResult of
+            Nothing -> pure Nothing
+            Just canon
+              | not (isUnderRoot rootCanon canon) -> pure Nothing
+              | otherwise -> do
+                  -- Enforce size limit.
+                  sizeResult <- try (getFileSize "AGENTS.md") :: IO (Either IOException Integer)
+                  case sizeResult of
+                    Left _  -> pure Nothing
+                    Right size
+                      | size > agentsMdMaxSize -> pure Nothing
+                      | otherwise -> do
+                          readResult <- try (TIO.readFile "AGENTS.md") :: IO (Either IOException Text)
+                          case readResult of
+                            Left _  -> pure Nothing
+                            Right txt
+                              | T.null txt -> pure Nothing
+                              | otherwise  -> pure (Just txt)
+
 -- | Build a system message that describes all available tools.
 --
 --   The prompt is plain text (not JSON) so that any LLM provider can
@@ -139,8 +196,11 @@ initState cfg prov pol reg approve = AgentState
 --   @tools@ array), the system prompt tells the model to use the
 --   provided tools — it must NOT print JSON tool-call objects as
 --   assistant text.
-buildSystemPrompt :: ToolRegistry -> Text
-buildSystemPrompt reg =
+--
+--   If an @AGENTS.md@ file was loaded, its contents are appended as
+--   repository-specific instructions for the agent.
+buildSystemPrompt :: ToolRegistry -> Maybe Text -> Text
+buildSystemPrompt reg agentsMd =
   "You are a helpful coding assistant. You have access to tools that\n\
   \are provided to you by the system. Use them when needed to answer\n\
   \the user's questions or perform tasks. Do NOT print tool calls as\n\
@@ -149,11 +209,47 @@ buildSystemPrompt reg =
   \\n\
   \Available tools:\n\n"
   <> T.concat (map describeTool (toolNames reg))
+  <> agentsMdSection
   where
     describeTool name = case lookupTool name reg of
       Nothing -> ""
       Just t  -> "- **" <> toolName t <> "**: " <> toolDescription t
               <> "\n  Schema: " <> T.pack (show (toolSchema t)) <> "\n\n"
+    agentsMdSection = case agentsMd of
+      Nothing -> ""
+      Just md -> "\n# Repository instructions (AGENTS.md)\n\n" <> md <> "\n"
+
+-- ---------------------------------------------------------------------------
+-- Context estimation
+-- ---------------------------------------------------------------------------
+
+-- | Estimate the total character count of a conversation.
+--
+--   This is a cheap, dependency-free proxy for token count.  It sums:
+--
+--     * The content of every message ('msgContent')
+--     * The JSON-encoded arguments of every 'ToolCall' in assistant messages
+--     * A small per-message overhead for role labels and framing
+--
+--   The estimate is deliberately conservative (slightly over-counting)
+--   so that the guard in 'processTurn' fires before the provider
+--   receives an oversized request.
+estimateContextChars :: Conversation -> Int
+estimateContextChars = sum . map messageChars
+  where
+    -- Per-message overhead: role label, JSON keys, framing.
+    -- Kept small but non-zero so the estimate grows with message count.
+    messageOverhead :: Int
+    messageOverhead = 20
+
+    messageChars :: Message -> Int
+    messageChars m = messageOverhead
+      + T.length (msgContent m)
+      + maybe 0 (sum . map toolCallChars) (msgToolCalls m)
+
+    toolCallChars :: ToolCall -> Int
+    toolCallChars tc = T.length (tcId tc) + T.length (tcName tc)
+                     + T.length (encodeText (tcArgs tc))
 
 -- ---------------------------------------------------------------------------
 -- Agent loop
@@ -193,8 +289,24 @@ processTurn state = do
       reg  = asRegistry state
 
   -- Build context: system prompt + conversation
-  let sysMsg    = mkSystemMessage (buildSystemPrompt reg)
+  agentsMd <- loadAgentsMd
+  let sysMsg    = mkSystemMessage (buildSystemPrompt reg agentsMd)
       context   = sysMsg : asConversation state
+
+  -- Context-window guard: estimate total size before calling provider.
+  -- This is a cheap character-count check that prevents oversized
+  -- requests from reaching the provider.  No truncation or summarization
+  -- is performed — the conversation must be shortened manually.
+  let maxChars   = cfgMaxContextChars cfg
+      charEst    = estimateContextChars context
+  when (charEst > maxChars) $ do
+    let msg = "Error: conversation is too large to send ("
+            <> T.pack (show charEst) <> " chars estimated, limit "
+            <> T.pack (show maxChars) <> "). "
+            <> "Context management is not implemented yet — "
+            <> "please start a new session to continue."
+    TIO.putStrLn $ "\nAssistant: " <> msg <> "\n"
+    fail (T.unpack msg)
 
   -- Call the provider
   let req = CompletionRequest
@@ -215,10 +327,19 @@ processTurn state = do
       replyWithCalls = case crToolCalls resp of
         Nothing  -> reply
         Just tcs -> reply { msgToolCalls = Just tcs }
+      -- Build a descriptive event payload.  When tool calls are
+      -- present we include a summary so the session log shows
+      -- what the assistant asked to do, not just the text reply.
+      replyEventData = case crToolCalls resp of
+        Nothing  -> msgContent reply
+        Just tcs -> msgContent reply
+                 <> " | tool_calls: "
+                 <> T.intercalate ", "
+                      [ tcId t <> "=" <> tcName t | t <- tcs ]
       state1 = state
         { asConversation = appendMessage replyWithCalls (asConversation state)
         , asSession = logEvent
-            (Event now EAssistantReply (msgContent reply))
+            (Event now EAssistantReply replyEventData)
             (asSession state)
         }
 
@@ -284,18 +405,46 @@ processSingleToolCall state tc = do
       -- Ask the user for confirmation via the injected approval function.
       -- In the CLI this prints tool info and reads y/N from stdin.
       -- In tests, autoApprove or autoReject is injected instead.
-      let approve = asApproval state
+      --
+      -- For apply_patch, show the target path and a unified diff preview
+      -- so the user can make an informed decision before approving.
+      let approve  = asApproval state
+          enrichedReason = if tcName tc == "apply_patch"
+            then case extractTextField "path" (tcArgs tc) of
+              Just p  -> "patch " <> p <> " — " <> reason
+              Nothing -> reason
+            else if tcName tc == "write_file"
+            then case extractTextField "path" (tcArgs tc) of
+              Just p  -> "write " <> p <> " — " <> reason
+              Nothing -> reason
+            else reason
       TIO.putStrLn $ "  [policy] Confirmation needed: " <> tcName tc
-      approved <- approve tc reason
+      -- Show diff preview for apply_patch so the user sees what will change.
+      when (tcName tc == "apply_patch") $
+        showPatchPreview tc
+      -- Show file preview for write_file so the user sees what will be created.
+      when (tcName tc == "write_file") $
+        showWriteFilePreview tc
+      approved <- approve tc enrichedReason
       if approved
         then do
           -- User approved — execute the tool (same path as Allow)
           TIO.putStrLn "  [policy] Approved by user."
           now2 <- getCurrentTime
+          -- For apply_patch, include the target path in the audit event
+          -- so the session log records which file was approved.
+          let approvalData = if tcName tc == "apply_patch"
+                then case extractTextField "path" (tcArgs tc) of
+                  Just p  -> tcName tc <> ": approved — " <> p
+                  Nothing -> tcName tc <> ": approved by user"
+                else if tcName tc == "write_file"
+                then case extractTextField "path" (tcArgs tc) of
+                  Just p  -> tcName tc <> ": approved — " <> p
+                  Nothing -> tcName tc <> ": approved by user"
+                else tcName tc <> ": approved by user"
           let state2 = state1
                 { asSession = logEvent
-                    (Event now2 EPolicyDecision
-                      (tcName tc <> ": approved by user"))
+                    (Event now2 EPolicyDecision approvalData)
                     (asSession state1)
                 }
           executeTool state2 tc
@@ -303,9 +452,20 @@ processSingleToolCall state tc = do
           -- User rejected — log and return a denial result
           TIO.putStrLn "  [policy] Rejected by user."
           now2 <- getCurrentTime
+          -- For apply_patch, include the target path in the denial reason
+          -- so the session log records which file was rejected.
+          let denialReason = if tcName tc == "apply_patch"
+                then case extractTextField "path" (tcArgs tc) of
+                  Just p  -> "patch " <> p <> " — " <> reason
+                  Nothing -> reason
+                else if tcName tc == "write_file"
+                then case extractTextField "path" (tcArgs tc) of
+                  Just p  -> "write " <> p <> " — " <> reason
+                  Nothing -> reason
+                else reason
           let resultMsg = Message
                 { msgRole      = User
-                , msgContent   = "Tool '" <> tcName tc <> "' denied by user: " <> reason
+                , msgContent   = "Tool '" <> tcName tc <> "' denied by user: " <> denialReason
                 , msgCallId    = Just (tcId tc)
                 , msgToolCalls = Nothing
                 }
@@ -313,7 +473,7 @@ processSingleToolCall state tc = do
                 { asConversation = appendMessage resultMsg (asConversation state1)
                 , asSession = logEvent
                     (Event now2 EToolResult
-                      (tcId tc <> " denied by user: " <> reason))
+                      (tcId tc <> " denied by user: " <> denialReason))
                     (asSession state1)
                 }
           pure state2
@@ -363,11 +523,18 @@ executeTool state tc = do
 
       result <- toolExecute tool (tcArgs tc)
 
-      -- Append tool result to conversation
+      -- Append tool result to conversation.
+      -- The conversation keeps the full output (for the model), but
+      -- the session event truncates large diffs from apply_patch to
+      -- keep the JSONL audit trail bounded.
       now2 <- getCurrentTime
-      let resultMsg = Message
+      let fullOutput   = trOutput result
+          sessionOutput = if tcName tc == "apply_patch" || tcName tc == "write_file"
+                           then truncatePatchLog fullOutput
+                           else fullOutput
+          resultMsg = Message
             { msgRole      = User
-            , msgContent   = trOutput result
+            , msgContent   = fullOutput
             , msgCallId    = Just (tcId tc)
             , msgToolCalls = Nothing
             }
@@ -375,12 +542,70 @@ executeTool state tc = do
             { asConversation = appendMessage resultMsg (asConversation state')
             , asSession = logEvent
                 (Event now2 EToolResult
-                  (tcId tc <> " " <> trOutput result))
+                  (tcId tc <> " " <> sessionOutput))
                 (asSession state')
             }
-      TIO.putStrLn $ "  [tool] Result: " <> T.take 200 (trOutput result)
+      TIO.putStrLn $ "  [tool] Result: " <> truncateDisplay fullOutput
       pure state''
 
+-- | Show a diff preview for an @apply_patch@ tool call.
+--   Prints the target path and a concise unified diff to the terminal
+--   so the user can see exactly what will change before approving.
+--   Failures are silently ignored (the approval prompt still works;
+--   the diff just won't be shown).
+showPatchPreview :: ToolCall -> IO ()
+showPatchPreview tc = do
+  result <- computePatchPreview (tcArgs tc)
+  case result of
+    Left _err ->
+      -- Preview failed; the approval prompt still works without it.
+      pure ()
+    Right (path, diff) -> do
+      TIO.putStrLn $ "  [confirm] File:     " <> T.pack path
+      TIO.putStrLn   "  [confirm] Diff:"
+      TIO.putStrLn $ "  " <> T.unlines (map ("  " <>) (T.lines diff))
+
+-- | Show a preview for a @write_file@ tool call.
+--   Prints the target path and a concise diff-like preview to the
+--   terminal so the user can see what will be created before approving.
+--   Failures are silently ignored (the approval prompt still works;
+--   the preview just won't be shown).
+showWriteFilePreview :: ToolCall -> IO ()
+showWriteFilePreview tc = do
+  result <- computeWriteFilePreview (tcArgs tc)
+  case result of
+    Left _err ->
+      -- Preview failed; the approval prompt still works without it.
+      pure ()
+    Right (path, preview) -> do
+      TIO.putStrLn $ "  [confirm] File:     " <> T.pack path
+      TIO.putStrLn   "  [confirm] Preview:"
+      TIO.putStrLn $ "  " <> T.unlines (map ("  " <>) (T.lines preview))
+
 -- | Encode a JSON Value to Text (for logging).
+--   Produces clean JSON without Haskell string escaping.
 encodeText :: Value -> Text
-encodeText = T.pack . show . encode
+encodeText = TE.decodeUtf8 . LBS.toStrict . encode
+
+-- | Truncate text for terminal display with a clear marker.
+truncateDisplay :: Text -> Text
+truncateDisplay t
+  | T.length t <= 200 = t
+  | otherwise = T.take 200 t <> "… [" <> T.pack (show (T.length t)) <> " chars total]"
+
+-- | Maximum characters kept from an apply_patch result in the session
+--   event log.  The full diff is kept in the conversation (for the
+--   model) and printed to the terminal, but the session event is
+--   bounded to avoid bloating the JSONL audit trail.
+patchResultLogLimit :: Int
+patchResultLogLimit = 1024
+
+-- | Truncate the diff portion of an apply_patch result for the
+--   session event log.  Keeps the first @patchResultLogLimit@
+--   characters and appends a marker when truncation occurs.
+--   Non-patch results pass through unchanged.
+truncatePatchLog :: Text -> Text
+truncatePatchLog t
+  | T.length t <= patchResultLogLimit = t
+  | otherwise = T.take patchResultLogLimit t
+              <> "\n[truncated: " <> T.pack (show (T.length t)) <> " chars total]"

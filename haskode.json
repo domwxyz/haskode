@@ -1,12 +1,14 @@
 {
   "cfgProvider": {
     "pcProvider": "openai",
-    "pcModel": "gpt-5.5",
+    "pcModel": "gpt-4o-mini",
     "pcBaseUrl": "https://api.openai.com",
     "pcApiKey": ""
   },
   "cfgMaxTokens": 4096,
   "cfgVerbose": false,
-  "cfgWorkingDir": "."
+  "cfgWorkingDir": ".",
+  "cfgMaxContextChars": 120000,
+  "cfgMaxSessionLogBytes": 5242880
 }
 

@@ -17,11 +17,14 @@ module Haskode.Config
   ( Config (..)
   , ProviderConfig (..)
   , defaultConfig
+  , defaultMaxContextChars
+  , defaultMaxSessionLogBytes
   , loadConfig
   , tokenLimitFieldName
   ) where
 
-import Data.Aeson            (FromJSON, ToJSON, eitherDecode)
+import Data.Aeson            (FromJSON, ToJSON, eitherDecode, parseJSON, withObject, (.:), (.:?))
+import Data.Aeson.Types      ((.!=))
 import Data.ByteString.Lazy  (readFile)
 import Data.Text             (Text)
 import GHC.Generics          (Generic)
@@ -58,22 +61,59 @@ defaultProviderConfig = ProviderConfig
 -- ---------------------------------------------------------------------------
 
 data Config = Config
-  { cfgProvider   :: !ProviderConfig
-  , cfgMaxTokens  :: !Int       -- ^ Max tokens per response
-  , cfgVerbose    :: !Bool      -- ^ Print debug info
-  , cfgWorkingDir :: !FilePath  -- ^ Project root (default: cwd)
+  { cfgProvider           :: !ProviderConfig
+  , cfgMaxTokens          :: !Int       -- ^ Max tokens per response
+  , cfgVerbose            :: !Bool      -- ^ Print debug info
+  , cfgWorkingDir         :: !FilePath  -- ^ Project root (default: cwd)
+  , cfgMaxContextChars    :: !Int       -- ^ Conservative context-window limit in characters
+  , cfgMaxSessionLogBytes :: !Int       -- ^ Max session.jsonl size before rotation (bytes)
   } deriving stock (Show, Eq, Generic)
 
 instance ToJSON Config
-instance FromJSON Config
+
+-- | Custom FromJSON instance that treats @cfgMaxContextChars@ and
+--   @cfgMaxSessionLogBytes@ as optional fields with sensible defaults.
+--   This keeps old minimal config files (without these fields) working
+--   after the fields were added.
+instance FromJSON Config where
+  parseJSON = withObject "Config" $ \o -> do
+    prov      <- o .:  "cfgProvider"
+    maxToks   <- o .:  "cfgMaxTokens"
+    verbose   <- o .:  "cfgVerbose"
+    workDir   <- o .:  "cfgWorkingDir"
+    maxCtx    <- o .:? "cfgMaxContextChars"    .!= defaultMaxContextChars
+    maxLogB   <- o .:? "cfgMaxSessionLogBytes" .!= defaultMaxSessionLogBytes
+    pure Config
+      { cfgProvider           = prov
+      , cfgMaxTokens          = maxToks
+      , cfgVerbose            = verbose
+      , cfgWorkingDir         = workDir
+      , cfgMaxContextChars    = maxCtx
+      , cfgMaxSessionLogBytes = maxLogB
+      }
 
 defaultConfig :: Config
 defaultConfig = Config
-  { cfgProvider   = defaultProviderConfig
-  , cfgMaxTokens  = 4096
-  , cfgVerbose    = False
-  , cfgWorkingDir = "."
+  { cfgProvider           = defaultProviderConfig
+  , cfgMaxTokens          = 4096
+  , cfgVerbose            = False
+  , cfgWorkingDir         = "."
+  , cfgMaxContextChars    = defaultMaxContextChars
+  , cfgMaxSessionLogBytes = defaultMaxSessionLogBytes
   }
+
+-- | Default context-window limit in characters.
+--   This is a conservative estimate (~30K tokens at ~4 chars/token)
+--   suitable for most 128K-token models.  Override via config file.
+defaultMaxContextChars :: Int
+defaultMaxContextChars = 120000
+
+-- | Default maximum session log file size in bytes (5 MB).
+--   When the existing @session.jsonl@ exceeds this limit, it is
+--   rotated to @session.jsonl.1@ before new events are appended.
+--   Set to 0 to disable rotation.
+defaultMaxSessionLogBytes :: Int
+defaultMaxSessionLogBytes = 5 * 1024 * 1024
 
 -- ---------------------------------------------------------------------------
 -- Loading
