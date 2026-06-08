@@ -75,7 +75,7 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, doesPathExist, getFileSize, listDirectory)
 import System.FilePath  ((</>), takeExtension)
-import System.Process   (readProcessWithExitCode)
+import System.Process   (readCreateProcessWithExitCode, shell)
 
 import Haskode.Core (ToolResult (..))
 import Haskode.Patch (Patch (..), applyPatch, makePatch, showDiff)
@@ -120,6 +120,31 @@ toolNames = Map.keys
 -- Helpers
 -- ---------------------------------------------------------------------------
 
+-- | Resolve the working directory root and a target path, verifying
+--   that the target is under the root.  Calls @k rootCanon pathCanon@
+--   on success.  Returns a 'ToolResult' error on failure (unresolvable
+--   root, unresolvable path, or path outside root).
+--
+--   This eliminates the repeated @safeCanonicalize "."@ + @isUnderRoot@
+--   pattern that every file tool must perform.
+withRootContainment :: FilePath -> (FilePath -> FilePath -> IO ToolResult) -> IO ToolResult
+withRootContainment path k = do
+  rootCanonResult <- safeCanonicalize "."
+  case rootCanonResult of
+    Nothing -> pure $ ToolResult ""
+      "error: could not resolve working directory"
+    Just rootCanon -> do
+      pathCanonResult <- safeCanonicalize path
+      case pathCanonResult of
+        Nothing -> pure $ ToolResult ""
+          ("error: could not resolve path: " <> T.pack path)
+        Just pathCanon
+          | not (isUnderRoot rootCanon pathCanon) ->
+            pure $ ToolResult ""
+              ("error: path must be under the working directory: "
+               <> T.pack path)
+          | otherwise -> k rootCanon pathCanon
+
 -- | Extract a text field from a JSON object.
 --   Returns 'Nothing' if the field is missing or not a string.
 extractTextField :: Text -> Value -> Maybe Text
@@ -163,30 +188,12 @@ readFileTool = Tool
             Nothing -> ""
       if null path
         then pure $ ToolResult "" "error: missing required field 'path'"
-        else do
-          -- Resolve working directory for containment (same as glob/search).
-          rootCanonResult <- safeCanonicalize "."
-          case rootCanonResult of
-            Nothing -> pure $ ToolResult ""
-              "error: could not resolve working directory"
-            Just rootCanon -> do
-              -- Canonicalize the requested path; Nothing catches broken
-              -- symlinks, permission errors, and missing targets.
-              pathCanonResult <- safeCanonicalize path
-              case pathCanonResult of
-                Nothing -> pure $ ToolResult ""
-                  ("error: could not resolve path: " <> T.pack path)
-                Just pathCanon
-                  | not (isUnderRoot rootCanon pathCanon) ->
-                    pure $ ToolResult ""
-                      ("error: path must be under the working directory: "
-                       <> T.pack path)
-                  | otherwise -> do
-                    result <- try (TIO.readFile path) :: IO (Either IOException Text)
-                    case result of
-                      Left e    -> pure $ ToolResult ""
-                        ("error reading " <> T.pack path <> ": " <> T.pack (show e))
-                      Right txt -> pure $ ToolResult "" txt
+        else withRootContainment path $ \_rootCanon _pathCanon -> do
+          result <- try (TIO.readFile path) :: IO (Either IOException Text)
+          case result of
+            Left e    -> pure $ ToolResult ""
+              ("error reading " <> T.pack path <> ": " <> T.pack (show e))
+            Right txt -> pure $ ToolResult "" txt
   }
 
 -- | List files in a directory.
@@ -208,29 +215,12 @@ listFilesTool = Tool
       let dir = case extractTextField "dir" args of
             Just d  -> T.unpack d
             Nothing -> "."
-      -- Resolve working directory for containment (same as glob/search).
-      rootCanonResult <- safeCanonicalize "."
-      case rootCanonResult of
-        Nothing -> pure $ ToolResult ""
-          "error: could not resolve working directory"
-        Just rootCanon -> do
-          -- Canonicalize the requested directory; Nothing catches broken
-          -- symlinks, permission errors, and missing targets.
-          dirCanonResult <- safeCanonicalize dir
-          case dirCanonResult of
-            Nothing -> pure $ ToolResult ""
-              ("error: could not resolve path: " <> T.pack dir)
-            Just dirCanon
-              | not (isUnderRoot rootCanon dirCanon) ->
-                pure $ ToolResult ""
-                  ("error: path must be under the working directory: "
-                   <> T.pack dir)
-              | otherwise -> do
-                result <- try (listDirectory dir) :: IO (Either IOException [FilePath])
-                case result of
-                  Left e     -> pure $ ToolResult ""
-                    ("error listing " <> T.pack dir <> ": " <> T.pack (show e))
-                  Right files -> pure $ ToolResult "" (T.unlines (map T.pack files))
+      withRootContainment dir $ \_rootCanon _dirCanon -> do
+        result <- try (listDirectory dir) :: IO (Either IOException [FilePath])
+        case result of
+          Left e     -> pure $ ToolResult ""
+            ("error listing " <> T.pack dir <> ": " <> T.pack (show e))
+          Right files -> pure $ ToolResult "" (T.unlines (map T.pack files))
   }
 
 -- | Maximum characters kept from stdout or stderr.
@@ -311,7 +301,9 @@ shellTool = Tool
       let cmd = case extractTextField "command" args of
             Just c  -> T.unpack c
             Nothing -> "echo missing-command"
-      (exitCode, stdout', stderr') <- readProcessWithExitCode "sh" ["-c", cmd] ""
+      -- 'shell' uses cmd /c on Windows and sh -c elsewhere,
+      -- handling quoting correctly on both platforms.
+      (exitCode, stdout', stderr') <- readCreateProcessWithExitCode (shell cmd) ""
       let trStdout  = truncateText shellOutputLimit (T.pack stdout')
           trStderr  = truncateText shellOutputLimit (T.pack stderr')
           output = T.intercalate "\n"
@@ -358,10 +350,13 @@ matchGlobSegment _ _ = False
 --     @matchGlob "*.hs" "src\/Foo.hs"@       = @False@
 --     @matchGlob "**\/\/*.hs" "src\/Foo.hs"@ = @True@
 --     @matchGlob "src\/**\/*.hs" "src\/A\/B.hs"@ = @True@
+--
+--   On Windows, backslash path separators are normalized to @/@ before matching.
 matchGlob :: String -> FilePath -> Bool
 matchGlob pattern path =
-  let patParts  = splitOn '/' pattern
-      pathParts = splitOn '/' path
+  let normalizeSep = map (\c -> if c == '\\' then '/' else c)
+      patParts  = splitOn '/' pattern
+      pathParts = splitOn '/' (normalizeSep path)
   in matchParts patParts pathParts
   where
     matchParts [] [] = True
@@ -576,9 +571,12 @@ isBinaryFile path = takeExtension path `elem` binaryExtensions
 
 -- | Check whether @path@ is the same as, or a subdirectory of, @root@.
 --   Both paths must already be canonicalized.
+--   Handles both @/@ and @\\@ separators for Windows compatibility.
 isUnderRoot :: FilePath -> FilePath -> Bool
 isUnderRoot root path =
-  root == path || (root ++ "/") `isPrefixOf` path
+  root == path
+  || (root ++ "/")  `isPrefixOf` path
+  || (root ++ "\\") `isPrefixOf` path
 
 -- | Safely canonicalize a path.  Returns 'Nothing' on failure
 -- (broken symlink, permission error, missing path, etc.).
@@ -866,43 +864,25 @@ previewPatchTool = Tool
             Nothing -> ""
       if null path
         then pure $ ToolResult "" "error: missing required field 'path'"
-        else do
-          -- Resolve working directory for containment (same as read_file).
-          rootCanonResult <- safeCanonicalize "."
-          case rootCanonResult of
-            Nothing -> pure $ ToolResult ""
-              "error: could not resolve working directory"
-            Just rootCanon -> do
-              -- Canonicalize the requested path; Nothing catches broken
-              -- symlinks, permission errors, and missing targets.
-              pathCanonResult <- safeCanonicalize path
-              case pathCanonResult of
-                Nothing -> pure $ ToolResult ""
-                  ("error: could not resolve path: " <> T.pack path)
-                Just pathCanon
-                  | not (isUnderRoot rootCanon pathCanon) ->
-                    pure $ ToolResult ""
-                      ("error: path must be under the working directory: "
-                       <> T.pack path)
-                  | otherwise -> do
-                    -- Read the current file content.
-                    readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
-                    case readResult of
-                      Left e -> pure $ ToolResult ""
-                        ("error reading " <> T.pack path <> ": " <> T.pack (show e))
-                      Right current -> do
-                        -- Compute the diff and apply the size limit.
-                        let patch = makePatch path current replacement
-                            diff  = showDiff patch
-                        if T.length diff > previewDiffLimit
-                          then pure $ ToolResult ""
-                            ("error: diff too large ("
-                             <> T.pack (show (T.length diff))
-                             <> " chars, limit "
-                             <> T.pack (show previewDiffLimit)
-                             <> "). Consider reading the file and making the change manually.")
-                          else pure $ ToolResult ""
-                            ("Diff preview (no files modified):\n" <> diff)
+        else withRootContainment path $ \_rootCanon _pathCanon -> do
+          -- Read the current file content.
+          readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
+          case readResult of
+            Left e -> pure $ ToolResult ""
+              ("error reading " <> T.pack path <> ": " <> T.pack (show e))
+            Right current -> do
+              -- Compute the diff and apply the size limit.
+              let patch = makePatch path current replacement
+                  diff  = showDiff patch
+              if T.length diff > previewDiffLimit
+                then pure $ ToolResult ""
+                  ("error: diff too large ("
+                   <> T.pack (show (T.length diff))
+                   <> " chars, limit "
+                   <> T.pack (show previewDiffLimit)
+                   <> "). Consider reading the file and making the change manually.")
+                else pure $ ToolResult ""
+                  ("Diff preview (no files modified):\n" <> diff)
   }
 
 -- | Apply a patch to a single existing in-root file.
@@ -942,41 +922,23 @@ applyPatchTool = Tool
             Nothing -> ""
       if null path
         then pure $ ToolResult "" "error: missing required field 'path'"
-        else do
-          -- Resolve working directory for containment (same as read_file).
-          rootCanonResult <- safeCanonicalize "."
-          case rootCanonResult of
-            Nothing -> pure $ ToolResult ""
-              "error: could not resolve working directory"
-            Just rootCanon -> do
-              -- Canonicalize the requested path; Nothing catches broken
-              -- symlinks, permission errors, and missing targets.
-              pathCanonResult <- safeCanonicalize path
-              case pathCanonResult of
-                Nothing -> pure $ ToolResult ""
-                  ("error: could not resolve path: " <> T.pack path)
-                Just pathCanon
-                  | not (isUnderRoot rootCanon pathCanon) ->
-                    pure $ ToolResult ""
-                      ("error: path must be under the working directory: "
-                       <> T.pack path)
-                  | otherwise -> do
-                    -- Read the current file content.
-                    readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
-                    case readResult of
-                      Left e -> pure $ ToolResult ""
-                        ("error reading " <> T.pack path <> ": " <> T.pack (show e))
-                      Right current -> do
-                        -- Compute the diff for the result message.
-                        let patch = makePatch path current replacement
-                            diff  = showDiff patch
-                        -- Apply the patch (writes to disk).
-                        applyResult <- try (applyPatch patch) :: IO (Either IOException Patch)
-                        case applyResult of
-                          Left e -> pure $ ToolResult ""
-                            ("error writing " <> T.pack path <> ": " <> T.pack (show e))
-                          Right _ -> pure $ ToolResult ""
-                            ("Patch applied:\n" <> diff)
+        else withRootContainment path $ \_rootCanon _pathCanon -> do
+          -- Read the current file content.
+          readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
+          case readResult of
+            Left e -> pure $ ToolResult ""
+              ("error reading " <> T.pack path <> ": " <> T.pack (show e))
+            Right current -> do
+              -- Compute the diff for the result message.
+              let patch = makePatch path current replacement
+                  diff  = showDiff patch
+              -- Apply the patch (writes to disk).
+              applyResult <- try (applyPatch patch) :: IO (Either IOException Patch)
+              case applyResult of
+                Left e -> pure $ ToolResult ""
+                  ("error writing " <> T.pack path <> ": " <> T.pack (show e))
+                Right _ -> pure $ ToolResult ""
+                  ("Patch applied:\n" <> diff)
   }
 
 -- | Create a new file under the working directory.

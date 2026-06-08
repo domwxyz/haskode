@@ -204,7 +204,7 @@ buildSystemPrompt reg agentsMd =
   "You are a helpful coding assistant. You have access to tools that\n\
   \are provided to you by the system. Use them when needed to answer\n\
   \the user's questions or perform tasks. Do NOT print tool calls as\n\
-  \JSON in your reply text — use the tool-calling mechanism provided\n\
+  \JSON in your reply text -- use the tool-calling mechanism provided\n\
   \by the API.\n\
   \\n\
   \Available tools:\n\n"
@@ -303,7 +303,7 @@ processTurn state = do
     let msg = "Error: conversation is too large to send ("
             <> T.pack (show charEst) <> " chars estimated, limit "
             <> T.pack (show maxChars) <> "). "
-            <> "Context management is not implemented yet — "
+            <> "Context management is not implemented yet -- "
             <> "please start a new session to continue."
     TIO.putStrLn $ "\nAssistant: " <> msg <> "\n"
     fail (T.unpack msg)
@@ -398,7 +398,7 @@ processSingleToolCall state tc = do
                   (tcId tc <> " denied: " <> reason))
                 (asSession state1)
             }
-      TIO.putStrLn $ "  [policy] Denied: " <> tcName tc <> " — " <> reason
+      TIO.putStrLn $ "  [policy] Denied: " <> tcName tc <> " -- " <> reason
       pure state2
 
     AskUser reason -> do
@@ -411,11 +411,11 @@ processSingleToolCall state tc = do
       let approve  = asApproval state
           enrichedReason = if tcName tc == "apply_patch"
             then case extractTextField "path" (tcArgs tc) of
-              Just p  -> "patch " <> p <> " — " <> reason
+              Just p  -> "patch " <> p <> " -- " <> reason
               Nothing -> reason
             else if tcName tc == "write_file"
             then case extractTextField "path" (tcArgs tc) of
-              Just p  -> "write " <> p <> " — " <> reason
+              Just p  -> "write " <> p <> " -- " <> reason
               Nothing -> reason
             else reason
       TIO.putStrLn $ "  [policy] Confirmation needed: " <> tcName tc
@@ -435,11 +435,11 @@ processSingleToolCall state tc = do
           -- so the session log records which file was approved.
           let approvalData = if tcName tc == "apply_patch"
                 then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> tcName tc <> ": approved — " <> p
+                  Just p  -> tcName tc <> ": approved -- " <> p
                   Nothing -> tcName tc <> ": approved by user"
                 else if tcName tc == "write_file"
                 then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> tcName tc <> ": approved — " <> p
+                  Just p  -> tcName tc <> ": approved -- " <> p
                   Nothing -> tcName tc <> ": approved by user"
                 else tcName tc <> ": approved by user"
           let state2 = state1
@@ -456,11 +456,11 @@ processSingleToolCall state tc = do
           -- so the session log records which file was rejected.
           let denialReason = if tcName tc == "apply_patch"
                 then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> "patch " <> p <> " — " <> reason
+                  Just p  -> "patch " <> p <> " -- " <> reason
                   Nothing -> reason
                 else if tcName tc == "write_file"
                 then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> "write " <> p <> " — " <> reason
+                  Just p  -> "write " <> p <> " -- " <> reason
                   Nothing -> reason
                 else reason
           let resultMsg = Message
@@ -591,7 +591,7 @@ encodeText = TE.decodeUtf8 . LBS.toStrict . encode
 truncateDisplay :: Text -> Text
 truncateDisplay t
   | T.length t <= 200 = t
-  | otherwise = T.take 200 t <> "… [" <> T.pack (show (T.length t)) <> " chars total]"
+  | otherwise = T.take 200 t <> "... [" <> T.pack (show (T.length t)) <> " chars total]"
 
 -- | Maximum characters kept from an apply_patch result in the session
 --   event log.  The full diff is kept in the conversation (for the

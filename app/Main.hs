@@ -156,7 +156,7 @@ main = do
     opts = info (optionsParser <**> helper)
       ( fullDesc
      <> progDesc "Haskode: a small, hackable LLM coding harness"
-     <> header "haskode — Haskell-native coding agent"
+     <> header "haskode - Haskell-native coding agent"
       )
 
 -- ---------------------------------------------------------------------------
