@@ -26,6 +26,7 @@ module Haskode.Session
   , logEvent
   , logEvents
   , events
+  , isMeaningfulSession
     -- * Persistence
   , flushLog
   , flushLogOnException
@@ -65,6 +66,7 @@ data EventType
   | EPolicyDecision
   | ESessionStart
   | ESessionEnd
+  | EConversationReset
   deriving stock (Show, Eq, Ord, Enum, Bounded)
 
 instance ToJSON EventType where
@@ -73,8 +75,9 @@ instance ToJSON EventType where
   toJSON EToolCall       = String "tool_call"
   toJSON EToolResult     = String "tool_result"
   toJSON EPolicyDecision = String "policy_decision"
-  toJSON ESessionStart   = String "session_start"
-  toJSON ESessionEnd     = String "session_end"
+  toJSON ESessionStart       = String "session_start"
+  toJSON ESessionEnd         = String "session_end"
+  toJSON EConversationReset  = String "conversation_reset"
 
 instance FromJSON EventType where
   parseJSON (String "user_message")    = pure EUserMessage
@@ -82,8 +85,9 @@ instance FromJSON EventType where
   parseJSON (String "tool_call")       = pure EToolCall
   parseJSON (String "tool_result")     = pure EToolResult
   parseJSON (String "policy_decision") = pure EPolicyDecision
-  parseJSON (String "session_start")   = pure ESessionStart
-  parseJSON (String "session_end")     = pure ESessionEnd
+  parseJSON (String "session_start")       = pure ESessionStart
+  parseJSON (String "session_end")         = pure ESessionEnd
+  parseJSON (String "conversation_reset")  = pure EConversationReset
   parseJSON other                      = fail $ "unknown EventType: " ++ show other
 
 -- | A single session event.
@@ -125,6 +129,24 @@ logEvents newEs (SessionLog es) = SessionLog (reverse newEs ++ es)
 events :: SessionLog -> [Event]
 events = reverse . unLog  -- chronological order
 
+-- | True when the log contains at least one content event (anything
+--   other than session_start, session_end, or conversation_reset).
+--   Used to decide whether a session is worth flushing: a run where
+--   the user immediately exits (or only uses /help, /status, /new)
+--   produces only lifecycle events and should not create a noisy log.
+isMeaningfulSession :: SessionLog -> Bool
+isMeaningfulSession = any isContentEvent . events
+  where
+    isContentEvent ev = case evType ev of
+      EUserMessage       -> True
+      EAssistantReply    -> True
+      EToolCall          -> True
+      EToolResult        -> True
+      EPolicyDecision    -> True
+      ESessionStart      -> False
+      ESessionEnd        -> False
+      EConversationReset -> False
+
 -- ---------------------------------------------------------------------------
 -- Persistence
 -- ---------------------------------------------------------------------------
@@ -164,9 +186,14 @@ flushLog dir maxBytes sess = do
 --   This is the building block for exception-safe session persistence:
 --   wrap any agent action with this helper to guarantee that accumulated
 --   events are written even when the action fails.
+--
+--   When the session contains only lifecycle events (no content), the
+--   exception guard is skipped — a crash in a no-op session should not
+--   create a noisy lifecycle-only log.
 flushLogOnException :: FilePath -> Int -> SessionLog -> IO a -> IO a
-flushLogOnException dir maxBytes sess action =
-  action `onException` flushLog dir maxBytes sess
+flushLogOnException dir maxBytes sess action
+  | isMeaningfulSession sess = action `onException` flushLog dir maxBytes sess
+  | otherwise                = action
 
 -- ---------------------------------------------------------------------------
 -- Session summary (read-only inspection)
@@ -243,13 +270,14 @@ formatSessionSummary ss =
                       <> "  Last event:    " <> fmtTime b
         _             -> "  Time:          (none)"
       typeLines = map fmtTypeCount
-        [ (EUserMessage,    "user_message")
-        , (EAssistantReply, "assistant_reply")
-        , (EToolCall,       "tool_call")
-        , (EToolResult,     "tool_result")
-        , (EPolicyDecision, "policy_decision")
-        , (ESessionStart,   "session_start")
-        , (ESessionEnd,     "session_end")
+        [ (EUserMessage,       "user_message")
+        , (EAssistantReply,    "assistant_reply")
+        , (EToolCall,          "tool_call")
+        , (EToolResult,        "tool_result")
+        , (EPolicyDecision,    "policy_decision")
+        , (ESessionStart,      "session_start")
+        , (ESessionEnd,        "session_end")
+        , (EConversationReset, "conversation_reset")
         ]
       fmtTypeCount (ety, label) =
         let n = Map.findWithDefault 0 ety (ssTypeCounts ss)

@@ -102,6 +102,20 @@ cabal run haskode -- --show-session
 cabal run haskode -- --help
 ```
 
+### Interactive commands
+
+In interactive mode, the following slash commands are available:
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/new` | Start a fresh conversation context |
+| `/status` | Show current provider, model, working dir, and runtime info |
+| `/exit` | Save session log and exit |
+| `/quit` | Same as `/exit` |
+
+Unknown slash commands print a short hint.  Anything without a leading `/` is sent to the agent as a normal prompt.
+
 ### Configuration
 
 Create a `haskode.json` in your project root:
@@ -112,7 +126,7 @@ Create a `haskode.json` in your project root:
     "pcProvider": "openai",
     "pcModel": "gpt-4o-mini",
     "pcBaseUrl": "https://api.openai.com",
-    "pcApiKey": ""
+    "pcApiKey": "$OPENAI_API_KEY"
   },
   "cfgMaxTokens": 4096,
   "cfgVerbose": false,
@@ -150,6 +164,24 @@ Any other name produces a clear error.
 1. `--api-key` CLI flag (highest priority)
 2. `OPENAI_API_KEY` environment variable
 3. `pcApiKey` field in config file
+
+**Environment variable expansion:** String fields in the config file
+(`pcApiKey`, `pcBaseUrl`, `pcModel`, `pcProvider`, `cfgWorkingDir`) support
+environment-variable references.  Syntax: `$VAR` or `${VAR}`.
+Undefined variables expand to the empty string.
+
+```json
+{
+  "cfgProvider": {
+    "pcApiKey": "$OPENAI_API_KEY",
+    "pcBaseUrl": "${MY_API_URL}"
+  },
+  "cfgWorkingDir": "$PROJECT_ROOT"
+}
+```
+
+You may also leave `pcApiKey` empty and rely on `OPENAI_API_KEY` directly
+(the provider checks the environment variable when the config field is empty).
 
 **CLI flags override config values:**
 
@@ -348,6 +380,9 @@ debugging, inspection, or fine-tuning data export.
 
 | Event type | When | Data payload |
 |---|---|---|
+| `session_start` | Interactive or single-shot run begins | `"session started"` |
+| `session_end` | Run exits normally (before log flush) | `"session ended"` |
+| `conversation_reset` | `/new` resets the in-memory conversation | `"conversation reset by /new"` |
 | `user_message` | User sends input | Raw user text |
 | `assistant_reply` | Model replies | Reply text; when tool calls are present, a summary of call IDs and tool names is appended (e.g. `\| tool_calls: call_1=read_file, call_2=list_files`) |
 | `tool_call` | Tool begins execution | Call ID, tool name, JSON arguments |
@@ -375,9 +410,19 @@ The session log is purely in-memory during a run.  The log is flushed
 to `session.jsonl` on normal exit (single-shot completion or typing
 `/exit` in interactive mode) and when the agent encounters a handled
 error (e.g. a provider failure).  The file is appended to — multiple
-runs in the same directory accumulate events.  An empty session (no
-user input) does not create the file.  The JSONL file is a write-only
-audit trail and cannot restore sessions.
+runs in the same directory accumulate events.  The JSONL file is a
+write-only audit trail and cannot restore sessions.  Lifecycle events
+(`session_start`, `session_end`, `conversation_reset`) mark the
+boundaries of each run and `/new` resets but are not used for replay
+or resume.
+
+**Empty and command-only sessions.**  A session is flushed only when
+it contains at least one *content* event (`user_message`,
+`assistant_reply`, `tool_call`, `tool_result`, or `policy_decision`).
+Sessions that contain only lifecycle events — such as an immediate
+`/exit`, `/help` then `/exit`, `/status` then `/exit`, or `/new` then
+`/exit` — are silently discarded and do not create `session.jsonl`.
+This keeps the log free of noisy lifecycle-only entries.
 
 **Log rotation.**  When the existing `session.jsonl` exceeds
 `cfgMaxSessionLogBytes` (default 5 MB), it is rotated to
@@ -401,8 +446,9 @@ Session summary:
   tool_call: 2
   tool_result: 2
   policy_decision: 2
-  session_start: 0
+  session_start: 1
   session_end: 0
+  conversation_reset: 0
 ```
 
 The summary reports total event count, first/last timestamps, and
@@ -471,7 +517,7 @@ re-execution are not implemented.
 - [ ] Session save/resume
 - [x] `.agentignore` file support (root-level, shared by `glob` and `search`)
 - [ ] Multi-file patch batching
-- [ ] Environment variable expansion in config
+- [x] Environment variable expansion in config
 
 ### Phase 3 — TUI & polish
 - [ ] Brick-based terminal UI

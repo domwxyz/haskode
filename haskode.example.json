@@ -3,7 +3,7 @@
     "pcProvider": "openai",
     "pcModel": "gpt-4o-mini",
     "pcBaseUrl": "https://api.openai.com",
-    "pcApiKey": ""
+    "pcApiKey": "$OPENAI_API_KEY"
   },
   "cfgMaxTokens": 4096,
   "cfgVerbose": false,

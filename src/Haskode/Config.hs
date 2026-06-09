@@ -11,7 +11,6 @@
 -- Future work:
 --   * JSONC / YAML support
 --   * Per-project overrides
---   * Environment-variable expansion
 
 module Haskode.Config
   ( Config (..)
@@ -21,15 +20,19 @@ module Haskode.Config
   , defaultMaxSessionLogBytes
   , loadConfig
   , tokenLimitFieldName
+  , expandEnvVars
+  , expandConfig
   ) where
 
 import Data.Aeson            (FromJSON, ToJSON, eitherDecode, parseJSON, withObject, (.:), (.:?))
 import Data.Aeson.Types      ((.!=))
 import Data.ByteString.Lazy  (readFile)
+import Data.Char             (isAlpha, isAlphaNum)
 import Data.Text             (Text)
 import GHC.Generics          (Generic)
 import Prelude               hiding (readFile)
 import System.Directory      (doesFileExist, getHomeDirectory)
+import System.Environment    (lookupEnv)
 import System.FilePath       ((</>))
 
 -- ---------------------------------------------------------------------------
@@ -116,6 +119,63 @@ defaultMaxSessionLogBytes :: Int
 defaultMaxSessionLogBytes = 5 * 1024 * 1024
 
 -- ---------------------------------------------------------------------------
+-- Environment-variable expansion
+-- ---------------------------------------------------------------------------
+
+-- | Expand environment-variable references in a string.
+--
+-- Supported syntax:
+--
+--   * @$VAR@ — bare variable name (letters, digits, underscores)
+--   * @${VAR}@ — braced variable name
+--
+-- Undefined variables expand to the empty string.
+-- A trailing @$@ with no variable name is left as-is.
+expandEnvVars :: String -> IO String
+expandEnvVars [] = pure []
+expandEnvVars ('$' : '{' : rest) =
+  case break (== '}') rest of
+    (name, '}' : more) -> do
+      val <- lookupEnv name
+      rest' <- expandEnvVars more
+      pure $ maybe [] id val ++ rest'
+    _ -> do
+      -- No closing brace: treat ${ as literal
+      rest' <- expandEnvVars rest
+      pure $ "${" ++ rest'
+expandEnvVars ('$' : c : rest)
+  | isAlpha c || c == '_' = do
+      let (namePart, more) = span (\ch -> isAlphaNum ch || ch == '_') (c : rest)
+      val <- lookupEnv namePart
+      rest' <- expandEnvVars more
+      pure $ maybe [] id val ++ rest'
+expandEnvVars (c : rest) = do
+  rest' <- expandEnvVars rest
+  pure (c : rest')
+
+-- | Expand environment-variable references in the string-valued fields
+--   of a 'Config'.  Only 'cfgWorkingDir' and the string fields of
+--   'ProviderConfig' are affected; numeric and boolean fields are left
+--   untouched.
+expandConfig :: Config -> IO Config
+expandConfig cfg = do
+  let pc = cfgProvider cfg
+  pcApiKey'   <- expandEnvVars (pcApiKey   pc)
+  pcBaseUrl'  <- expandEnvVars (pcBaseUrl  pc)
+  pcModel'    <- expandEnvVars (pcModel    pc)
+  pcProvider' <- expandEnvVars (pcProvider pc)
+  workDir'    <- expandEnvVars (cfgWorkingDir cfg)
+  pure cfg
+    { cfgProvider = pc
+        { pcApiKey   = pcApiKey'
+        , pcBaseUrl  = pcBaseUrl'
+        , pcModel    = pcModel'
+        , pcProvider = pcProvider'
+        }
+    , cfgWorkingDir = workDir'
+    }
+
+-- ---------------------------------------------------------------------------
 -- Loading
 -- ---------------------------------------------------------------------------
 
@@ -126,6 +186,10 @@ defaultMaxSessionLogBytes = 5 * 1024 * 1024
 --   3. @~\/.config\/haskode\/config.json@
 --
 --   Returns 'defaultConfig' when no file is found or parsing fails.
+--
+--   After successful JSON decode, environment-variable references in
+--   string fields are expanded via 'expandConfig' before the result
+--   is returned.
 loadConfig :: IO Config
 loadConfig = do
   candidates <- sequence
@@ -142,7 +206,7 @@ loadConfig = do
         then do
           bytes <- readFile path
           case eitherDecode bytes of
-            Right cfg -> pure cfg
+            Right cfg -> expandConfig cfg
             Left  err -> do
               putStrLn $ "haskode: warning: failed to parse " ++ path
                        ++ " (" ++ err ++ "), using defaults"

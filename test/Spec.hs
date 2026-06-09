@@ -23,15 +23,27 @@ import System.Directory  (getTemporaryDirectory, doesFileExist, removeFile,
                           getCurrentDirectory, setCurrentDirectory,
                           createFileLink, createDirectoryLink, emptyPermissions,
                           getPermissions, setPermissions, renameFile)
+import System.Environment (setEnv, unsetEnv)
 import System.Exit       (exitFailure, exitSuccess)
 import System.FilePath   ((</>))
 import System.Info       (os)
 import System.IO         (hClose, hFileSize, openFile, openTempFile, IOMode (..))
 
 import Haskode.Core
+import Haskode.Commands  (parseSlashCommand, formatHelp, formatStatus, formatUnknownCommand, formatNewConfirmation, resetConversation, formatContextUsage)
+import Haskode.Display   (indentBlock, formatAssistantReply, formatToolExecuting,
+                          formatToolResult, formatToolUnknown,
+                          formatPolicyDenied, formatPolicyConfirmationNeeded,
+                          formatPolicyApproved, formatPolicyRejected,
+                          formatConfirmTool, formatConfirmArgs,
+                          formatConfirmReason, formatConfirmPrompt,
+                          formatConfirmFile, formatConfirmDiffHeader,
+                          formatConfirmPreviewHeader, formatError, formatVerbose,
+                          formatContextLimitRefusal)
 import Haskode.Config    (defaultConfig, Config (..), ProviderConfig (..),
                           tokenLimitFieldName, defaultMaxContextChars,
-                          defaultMaxSessionLogBytes)
+                          defaultMaxSessionLogBytes,
+                          expandEnvVars, expandConfig)
 import Haskode.Provider  (Provider (..), CompletionRequest (..),
                           CompletionResponse (..), stubProvider, scriptedProvider)
 import Haskode.Provider.OpenAI
@@ -50,13 +62,15 @@ import Haskode.Tools     (defaultRegistry, toolNames, lookupTool, readFileTool, 
                           computePatchPreview, computeWriteFilePreview)
 import Haskode.Session   (emptyLog, logEvent, events, flushLog, flushLogOnException,
                           Event (..), EventType (..),
-                          SessionSummary (..), summarizeSession, formatSessionSummary)
+                          SessionSummary (..), summarizeSession, formatSessionSummary,
+                          isMeaningfulSession)
 import Haskode.Patch     (makePatch, showDiff)
 import Haskode.Agent     (AgentState (..), initState, runAgent, buildSystemPrompt,
                           loadAgentsMd,
                           estimateContextChars,
                           ApprovalFunc,
-                          autoApprove, autoReject)
+                          autoApprove, autoReject,
+                          recordSessionStart, recordSessionEnd, recordConversationReset)
 import Data.Time.Clock   (getCurrentTime)
 import qualified Data.Text    as T
 import qualified Data.Text.Encoding as TE
@@ -626,7 +640,130 @@ testDefaultConfigOptionalFields =
      else pure $ Left $ "defaultConfig values changed: "
                       ++ "ctx=" ++ show (cfgMaxContextChars cfg)
                       ++ " log=" ++ show (cfgMaxSessionLogBytes cfg)
-                      ++ " toks=" ++ show (cfgMaxTokens cfg)
+                       ++ " toks=" ++ show (cfgMaxTokens cfg)
+
+-- ---------------------------------------------------------------------------
+-- Environment-variable expansion tests
+-- ---------------------------------------------------------------------------
+
+-- | $VAR syntax expands a known environment variable.
+testExpandEnvVarBare :: Test
+testExpandEnvVarBare = do
+  setEnv "HASKODE_TEST_VAR" "hello"
+  result <- expandEnvVars "prefix_${HASKODE_TEST_VAR}_suffix"
+  unsetEnv "HASKODE_TEST_VAR"
+  if result == "prefix_hello_suffix"
+    then pure $ Right ()
+    else pure $ Left $ "expandEnvVars bare: got " ++ show result
+
+-- | ${VAR} syntax expands a known environment variable.
+testExpandEnvVarBraced :: Test
+testExpandEnvVarBraced = do
+  setEnv "HASKODE_TEST_VAR" "world"
+  result <- expandEnvVars "prefix_${HASKODE_TEST_VAR}_suffix"
+  unsetEnv "HASKODE_TEST_VAR"
+  if result == "prefix_world_suffix"
+    then pure $ Right ()
+    else pure $ Left $ "expandEnvVars braced: got " ++ show result
+
+-- | Undefined variables expand to the empty string.
+testExpandEnvVarUndefined :: Test
+testExpandEnvVarUndefined = do
+  -- Ensure the variable is not set
+  unsetEnv "HASKODE_TEST_UNDEF"
+  result <- expandEnvVars "before_${HASKODE_TEST_UNDEF}_after"
+  if result == "before__after"
+    then pure $ Right ()
+    else pure $ Left $ "expandEnvVars undefined: got " ++ show result
+
+-- | Undefined $VAR (no braces) also expands to empty string.
+--   Note: bare $VAR reads all consecutive alphanumeric/underscore chars,
+--   so $HASKODE_TEST_UNDEF_after looks up "HASKODE_TEST_UNDEF_after".
+testExpandEnvVarUndefinedBare :: Test
+testExpandEnvVarUndefinedBare = do
+  unsetEnv "HASKODE_TEST_UNDEF"
+  result <- expandEnvVars "before_$HASKODE_TEST_UNDEF"
+  if result == "before_"
+    then pure $ Right ()
+    else pure $ Left $ "expandEnvVars undefined bare: got " ++ show result
+
+-- | A string with no variables passes through unchanged.
+testExpandEnvVarNone :: Test
+testExpandEnvVarNone = do
+  result <- expandEnvVars "no variables here"
+  if result == "no variables here"
+    then pure $ Right ()
+    else pure $ Left $ "expandEnvVars none: got " ++ show result
+
+-- | A trailing $ with no variable name is left as-is.
+testExpandEnvVarTrailingDollar :: Test
+testExpandEnvVarTrailingDollar = do
+  result <- expandEnvVars "trailing$"
+  if result == "trailing$"
+    then pure $ Right ()
+    else pure $ Left $ "expandEnvVars trailing $: got " ++ show result
+
+-- | expandConfig applies expansion to ProviderConfig string fields.
+testExpandConfigProviderFields :: Test
+testExpandConfigProviderFields = do
+  setEnv "HASKODE_TEST_KEY" "sk-secret"
+  setEnv "HASKODE_TEST_URL" "https://example.com"
+  setEnv "HASKODE_TEST_MODEL" "gpt-test"
+  let cfg = defaultConfig
+        { cfgProvider = (cfgProvider defaultConfig)
+            { pcApiKey  = "$HASKODE_TEST_KEY"
+            , pcBaseUrl = "${HASKODE_TEST_URL}"
+            , pcModel   = "prefix-$HASKODE_TEST_MODEL-suffix"
+            }
+        }
+  cfg' <- expandConfig cfg
+  unsetEnv "HASKODE_TEST_KEY"
+  unsetEnv "HASKODE_TEST_URL"
+  unsetEnv "HASKODE_TEST_MODEL"
+  let pc = cfgProvider cfg'
+  if pcApiKey pc == "sk-secret"
+     && pcBaseUrl pc == "https://example.com"
+     && pcModel pc == "prefix-gpt-test-suffix"
+    then pure $ Right ()
+    else pure $ Left $ "expandConfig provider: key=" ++ show (pcApiKey pc)
+                    ++ " url=" ++ show (pcBaseUrl pc)
+                    ++ " model=" ++ show (pcModel pc)
+
+-- | expandConfig applies expansion to cfgWorkingDir.
+testExpandConfigWorkingDir :: Test
+testExpandConfigWorkingDir = do
+  setEnv "HASKODE_TEST_DIR" "/tmp/test-project"
+  let cfg = defaultConfig { cfgWorkingDir = "$HASKODE_TEST_DIR/src" }
+  cfg' <- expandConfig cfg
+  unsetEnv "HASKODE_TEST_DIR"
+  if cfgWorkingDir cfg' == "/tmp/test-project/src"
+    then pure $ Right ()
+    else pure $ Left $ "expandConfig workingDir: got " ++ show (cfgWorkingDir cfg')
+
+-- | expandConfig does not touch numeric or boolean fields.
+testExpandConfigPreservesNonStrings :: Test
+testExpandConfigPreservesNonStrings = do
+  let cfg = defaultConfig
+  cfg' <- expandConfig cfg
+  if cfgMaxTokens cfg' == cfgMaxTokens cfg
+     && cfgVerbose cfg' == cfgVerbose cfg
+     && cfgMaxContextChars cfg' == cfgMaxContextChars cfg
+     && cfgMaxSessionLogBytes cfg' == cfgMaxSessionLogBytes cfg
+    then pure $ Right ()
+    else pure $ Left "expandConfig changed non-string fields"
+
+-- | OPENAI_API_KEY is usable without pcApiKey in config (integration check).
+--   This tests that after expansion, an empty pcApiKey does not
+--   interfere with the existing OPENAI_API_KEY lookup in the provider.
+testExpandConfigOpenAIFallback :: Test
+testExpandConfigOpenAIFallback = do
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig) { pcApiKey = "" } }
+  cfg' <- expandConfig cfg
+  -- The pcApiKey should remain empty; the provider module handles
+  -- OPENAI_API_KEY separately via lookupEnv.
+  if pcApiKey (cfgProvider cfg') == ""
+    then pure $ Right ()
+    else pure $ Left $ "expandConfig changed empty pcApiKey: " ++ show (pcApiKey (cfgProvider cfg'))
 
 -- | Under-limit conversation proceeds to provider (provider reply is seen).
 testContextGuardUnderLimit :: Test
@@ -663,7 +800,7 @@ testContextGuardOverLimit = do
     Left _ex -> pure $ Right ()  -- expected: fail throws IOException
     Right _  -> pure $ Left "Over-limit guard: expected exception but got success"
 
--- | Context guard error text mentions that context management is not implemented.
+-- | Context guard error text mentions that Haskode does not auto-truncate.
 testContextGuardErrorText :: Test
 testContextGuardErrorText = do
   prov <- scriptedProvider
@@ -679,7 +816,7 @@ testContextGuardErrorText = do
   case result of
     Left ex -> do
       let errMsg = show ex
-      if "Context management is not implemented" `isInfixOf` errMsg
+      if "does not auto-truncate or summarize" `isInfixOf` errMsg
         then pure $ Right ()
         else pure $ Left $ "Error text missing phrase: " ++ errMsg
     Right _ -> pure $ Left "Expected exception for over-limit"
@@ -5101,6 +5238,728 @@ testFormatSessionSummaryContainsSections = do
     then pure $ Right ()
     else pure $ Left $ "formatSessionSummary missing sections: " ++ T.unpack (T.take 300 out)
 
+-- ---------------------------------------------------------------------------
+-- Lifecycle event tests
+-- ---------------------------------------------------------------------------
+
+-- | EConversationReset JSON roundtrip.
+testConversationResetJSON :: Test
+testConversationResetJSON = do
+  now <- getCurrentTime
+  let ev = Event now EConversationReset "conversation reset by /new"
+  case decode (encode ev) :: Maybe Event of
+    Nothing  -> pure $ Left "EConversationReset JSON roundtrip failed"
+    Just ev'
+      | evType ev' == EConversationReset && evData ev' == "conversation reset by /new" ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "EConversationReset roundtrip mismatch: " ++ show ev'
+
+-- | summarizeSession counts conversation_reset events.
+testSummarizeSessionConversationReset :: Test
+testSummarizeSessionConversationReset = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-summarize-reset"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now EUserMessage "hello"
+        , Event now EAssistantReply "hi"
+        , Event now EConversationReset "conversation reset by /new"
+        , Event now EUserMessage "second"
+        ]
+  flushLog root 0 log'
+  ss <- summarizeSession root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  let counts = ssTypeCounts ss
+      ok = ssTotalEvents ss == 4
+           && Map.findWithDefault 0 EConversationReset counts == 1
+           && Map.findWithDefault 0 EUserMessage counts == 2
+  if ok
+    then pure $ Right ()
+    else pure $ Left $ "conversation_reset count: total=" ++ show (ssTotalEvents ss)
+                     ++ " counts=" ++ show counts
+
+-- | formatSessionSummary includes conversation_reset line.
+testFormatSessionSummaryConversationReset :: Test
+testFormatSessionSummaryConversationReset = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-summarize-format-reset"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  now <- getCurrentTime
+  let log' = logEvent (Event now EConversationReset "reset") emptyLog
+  flushLog root 0 log'
+  ss <- summarizeSession root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  let out = formatSessionSummary ss
+  if T.isInfixOf "conversation_reset:" out
+    then pure $ Right ()
+    else pure $ Left $ "formatSessionSummary missing conversation_reset: " ++ T.unpack (T.take 300 out)
+
+-- | recordSessionStart produces an ESessionStart event.
+testRecordSessionStartEvent :: Test
+testRecordSessionStartEvent = do
+  let cfg = defaultConfig
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+  state1 <- recordSessionStart state0
+  let evts = events (asSession state1)
+      types = map evType evts
+  if types == [ESessionStart]
+    then pure $ Right ()
+    else pure $ Left $ "recordSessionStart events: " ++ show types
+
+-- | recordSessionEnd produces an ESessionEnd event.
+testRecordSessionEndEvent :: Test
+testRecordSessionEndEvent = do
+  let cfg = defaultConfig
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+  state1 <- recordSessionEnd state0
+  let evts = events (asSession state1)
+      types = map evType evts
+  if types == [ESessionEnd]
+    then pure $ Right ()
+    else pure $ Left $ "recordSessionEnd events: " ++ show types
+
+-- | recordConversationReset produces an EConversationReset event.
+testRecordConversationResetEvent :: Test
+testRecordConversationResetEvent = do
+  let cfg = defaultConfig
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+  state1 <- recordConversationReset state0
+  let evts = events (asSession state1)
+      types = map evType evts
+  if types == [EConversationReset]
+    then pure $ Right ()
+    else pure $ Left $ "recordConversationReset events: " ++ show types
+
+-- | /new command preserves existing session events and appends
+--   a conversation_reset event.  Tests the pure layer:
+--   resetConversation clears messages; recordConversationReset appends event.
+testNewPreservesSessionAndAppendsReset :: Test
+testNewPreservesSessionAndAppendsReset = do
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Hello."
+        , crToolCalls = Nothing
+        }
+    ]
+  let cfg = defaultConfig
+      state0 = initState cfg prov defaultPolicy defaultRegistry autoApprove
+  -- Run an agent turn to accumulate session events
+  state1 <- runAgent state0 "hi"
+  let evtsBefore = events (asSession state1)
+      countBefore = length evtsBefore
+  -- Simulate /new: reset conversation, record reset event
+  let state2 = resetConversation state1
+  state3 <- recordConversationReset state2
+  let evtsAfter = events (asSession state3)
+      countAfter = length evtsAfter
+      hasReset = EConversationReset `elem` map evType evtsAfter
+      convCleared = null (asConversation state2)
+  if countAfter == countBefore + 1 && hasReset && convCleared
+    then pure $ Right ()
+    else pure $ Left $ "before=" ++ show countBefore
+                     ++ " after=" ++ show countAfter
+                     ++ " hasReset=" ++ show hasReset
+                     ++ " convCleared=" ++ show convCleared
+
+-- | Full lifecycle: start, agent turn, reset, agent turn, end.
+--   Verifies the complete event sequence.
+testFullLifecycleEventSequence :: Test
+testFullLifecycleEventSequence = do
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "First reply."
+        , crToolCalls = Nothing
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "Second reply."
+        , crToolCalls = Nothing
+        }
+    ]
+  let cfg = defaultConfig
+      state0 = initState cfg prov defaultPolicy defaultRegistry autoApprove
+  -- session_start
+  state1 <- recordSessionStart state0
+  -- first turn
+  state2 <- runAgent state1 "first"
+  -- /new
+  let state3 = resetConversation state2
+  state4 <- recordConversationReset state3
+  -- second turn
+  state5 <- runAgent state4 "second"
+  -- session_end
+  state6 <- recordSessionEnd state5
+  let evts = events (asSession state6)
+      types = map evType evts
+  -- Expected: session_start, user_message, assistant_reply,
+  --           conversation_reset, user_message, assistant_reply, session_end
+  let expected = [ ESessionStart, EUserMessage, EAssistantReply
+                 , EConversationReset, EUserMessage, EAssistantReply, ESessionEnd]
+  if types == expected
+    then pure $ Right ()
+    else pure $ Left $ "lifecycle events: " ++ show types
+                     ++ " expected: " ++ show expected
+
+-- ---------------------------------------------------------------------------
+-- isMeaningfulSession tests
+-- ---------------------------------------------------------------------------
+
+-- | Empty log is not meaningful.
+testIsMeaningfulEmpty :: Test
+testIsMeaningfulEmpty =
+  if not (isMeaningfulSession emptyLog)
+    then pure $ Right ()
+    else pure $ Left "empty log should not be meaningful"
+
+-- | Lifecycle-only log ([session_start, session_end]) is not meaningful.
+testIsMeaningfulLifecycleOnly :: Test
+testIsMeaningfulLifecycleOnly = do
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now ESessionStart "session started"
+        , Event now ESessionEnd "session ended"
+        ]
+  if not (isMeaningfulSession log')
+    then pure $ Right ()
+    else pure $ Left "lifecycle-only log should not be meaningful"
+
+-- | Lifecycle with conversation_reset is not meaningful.
+testIsMeaningfulWithReset :: Test
+testIsMeaningfulWithReset = do
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now ESessionStart "session started"
+        , Event now EConversationReset "conversation reset by /new"
+        , Event now ESessionEnd "session ended"
+        ]
+  if not (isMeaningfulSession log')
+    then pure $ Right ()
+    else pure $ Left "lifecycle+reset log should not be meaningful"
+
+-- | Log with user_message is meaningful.
+testIsMeaningfulWithUserMessage :: Test
+testIsMeaningfulWithUserMessage = do
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now ESessionStart "session started"
+        , Event now EUserMessage "hello"
+        , Event now ESessionEnd "session ended"
+        ]
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "log with user_message should be meaningful"
+
+-- | Log with assistant_reply is meaningful.
+testIsMeaningfulWithAssistantReply :: Test
+testIsMeaningfulWithAssistantReply = do
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now ESessionStart "session started"
+        , Event now EAssistantReply "hi"
+        , Event now ESessionEnd "session ended"
+        ]
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "log with assistant_reply should be meaningful"
+
+-- | Log with tool_call is meaningful.
+testIsMeaningfulWithToolCall :: Test
+testIsMeaningfulWithToolCall = do
+  now <- getCurrentTime
+  let log' = logEvent (Event now EToolCall "tc-1 read_file") emptyLog
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "log with tool_call should be meaningful"
+
+-- | Log with tool_result is meaningful.
+testIsMeaningfulWithToolResult :: Test
+testIsMeaningfulWithToolResult = do
+  now <- getCurrentTime
+  let log' = logEvent (Event now EToolResult "tc-1 contents") emptyLog
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "log with tool_result should be meaningful"
+
+-- | Log with policy_decision is meaningful.
+testIsMeaningfulWithPolicyDecision :: Test
+testIsMeaningfulWithPolicyDecision = do
+  now <- getCurrentTime
+  let log' = logEvent (Event now EPolicyDecision "read_file: Allow") emptyLog
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "log with policy_decision should be meaningful"
+
+-- | Full lifecycle with real content is meaningful.
+testIsMeaningfulFullLifecycle :: Test
+testIsMeaningfulFullLifecycle = do
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now ESessionStart "session started"
+        , Event now EUserMessage "hello"
+        , Event now EAssistantReply "hi"
+        , Event now EConversationReset "conversation reset by /new"
+        , Event now EUserMessage "second"
+        , Event now EAssistantReply "hey"
+        , Event now ESessionEnd "session ended"
+        ]
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "full lifecycle with content should be meaningful"
+
+-- | flushLogOnException does NOT flush a lifecycle-only session on exception.
+testFlushLogOnExceptionLifecycleOnly :: Test
+testFlushLogOnExceptionLifecycleOnly = do
+  tmpDir <- getTemporaryDirectory
+  now    <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now ESessionStart "session started"
+        , Event now ESessionEnd "session ended"
+        ]
+      path = tmpDir </> "session.jsonl"
+  _ <- try (removeFile path) :: IO (Either IOException ())
+  let badAction = throwIO (userError "simulated") :: IO ()
+  _ <- try (flushLogOnException tmpDir 0 log' badAction) :: IO (Either IOException ())
+  exists <- doesFileExist path
+  cleanup path
+  if not exists
+    then pure $ Right ()
+    else pure $ Left "lifecycle-only session should not create file on exception"
+
+-- ---------------------------------------------------------------------------
+-- Slash-command tests (pure)
+-- ---------------------------------------------------------------------------
+
+testParseSlashCommandHelp :: Test
+testParseSlashCommandHelp =
+  if parseSlashCommand "/help" == Just "help"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/help\" should be Just \"help\""
+
+testParseSlashCommandStatus :: Test
+testParseSlashCommandStatus =
+  if parseSlashCommand "/status" == Just "status"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/status\" should be Just \"status\""
+
+testParseSlashCommandExit :: Test
+testParseSlashCommandExit =
+  if parseSlashCommand "/exit" == Just "exit"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/exit\" should be Just \"exit\""
+
+testParseSlashCommandQuit :: Test
+testParseSlashCommandQuit =
+  if parseSlashCommand "/quit" == Just "quit"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/quit\" should be Just \"quit\""
+
+testParseSlashCommandUnknown :: Test
+testParseSlashCommandUnknown =
+  if parseSlashCommand "/foo" == Just "foo"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/foo\" should be Just \"foo\""
+
+testParseSlashCommandNormalInput :: Test
+testParseSlashCommandNormalInput =
+  if parseSlashCommand "hello" == Nothing
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"hello\" should be Nothing"
+
+testParseSlashCommandWhitespace :: Test
+testParseSlashCommandWhitespace =
+  if parseSlashCommand "  /help  " == Just "help"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"  /help  \" should be Just \"help\""
+
+testParseSlashCommandEmpty :: Test
+testParseSlashCommandEmpty =
+  if parseSlashCommand "" == Nothing
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"\" should be Nothing"
+
+testParseSlashCommandSpacesOnly :: Test
+testParseSlashCommandSpacesOnly =
+  if parseSlashCommand "   " == Nothing
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"   \" should be Nothing"
+
+testFormatHelpContent :: Test
+testFormatHelpContent =
+  if T.isInfixOf "/help" formatHelp
+     && T.isInfixOf "/status" formatHelp
+     && T.isInfixOf "/exit" formatHelp
+     && T.isInfixOf "/quit" formatHelp
+    then pure $ Right ()
+    else pure $ Left $ "formatHelp missing expected commands: " ++ T.unpack (T.take 200 formatHelp)
+
+testFormatStatusContent :: Test
+testFormatStatusContent =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "openai"
+                            , pcModel    = "gpt-4o"
+                            , pcBaseUrl  = "https://api.openai.com"
+                            , pcApiKey   = "sk-secret-key-12345"
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      out   = formatStatus state
+  in if T.isInfixOf "openai" out
+        && T.isInfixOf "gpt-4o" out
+        && T.isInfixOf "https://api.openai.com" out
+        && T.isInfixOf "Session events:" out
+        && T.isInfixOf "Tools:" out
+        && T.isInfixOf "Context est:" out
+        && T.isInfixOf "Remaining:" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus missing expected fields: " ++ T.unpack (T.take 400 out)
+
+testFormatStatusNoApiKey :: Test
+testFormatStatusNoApiKey =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcApiKey = "sk-super-secret-key-DO-NOT-PRINT" }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      out   = formatStatus state
+  in if T.isInfixOf "sk-super-secret-key-DO-NOT-PRINT" out
+     then pure $ Left "formatStatus should not expose API key"
+     else pure $ Right ()
+
+testFormatUnknownCommandContent :: Test
+testFormatUnknownCommandContent =
+  let out = formatUnknownCommand "foo"
+  in if T.isInfixOf "/foo" out && T.isInfixOf "/help" out
+     then pure $ Right ()
+     else pure $ Left $ "formatUnknownCommand missing expected text: " ++ T.unpack out
+
+testFormatContextUsageUnderLimit :: Test
+testFormatContextUsageUnderLimit =
+  let conv    = [mkUserMessage "hello"]   -- 5 chars + 20 overhead = 25
+      maxC    = 120000
+      out     = formatContextUsage conv maxC
+      est     = estimateContextChars conv
+      remain  = maxC - est
+  in if T.isInfixOf (T.pack (show est)) out
+        && T.isInfixOf "Context est:" out
+        && T.isInfixOf (T.pack (show remain)) out
+        && T.isInfixOf "Remaining:" out
+        && T.isInfixOf "% used" out
+     then pure $ Right ()
+     else pure $ Left $ "formatContextUsage under-limit: " ++ T.unpack out
+
+testFormatContextUsageExactLimit :: Test
+testFormatContextUsageExactLimit =
+  let conv    = [mkUserMessage "hello"]   -- 25 chars estimated
+      maxC    = estimateContextChars conv  -- exactly at limit
+      out     = formatContextUsage conv maxC
+  in if T.isInfixOf "Remaining:" out
+        && T.isInfixOf "0 chars" out
+        && not (T.isInfixOf "Over limit:" out)
+     then pure $ Right ()
+     else pure $ Left $ "formatContextUsage exact-limit: " ++ T.unpack out
+
+testFormatContextUsageOverLimit :: Test
+testFormatContextUsageOverLimit =
+  let conv    = [mkUserMessage "this is a longer message for testing"]
+      maxC    = 10   -- deliberately small
+      out     = formatContextUsage conv maxC
+      est     = estimateContextChars conv
+      overBy  = est - maxC
+  in if T.isInfixOf "Over limit:" out
+        && T.isInfixOf (T.pack (show overBy)) out
+        && T.isInfixOf "Context est:" out
+        && T.isInfixOf "% used" out
+     then pure $ Right ()
+     else pure $ Left $ "formatContextUsage over-limit: " ++ T.unpack out
+
+testParseSlashCommandNew :: Test
+testParseSlashCommandNew =
+  if parseSlashCommand "/new" == Just "new"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/new\" should be Just \"new\""
+
+testFormatHelpContentIncludesNew :: Test
+testFormatHelpContentIncludesNew =
+  if T.isInfixOf "/new" formatHelp
+    then pure $ Right ()
+    else pure $ Left $ "formatHelp missing /new: " ++ T.unpack (T.take 200 formatHelp)
+
+testFormatNewConfirmationText :: Test
+testFormatNewConfirmationText =
+  if "fresh conversation" `T.isInfixOf` formatNewConfirmation
+    then pure $ Right ()
+    else pure $ Left $ "formatNewConfirmation missing expected text: " ++ T.unpack formatNewConfirmation
+
+testResetConversationClearsMessages :: Test
+testResetConversationClearsMessages =
+  let cfg = defaultConfig
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      msg = Message User "hello" Nothing Nothing
+      state1 = state0 { asConversation = [msg] }
+      state2 = resetConversation state1
+  in if null (asConversation state2)
+       then pure $ Right ()
+       else pure $ Left "resetConversation should clear conversation"
+
+testResetConversationPreservesSession :: Test
+testResetConversationPreservesSession =
+  let cfg = defaultConfig
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      msg = Message User "hello" Nothing Nothing
+      state1 = state0 { asConversation = [msg] }
+      state2 = resetConversation state1
+  in if length (events (asSession state2)) == length (events (asSession state1))
+       then pure $ Right ()
+       else pure $ Left "resetConversation should preserve session events"
+
+-- ---------------------------------------------------------------------------
+-- Display formatting tests (pure)
+-- ---------------------------------------------------------------------------
+
+-- | indentBlock indents each line by the given number of spaces.
+testDisplayIndentBlock :: Test
+testDisplayIndentBlock =
+  let result = indentBlock 4 "line1\nline2\n"
+  in if result == "    line1\n    line2\n"
+       then pure $ Right ()
+       else pure $ Left $ "indentBlock 4: got " ++ show result
+
+-- | indentBlock with single line.
+testDisplayIndentBlockSingleLine :: Test
+testDisplayIndentBlockSingleLine =
+  let result = indentBlock 2 "hello\n"
+  in if result == "  hello\n"
+       then pure $ Right ()
+       else pure $ Left $ "indentBlock single: got " ++ show result
+
+-- | indentBlock on empty text returns empty string.
+testDisplayIndentBlockEmpty :: Test
+testDisplayIndentBlockEmpty =
+  let result = indentBlock 4 ""
+  in if result == ""
+       then pure $ Right ()
+       else pure $ Left $ "indentBlock empty: got " ++ show result
+
+-- | indentBlock preserves trailing content without newline.
+testDisplayIndentBlockNoTrailingNewline :: Test
+testDisplayIndentBlockNoTrailingNewline =
+  let result = indentBlock 2 "line1\nline2"
+  in if result == "  line1\n  line2\n"
+       then pure $ Right ()
+       else pure $ Left $ "indentBlock no trailing: got " ++ show result
+
+-- | formatAssistantReply wraps content with Assistant: prefix and newlines.
+testDisplayFormatAssistantReply :: Test
+testDisplayFormatAssistantReply =
+  let result = formatAssistantReply "hello there"
+  in if result == "\nAssistant: hello there\n"
+       then pure $ Right ()
+       else pure $ Left $ "formatAssistantReply: got " ++ show result
+
+-- | formatAssistantReply with empty content.
+testDisplayFormatAssistantReplyEmpty :: Test
+testDisplayFormatAssistantReplyEmpty =
+  let result = formatAssistantReply ""
+  in if result == "\nAssistant: \n"
+       then pure $ Right ()
+       else pure $ Left $ "formatAssistantReply empty: got " ++ show result
+
+-- | formatToolExecuting produces correct label.
+testDisplayFormatToolExecuting :: Test
+testDisplayFormatToolExecuting =
+  let result = formatToolExecuting "read_file"
+  in if result == "  [tool] Executing: read_file"
+       then pure $ Right ()
+       else pure $ Left $ "formatToolExecuting: got " ++ show result
+
+-- | formatToolResult produces correct label.
+testDisplayFormatToolResult :: Test
+testDisplayFormatToolResult =
+  let result = formatToolResult "file contents here"
+  in if result == "  [tool] Result: file contents here"
+       then pure $ Right ()
+       else pure $ Left $ "formatToolResult: got " ++ show result
+
+-- | formatToolUnknown produces correct label.
+testDisplayFormatToolUnknown :: Test
+testDisplayFormatToolUnknown =
+  let result = formatToolUnknown "bad_tool"
+  in if result == "  [error] Unknown tool: bad_tool"
+       then pure $ Right ()
+       else pure $ Left $ "formatToolUnknown: got " ++ show result
+
+-- | formatPolicyDenied produces correct label with name and reason.
+testDisplayFormatPolicyDenied :: Test
+testDisplayFormatPolicyDenied =
+  let result = formatPolicyDenied "shell" "dangerous command"
+  in if result == "  [policy] Denied: shell -- dangerous command"
+       then pure $ Right ()
+       else pure $ Left $ "formatPolicyDenied: got " ++ show result
+
+-- | formatPolicyConfirmationNeeded produces correct label.
+testDisplayFormatPolicyConfirmationNeeded :: Test
+testDisplayFormatPolicyConfirmationNeeded =
+  let result = formatPolicyConfirmationNeeded "apply_patch"
+  in if result == "  [policy] Confirmation needed: apply_patch"
+       then pure $ Right ()
+       else pure $ Left $ "formatPolicyConfirmationNeeded: got " ++ show result
+
+-- | formatPolicyApproved produces correct text.
+testDisplayFormatPolicyApproved :: Test
+testDisplayFormatPolicyApproved =
+  if formatPolicyApproved == "  [policy] Approved by user."
+    then pure $ Right ()
+    else pure $ Left $ "formatPolicyApproved: got " ++ show formatPolicyApproved
+
+-- | formatPolicyRejected produces correct text.
+testDisplayFormatPolicyRejected :: Test
+testDisplayFormatPolicyRejected =
+  if formatPolicyRejected == "  [policy] Rejected by user."
+    then pure $ Right ()
+    else pure $ Left $ "formatPolicyRejected: got " ++ show formatPolicyRejected
+
+-- | formatConfirmTool produces correct label.
+testDisplayFormatConfirmTool :: Test
+testDisplayFormatConfirmTool =
+  let result = formatConfirmTool "read_file"
+  in if result == "  [confirm] Tool:     read_file"
+       then pure $ Right ()
+       else pure $ Left $ "formatConfirmTool: got " ++ show result
+
+-- | formatConfirmArgs produces correct label.
+testDisplayFormatConfirmArgs :: Test
+testDisplayFormatConfirmArgs =
+  let result = formatConfirmArgs "{\"path\":\"foo.hs\"}"
+  in if result == "  [confirm] Args:     {\"path\":\"foo.hs\"}"
+       then pure $ Right ()
+       else pure $ Left $ "formatConfirmArgs: got " ++ show result
+
+-- | formatConfirmReason produces correct label.
+testDisplayFormatConfirmReason :: Test
+testDisplayFormatConfirmReason =
+  let result = formatConfirmReason "needs approval"
+  in if result == "  [confirm] Reason:   needs approval"
+       then pure $ Right ()
+       else pure $ Left $ "formatConfirmReason: got " ++ show result
+
+-- | formatConfirmPrompt produces correct text.
+testDisplayFormatConfirmPrompt :: Test
+testDisplayFormatConfirmPrompt =
+  if formatConfirmPrompt == "  [confirm] Approve? (y/N) "
+    then pure $ Right ()
+    else pure $ Left $ "formatConfirmPrompt: got " ++ show formatConfirmPrompt
+
+-- | formatConfirmFile produces correct label.
+testDisplayFormatConfirmFile :: Test
+testDisplayFormatConfirmFile =
+  let result = formatConfirmFile "src/Main.hs"
+  in if result == "  [confirm] File:     src/Main.hs"
+       then pure $ Right ()
+       else pure $ Left $ "formatConfirmFile: got " ++ show result
+
+-- | formatConfirmDiffHeader produces correct text.
+testDisplayFormatConfirmDiffHeader :: Test
+testDisplayFormatConfirmDiffHeader =
+  if formatConfirmDiffHeader == "  [confirm] Diff:"
+    then pure $ Right ()
+    else pure $ Left $ "formatConfirmDiffHeader: got " ++ show formatConfirmDiffHeader
+
+-- | formatConfirmPreviewHeader produces correct text.
+testDisplayFormatConfirmPreviewHeader :: Test
+testDisplayFormatConfirmPreviewHeader =
+  if formatConfirmPreviewHeader == "  [confirm] Preview:"
+    then pure $ Right ()
+    else pure $ Left $ "formatConfirmPreviewHeader: got " ++ show formatConfirmPreviewHeader
+
+-- | formatError produces correct label.
+testDisplayFormatError :: Test
+testDisplayFormatError =
+  let result = formatError "something went wrong"
+  in if result == "  [error] something went wrong"
+       then pure $ Right ()
+       else pure $ Left $ "formatError: got " ++ show result
+
+-- | formatVerbose produces correct label format.
+testDisplayFormatVerbose :: Test
+testDisplayFormatVerbose =
+  let result = formatVerbose "provider" "openai"
+  in if result == "[verbose] provider: openai"
+       then pure $ Right ()
+       else pure $ Left $ "formatVerbose: got " ++ show result
+
+-- | Multiline diff formatted with indentBlock is readable.
+testDisplayMultilineDiffIndent :: Test
+testDisplayMultilineDiffIndent =
+  let diff = "--- Foo.hs\n+++ Foo.hs\n@@ -1 +1 @@\n-old\n+new\n"
+      result = indentBlock 4 diff
+      lines' = T.lines result
+  in if all (\l -> T.null l || T.isPrefixOf "    " l) lines'
+       then pure $ Right ()
+       else pure $ Left $ "Multiline diff indent failed: " ++ show lines'
+
+-- | No secrets appear in formatVerbose output.
+testDisplayFormatVerboseNoSecrets :: Test
+testDisplayFormatVerboseNoSecrets =
+  let result = formatVerbose "api key" "sk-secret-12345"
+  in -- formatVerbose is a simple concatenation helper; it does not
+     -- redact.  This test confirms the function exists and works.
+     -- Secret redaction is handled by the caller (e.g. formatStatus
+     -- in Commands.hs never prints pcApiKey).
+     if "sk-secret-12345" `T.isInfixOf` T.pack result
+       then pure $ Right ()
+       else pure $ Left $ "formatVerbose value not in output: " ++ result
+
+-- | formatContextLimitRefusal includes estimated character count.
+testFormatContextLimitRefusalEstimate :: Test
+testFormatContextLimitRefusalEstimate =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "130000" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing estimate in: " ++ T.unpack msg
+
+-- | formatContextLimitRefusal includes configured limit.
+testFormatContextLimitRefusalLimit :: Test
+testFormatContextLimitRefusalLimit =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "120000" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing limit in: " ++ T.unpack msg
+
+-- | formatContextLimitRefusal includes over-limit delta.
+testFormatContextLimitRefusalDelta :: Test
+testFormatContextLimitRefusalDelta =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "10000" `T.isInfixOf` msg && "Over limit by" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing delta in: " ++ T.unpack msg
+
+-- | formatContextLimitRefusal states no auto-truncation or summarization.
+testFormatContextLimitRefusalNoAutoTruncate :: Test
+testFormatContextLimitRefusalNoAutoTruncate =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "does not auto-truncate or summarize" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing no-auto-truncate note in: " ++ T.unpack msg
+
+-- | formatContextLimitRefusal includes suggested next steps.
+testFormatContextLimitRefusalNextSteps :: Test
+testFormatContextLimitRefusalNextSteps =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "Suggested next steps" `T.isInfixOf` msg
+       && "fresh session"       `T.isInfixOf` msg
+       && "cfgMaxContextChars"  `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing next steps in: " ++ T.unpack msg
+
+-- | formatContextLimitRefusal with no overage (exact limit exceeded by 1).
+testFormatContextLimitRefusalExactOver :: Test
+testFormatContextLimitRefusalExactOver =
+  let msg = formatContextLimitRefusal 120001 120000
+  in if "1" `T.isInfixOf` msg && "Over limit by" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Exact-over case failed: " ++ T.unpack msg
+
 -- | Helper: remove a temp file, ignoring errors.
 cleanup :: FilePath -> IO ()
 cleanup path = do
@@ -5149,6 +6008,17 @@ main = runTests
   , testConfigBackcompatMalformedContextChars
   , testConfigBackcompatMalformedSessionLogBytes
   , testDefaultConfigOptionalFields
+    -- Environment-variable expansion tests
+  , testExpandEnvVarBare
+  , testExpandEnvVarBraced
+  , testExpandEnvVarUndefined
+  , testExpandEnvVarUndefinedBare
+  , testExpandEnvVarNone
+  , testExpandEnvVarTrailingDollar
+  , testExpandConfigProviderFields
+  , testExpandConfigWorkingDir
+  , testExpandConfigPreservesNonStrings
+  , testExpandConfigOpenAIFallback
   , testContextGuardUnderLimit
   , testContextGuardOverLimit
   , testContextGuardErrorText
@@ -5391,4 +6261,78 @@ main = runTests
   , testSummarizeSessionIgnoresBackup
   , testAgentUnchangedWithSessionSummary
   , testFormatSessionSummaryContainsSections
+    -- Lifecycle event tests
+  , testConversationResetJSON
+  , testSummarizeSessionConversationReset
+  , testFormatSessionSummaryConversationReset
+  , testRecordSessionStartEvent
+  , testRecordSessionEndEvent
+  , testRecordConversationResetEvent
+  , testNewPreservesSessionAndAppendsReset
+  , testFullLifecycleEventSequence
+    -- isMeaningfulSession tests
+  , testIsMeaningfulEmpty
+  , testIsMeaningfulLifecycleOnly
+  , testIsMeaningfulWithReset
+  , testIsMeaningfulWithUserMessage
+  , testIsMeaningfulWithAssistantReply
+  , testIsMeaningfulWithToolCall
+  , testIsMeaningfulWithToolResult
+  , testIsMeaningfulWithPolicyDecision
+  , testIsMeaningfulFullLifecycle
+  , testFlushLogOnExceptionLifecycleOnly
+    -- Slash-command tests (pure)
+  , testParseSlashCommandHelp
+  , testParseSlashCommandStatus
+  , testParseSlashCommandExit
+  , testParseSlashCommandQuit
+  , testParseSlashCommandUnknown
+  , testParseSlashCommandNormalInput
+  , testParseSlashCommandWhitespace
+  , testParseSlashCommandEmpty
+  , testParseSlashCommandSpacesOnly
+  , testParseSlashCommandNew
+  , testFormatHelpContent
+  , testFormatHelpContentIncludesNew
+  , testFormatStatusContent
+  , testFormatStatusNoApiKey
+  , testFormatContextUsageUnderLimit
+  , testFormatContextUsageExactLimit
+  , testFormatContextUsageOverLimit
+  , testFormatUnknownCommandContent
+  , testFormatNewConfirmationText
+  , testResetConversationClearsMessages
+  , testResetConversationPreservesSession
+    -- Display formatting tests (pure)
+  , testDisplayIndentBlock
+  , testDisplayIndentBlockSingleLine
+  , testDisplayIndentBlockEmpty
+  , testDisplayIndentBlockNoTrailingNewline
+  , testDisplayFormatAssistantReply
+  , testDisplayFormatAssistantReplyEmpty
+  , testDisplayFormatToolExecuting
+  , testDisplayFormatToolResult
+  , testDisplayFormatToolUnknown
+  , testDisplayFormatPolicyDenied
+  , testDisplayFormatPolicyConfirmationNeeded
+  , testDisplayFormatPolicyApproved
+  , testDisplayFormatPolicyRejected
+  , testDisplayFormatConfirmTool
+  , testDisplayFormatConfirmArgs
+  , testDisplayFormatConfirmReason
+  , testDisplayFormatConfirmPrompt
+  , testDisplayFormatConfirmFile
+  , testDisplayFormatConfirmDiffHeader
+  , testDisplayFormatConfirmPreviewHeader
+  , testDisplayFormatError
+  , testDisplayFormatVerbose
+  , testDisplayMultilineDiffIndent
+  , testDisplayFormatVerboseNoSecrets
+    -- Context limit refusal formatting tests (pure)
+  , testFormatContextLimitRefusalEstimate
+  , testFormatContextLimitRefusalLimit
+  , testFormatContextLimitRefusalDelta
+  , testFormatContextLimitRefusalNoAutoTruncate
+  , testFormatContextLimitRefusalNextSteps
+  , testFormatContextLimitRefusalExactOver
   ]

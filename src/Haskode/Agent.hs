@@ -34,6 +34,10 @@ module Haskode.Agent
   , loadAgentsMd
     -- * Context estimation
   , estimateContextChars
+    -- * Session lifecycle helpers
+  , recordSessionStart
+  , recordSessionEnd
+  , recordConversationReset
     -- * Approval
   , ApprovalFunc
   , autoApprove
@@ -53,6 +57,15 @@ import System.Directory   (doesFileExist, getFileSize)
 import System.IO          (hFlush, stdout)
 
 import Haskode.Config     (Config (..), ProviderConfig (..))
+import Haskode.Display    (formatAssistantReply, formatToolExecuting,
+                           formatToolResult, formatToolUnknown,
+                           formatPolicyDenied, formatPolicyConfirmationNeeded,
+                           formatPolicyApproved, formatPolicyRejected,
+                           formatConfirmTool, formatConfirmArgs,
+                           formatConfirmReason, formatConfirmPrompt,
+                           formatConfirmFile, formatConfirmDiffHeader,
+                           formatConfirmPreviewHeader, formatContextLimitRefusal,
+                           indentBlock)
 import Haskode.Core       (Conversation, Message (..), Role (..), ToolCall (..),
                            ToolResult (..), emptyConversation,
                            mkUserMessage, mkSystemMessage, appendMessage)
@@ -102,10 +115,10 @@ autoReject _tc _reason = pure False
 --   This is the default approval function used by the CLI.
 terminalApproval :: ApprovalFunc
 terminalApproval tc reason = do
-  TIO.putStrLn $ "  [confirm] Tool:     " <> tcName tc
-  TIO.putStrLn $ "  [confirm] Args:     " <> encodeText (tcArgs tc)
-  TIO.putStrLn $ "  [confirm] Reason:   " <> reason
-  putStr   "  [confirm] Approve? (y/N) "
+  TIO.putStrLn $ formatConfirmTool (tcName tc)
+  TIO.putStrLn $ formatConfirmArgs (encodeText (tcArgs tc))
+  TIO.putStrLn $ formatConfirmReason reason
+  putStr   (T.unpack formatConfirmPrompt)
   hFlush stdout
   answer <- TIO.getLine
   pure (T.strip answer `elem` ["y", "Y"])
@@ -135,6 +148,31 @@ initState cfg prov pol reg approve = AgentState
   , asRegistry     = reg
   , asApproval     = approve
   }
+
+-- ---------------------------------------------------------------------------
+-- Session lifecycle helpers
+-- ---------------------------------------------------------------------------
+
+-- | Record a @session_start@ event in the agent state's session log.
+--   Call once when an interactive or single-shot run begins.
+recordSessionStart :: AgentState -> IO AgentState
+recordSessionStart st = do
+  now <- getCurrentTime
+  pure st { asSession = logEvent (Event now ESessionStart "session started") (asSession st) }
+
+-- | Record a @session_end@ event in the agent state's session log.
+--   Call once when the run exits normally, before flushing.
+recordSessionEnd :: AgentState -> IO AgentState
+recordSessionEnd st = do
+  now <- getCurrentTime
+  pure st { asSession = logEvent (Event now ESessionEnd "session ended") (asSession st) }
+
+-- | Record a @conversation_reset@ event in the agent state's session log.
+--   Call when @/new@ resets the in-memory conversation.
+recordConversationReset :: AgentState -> IO AgentState
+recordConversationReset st = do
+  now <- getCurrentTime
+  pure st { asSession = logEvent (Event now EConversationReset "conversation reset by /new") (asSession st) }
 
 -- ---------------------------------------------------------------------------
 -- System prompt
@@ -300,12 +338,8 @@ processTurn state = do
   let maxChars   = cfgMaxContextChars cfg
       charEst    = estimateContextChars context
   when (charEst > maxChars) $ do
-    let msg = "Error: conversation is too large to send ("
-            <> T.pack (show charEst) <> " chars estimated, limit "
-            <> T.pack (show maxChars) <> "). "
-            <> "Context management is not implemented yet -- "
-            <> "please start a new session to continue."
-    TIO.putStrLn $ "\nAssistant: " <> msg <> "\n"
+    let msg = formatContextLimitRefusal charEst maxChars
+    TIO.putStrLn $ formatAssistantReply msg
     fail (T.unpack msg)
 
   -- Call the provider
@@ -347,7 +381,7 @@ processTurn state = do
   case crToolCalls resp of
     Nothing -> do
       -- Final text reply — display and return
-      TIO.putStrLn $ "\nAssistant: " <> msgContent reply <> "\n"
+      TIO.putStrLn $ formatAssistantReply (msgContent reply)
       pure state1
     Just calls -> do
       -- Process each tool call and loop
@@ -398,7 +432,7 @@ processSingleToolCall state tc = do
                   (tcId tc <> " denied: " <> reason))
                 (asSession state1)
             }
-      TIO.putStrLn $ "  [policy] Denied: " <> tcName tc <> " -- " <> reason
+      TIO.putStrLn $ formatPolicyDenied (tcName tc) reason
       pure state2
 
     AskUser reason -> do
@@ -418,7 +452,7 @@ processSingleToolCall state tc = do
               Just p  -> "write " <> p <> " -- " <> reason
               Nothing -> reason
             else reason
-      TIO.putStrLn $ "  [policy] Confirmation needed: " <> tcName tc
+      TIO.putStrLn $ formatPolicyConfirmationNeeded (tcName tc)
       -- Show diff preview for apply_patch so the user sees what will change.
       when (tcName tc == "apply_patch") $
         showPatchPreview tc
@@ -429,7 +463,7 @@ processSingleToolCall state tc = do
       if approved
         then do
           -- User approved — execute the tool (same path as Allow)
-          TIO.putStrLn "  [policy] Approved by user."
+          TIO.putStrLn formatPolicyApproved
           now2 <- getCurrentTime
           -- For apply_patch, include the target path in the audit event
           -- so the session log records which file was approved.
@@ -450,7 +484,7 @@ processSingleToolCall state tc = do
           executeTool state2 tc
         else do
           -- User rejected — log and return a denial result
-          TIO.putStrLn "  [policy] Rejected by user."
+          TIO.putStrLn formatPolicyRejected
           now2 <- getCurrentTime
           -- For apply_patch, include the target path in the denial reason
           -- so the session log records which file was rejected.
@@ -507,12 +541,12 @@ executeTool state tc = do
                   (tcId tc <> " error: unknown tool " <> tcName tc))
                 (asSession state)
             }
-      TIO.putStrLn $ "  [error] Unknown tool: " <> tcName tc
+      TIO.putStrLn $ formatToolUnknown (tcName tc)
       pure state'
 
     Just tool -> do
       -- Execute
-      TIO.putStrLn $ "  [tool] Executing: " <> tcName tc
+      TIO.putStrLn $ formatToolExecuting (tcName tc)
       now <- getCurrentTime
       let state' = state
             { asSession = logEvent
@@ -545,7 +579,7 @@ executeTool state tc = do
                   (tcId tc <> " " <> sessionOutput))
                 (asSession state')
             }
-      TIO.putStrLn $ "  [tool] Result: " <> truncateDisplay fullOutput
+      TIO.putStrLn $ formatToolResult (truncateDisplay fullOutput)
       pure state''
 
 -- | Show a diff preview for an @apply_patch@ tool call.
@@ -561,9 +595,9 @@ showPatchPreview tc = do
       -- Preview failed; the approval prompt still works without it.
       pure ()
     Right (path, diff) -> do
-      TIO.putStrLn $ "  [confirm] File:     " <> T.pack path
-      TIO.putStrLn   "  [confirm] Diff:"
-      TIO.putStrLn $ "  " <> T.unlines (map ("  " <>) (T.lines diff))
+      TIO.putStrLn $ formatConfirmFile (T.pack path)
+      TIO.putStrLn   formatConfirmDiffHeader
+      TIO.putStrLn $ indentBlock 4 diff
 
 -- | Show a preview for a @write_file@ tool call.
 --   Prints the target path and a concise diff-like preview to the
@@ -578,9 +612,9 @@ showWriteFilePreview tc = do
       -- Preview failed; the approval prompt still works without it.
       pure ()
     Right (path, preview) -> do
-      TIO.putStrLn $ "  [confirm] File:     " <> T.pack path
-      TIO.putStrLn   "  [confirm] Preview:"
-      TIO.putStrLn $ "  " <> T.unlines (map ("  " <>) (T.lines preview))
+      TIO.putStrLn $ formatConfirmFile (T.pack path)
+      TIO.putStrLn   formatConfirmPreviewHeader
+      TIO.putStrLn $ indentBlock 4 preview
 
 -- | Encode a JSON Value to Text (for logging).
 --   Produces clean JSON without Haskell string escaping.

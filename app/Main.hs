@@ -27,19 +27,21 @@ module Main (main) where
 
 import Control.Monad      (when)
 import Data.Text          (Text)
-import qualified Data.Text    as T
 import qualified Data.Text.IO as TIO
 import Options.Applicative
 import System.Exit        (exitFailure, exitSuccess)
 import System.IO          (hFlush, stdout, hSetBuffering, stdin, BufferMode (..))
 
-import Haskode.Config         (Config (..), ProviderConfig (..), loadConfig)
-import Haskode.Provider       (Provider, stubProvider)
+import Haskode.Commands        (parseSlashCommand, formatHelp, formatStatus, formatUnknownCommand, formatNewConfirmation, resetConversation)
+import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig)
+import Haskode.Display         (formatVerbose)
+import Haskode.Provider        (Provider, stubProvider)
 import Haskode.Provider.OpenAI (openaiProvider)
-import Haskode.Policy         (defaultPolicy)
-import Haskode.Session        (flushLog, flushLogOnException, summarizeSession, formatSessionSummary)
-import Haskode.Tools          (defaultRegistry)
-import Haskode.Agent          (AgentState (..), initState, runAgent, terminalApproval)
+import Haskode.Policy          (defaultPolicy)
+import Haskode.Session         (flushLog, flushLogOnException, summarizeSession, formatSessionSummary, isMeaningfulSession)
+import Haskode.Tools           (defaultRegistry)
+import Haskode.Agent           (AgentState (..), initState, runAgent, terminalApproval,
+                                recordSessionStart, recordSessionEnd, recordConversationReset)
 
 -- ---------------------------------------------------------------------------
 -- CLI options
@@ -136,22 +138,27 @@ main = do
   -- Print diagnostics in verbose mode
   when (optVerbose opts') $ do
     let pc = cfgProvider cfg'
-    putStrLn $ "[verbose] provider: " ++ pcProvider pc
-    putStrLn $ "[verbose] model:    " ++ pcModel pc
-    putStrLn $ "[verbose] base url: " ++ pcBaseUrl pc
+    putStrLn $ formatVerbose "provider" (pcProvider pc)
+    putStrLn $ formatVerbose "model"    (pcModel pc)
+    putStrLn $ formatVerbose "base url" (pcBaseUrl pc)
     putStrLn ""
 
   -- Build initial state
-  let state = initState cfg' prov defaultPolicy defaultRegistry terminalApproval
+  let state0 = initState cfg' prov defaultPolicy defaultRegistry terminalApproval
+
+  -- Record session start
+  state <- recordSessionStart state0
 
   -- Single-shot or interactive mode
   case optPrompt opts' of
     Just prompt -> do
       state' <- runAgentSafe state prompt
-      flushSession state'
+      stateEnd <- recordSessionEnd state'
+      flushSession stateEnd
     Nothing -> do
       finalState <- interactiveLoop state
-      flushSession finalState
+      stateEnd <- recordSessionEnd finalState
+      flushSession stateEnd
   where
     opts = info (optionsParser <**> helper)
       ( fullDesc
@@ -248,11 +255,26 @@ interactiveLoop state = do
       maxB = cfgMaxSessionLogBytes (asConfig state)
   flushLogOnException dir maxB (asSession state) $ do
     input <- TIO.getLine
-    if T.strip input `elem` ["/exit", "/quit", "exit", "quit"]
-      then do
-        putStrLn "Goodbye!"
-        pure state
-      else do
+    case parseSlashCommand input of
+      Just cmd
+        | cmd `elem` ["exit", "quit"] -> do
+            putStrLn "Goodbye!"
+            pure state
+        | cmd == "help" -> do
+            TIO.putStr formatHelp
+            interactiveLoop state
+        | cmd == "status" -> do
+            TIO.putStr (formatStatus state)
+            interactiveLoop state
+        | cmd == "new" -> do
+            TIO.putStrLn formatNewConfirmation
+            let state1 = resetConversation state
+            state2 <- recordConversationReset state1
+            interactiveLoop state2
+        | otherwise -> do
+            TIO.putStrLn (formatUnknownCommand cmd)
+            interactiveLoop state
+      Nothing -> do
         state' <- runAgentSafe state input
         interactiveLoop state'
 
@@ -267,7 +289,11 @@ runAgentSafe st input =
 
 -- | Flush the session log to @session.jsonl@ in the working directory.
 --   Called on normal exit (single-shot completion or interactive /exit).
+--   Skips the write when the session contains only lifecycle events
+--   (e.g. immediate /exit, /help then /exit, /new then /exit).
 flushSession :: AgentState -> IO ()
 flushSession state = do
-  let dir = cfgWorkingDir (asConfig state)
-  flushLog dir (cfgMaxSessionLogBytes (asConfig state)) (asSession state)
+  let dir  = cfgWorkingDir (asConfig state)
+      sess = asSession state
+  when (isMeaningfulSession sess) $
+    flushLog dir (cfgMaxSessionLogBytes (asConfig state)) sess
