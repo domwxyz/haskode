@@ -1,4 +1,5 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The agent loop.
 --
@@ -45,10 +46,11 @@ module Haskode.Agent
   , terminalApproval
   ) where
 
-import Control.Exception  (IOException, try)
-import Control.Monad      (when)
+import Control.Exception  (IOException, try, SomeException, throwIO)
+import Control.Monad      (when, unless)
 import Data.Aeson         (Value, encode)
 import qualified Data.ByteString.Lazy as LBS
+import Data.IORef
 import Data.Text          (Text)
 import qualified Data.Text          as T
 import qualified Data.Text.Encoding as TE
@@ -65,13 +67,14 @@ import Haskode.Display    (formatAssistantReply, formatToolExecuting,
                            formatConfirmReason, formatConfirmPrompt,
                            formatConfirmFile, formatConfirmDiffHeader,
                            formatConfirmPreviewHeader, formatContextLimitRefusal,
-                           indentBlock)
+                           indentBlock,
+                           streamBegin, streamChunk, streamEnd)
 import Haskode.Core       (Conversation, Message (..), Role (..), ToolCall (..),
                            ToolResult (..), emptyConversation,
                            mkUserMessage, mkSystemMessage, appendMessage)
 import Haskode.Policy     (Policy, Decision (..), checkPolicy)
 import Haskode.Provider   (Provider (..), CompletionRequest (..),
-                           CompletionResponse (..))
+                           CompletionResponse (..), StreamHandler (..))
 import Haskode.Session    (Event (..), EventType (..), SessionLog,
                            emptyLog, logEvent)
 import Haskode.Tools      (Tool (..), ToolRegistry, toolNames, lookupTool,
@@ -342,15 +345,39 @@ processTurn state = do
     TIO.putStrLn $ formatAssistantReply msg
     fail (T.unpack msg)
 
-  -- Call the provider
+  -- Call the provider (prefer streaming when available)
   let req = CompletionRequest
         { crMessages  = context
         , crModel     = T.pack (pcModel (cfgProvider cfg))
         , crMaxTokens = cfgMaxTokens cfg
         }
-  resp <- providerComplete prov req
+  let mStream = providerStream prov
+  resp <- case mStream of
+    Just stream -> do
+      displayStarted <- newIORef False
+      let onTokenLazy chunk
+            | T.null chunk = pure ()
+            | otherwise = do
+                started <- readIORef displayStarted
+                unless started $ do
+                  writeIORef displayStarted True
+                  streamBegin
+                streamChunk chunk
+      r <- do
+        result <- try $ stream req StreamHandler { onToken = onTokenLazy }
+        case result of
+          Left (e :: SomeException) -> do
+            started <- readIORef displayStarted
+            when started streamEnd
+            throwIO e
+          Right val -> pure val
+      started <- readIORef displayStarted
+      when started streamEnd
+      pure r
+    Nothing ->
+      providerComplete prov req
 
-  -- Record the assistant reply
+  -- Record the assistant reply (identical for both paths)
   now <- getCurrentTime
   let reply = crReply resp
       -- If the response includes tool calls, attach them to the
@@ -380,8 +407,11 @@ processTurn state = do
   -- Check for tool calls
   case crToolCalls resp of
     Nothing -> do
-      -- Final text reply — display and return
-      TIO.putStrLn $ formatAssistantReply (msgContent reply)
+      -- Final text reply.  Streaming already displayed it via
+      -- streamBegin/streamChunk/streamEnd; non-streaming displays it now.
+      case mStream of
+        Just _  -> pure ()
+        Nothing -> TIO.putStrLn $ formatAssistantReply (msgContent reply)
       pure state1
     Just calls -> do
       -- Process each tool call and loop

@@ -460,8 +460,10 @@ re-execution are not implemented.
 
 ### Known limitations (Phase 1)
 
-- **Non-streaming only** — the entire response is collected before
-  displaying.  No token-by-token output.
+- **Streaming for OpenAI-compatible providers** — text deltas stream
+  token-by-token to the terminal.  Tool-call deltas are assembled
+  from fragments before execution.  Providers without streaming
+  support fall back to the non-streaming `providerComplete` path.
 - **No context window management** — long conversations may exceed the
   model's context limit.  A conservative character-count guard
   (`cfgMaxContextChars`, default 120K chars / ~30K tokens) prevents
@@ -512,7 +514,7 @@ re-execution are not implemented.
 - [ ] Token counting and context window management
 
 ### Phase 2 — Usable daily driver
-- [ ] Streaming token output
+- [x] Streaming token output
 - [ ] Rich diff display (colored, side-by-side)
 - [ ] Session save/resume
 - [x] `.agentignore` file support (root-level, shared by `glob` and `search`)

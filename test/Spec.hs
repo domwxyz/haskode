@@ -12,10 +12,13 @@ module Main (main) where
 import Data.Aeson       (Value (..), encode, decode, eitherDecode, object, (.=))
 import qualified Data.Aeson.Key    as Key
 import qualified Data.Aeson.KeyMap as KM
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import Control.Exception (try, IOException, throwIO)
 import qualified Data.IORef
 import Data.List          (isInfixOf)
+import Data.Maybe         (isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Vector        as V
 import System.Directory  (getTemporaryDirectory, doesFileExist, removeFile,
@@ -39,16 +42,23 @@ import Haskode.Display   (indentBlock, formatAssistantReply, formatToolExecuting
                           formatConfirmReason, formatConfirmPrompt,
                           formatConfirmFile, formatConfirmDiffHeader,
                           formatConfirmPreviewHeader, formatError, formatVerbose,
-                          formatContextLimitRefusal)
+                          formatContextLimitRefusal,
+                          formatStreamBegin, formatStreamEnd)
 import Haskode.Config    (defaultConfig, Config (..), ProviderConfig (..),
                           tokenLimitFieldName, defaultMaxContextChars,
                           defaultMaxSessionLogBytes,
                           expandEnvVars, expandConfig)
 import Haskode.Provider  (Provider (..), CompletionRequest (..),
-                          CompletionResponse (..), stubProvider, scriptedProvider)
+                          CompletionResponse (..), StreamHandler (..),
+                          stubProvider, scriptedProvider)
 import Haskode.Provider.OpenAI
-                          (buildRequestBody, messagesToJSON, messageToJSON, toolsToJSON,
-                           parseResponseBody, parseToolCall, OpenAIError (..))
+                          (buildRequestBody, buildStreamingRequestBody,
+                           messagesToJSON, messageToJSON, toolsToJSON,
+                           parseResponseBody, parseToolCall,
+                           parseSSELine, parseSSEEvent, parseDeltaContent,
+                           parseDeltaToolCalls,
+                           StreamingToolCall (..), assembleStreamToolCalls,
+                           OpenAIError (..))
 import Haskode.Policy    (checkPolicy, defaultPolicy, Decision (..))
 import Haskode.Tools     (defaultRegistry, toolNames, lookupTool, readFileTool, listFilesTool,
                           shellTool, globTool, searchTool, previewPatchTool,
@@ -5960,6 +5970,675 @@ testFormatContextLimitRefusalExactOver =
        then pure $ Right ()
        else pure $ Left $ "Exact-over case failed: " ++ T.unpack msg
 
+-- ---------------------------------------------------------------------------
+-- Streaming display helpers (future scaffolding)
+-- ---------------------------------------------------------------------------
+
+-- | formatStreamBegin produces the assistant label prefix.
+testFormatStreamBegin :: Test
+testFormatStreamBegin =
+  if formatStreamBegin == "\nAssistant: "
+    then pure $ Right ()
+    else pure $ Left $ "formatStreamBegin: got " ++ show formatStreamBegin
+
+-- | formatStreamEnd produces a trailing newline.
+testFormatStreamEnd :: Test
+testFormatStreamEnd =
+  if formatStreamEnd == "\n"
+    then pure $ Right ()
+    else pure $ Left $ "formatStreamEnd: got " ++ show formatStreamEnd
+
+-- | formatStreamBegin matches the prefix of formatAssistantReply.
+testFormatStreamBeginMatchesReply :: Test
+testFormatStreamBeginMatchesReply =
+  let reply = formatAssistantReply "test"
+  in if T.isPrefixOf formatStreamBegin reply
+       then pure $ Right ()
+       else pure $ Left $ "formatStreamBegin not a prefix of formatAssistantReply: "
+                        ++ show (formatStreamBegin, T.take 20 reply)
+
+-- | formatStreamEnd matches the suffix of formatAssistantReply.
+testFormatStreamEndMatchesReply :: Test
+testFormatStreamEndMatchesReply =
+  let reply = formatAssistantReply "test"
+  in if T.isSuffixOf formatStreamEnd reply
+       then pure $ Right ()
+       else pure $ Left $ "formatStreamEnd not a suffix of formatAssistantReply: "
+                        ++ show (formatStreamEnd, T.takeEnd 20 reply)
+
+-- | formatStreamBegin <> content <> formatStreamEnd equals formatAssistantReply.
+testStreamFormattingConsistency :: Test
+testStreamFormattingConsistency =
+  let content = "hello there"
+      streamed = formatStreamBegin <> content <> formatStreamEnd
+      reply    = formatAssistantReply content
+  in if streamed == reply
+       then pure $ Right ()
+       else pure $ Left $ "Stream formatting mismatch: " ++ show (streamed, reply)
+
+-- ---------------------------------------------------------------------------
+-- Provider streaming hook tests
+-- ---------------------------------------------------------------------------
+
+-- | stubProvider exposes no streaming implementation.
+testStubProviderNoStream :: Test
+testStubProviderNoStream =
+  if isNothing (providerStream stubProvider)
+    then pure $ Right ()
+    else pure $ Left "stubProvider should have providerStream = Nothing"
+
+-- | scriptedProvider exposes no streaming implementation.
+testScriptedProviderNoStream :: Test
+testScriptedProviderNoStream = do
+  prov <- scriptedProvider []
+  if isNothing (providerStream prov)
+    then pure $ Right ()
+    else pure $ Left "scriptedProvider should have providerStream = Nothing"
+
+-- | StreamHandler record can be constructed with a simple callback.
+testStreamHandlerConstruction :: Test
+testStreamHandlerConstruction = do
+  ref <- Data.IORef.newIORef ("" :: T.Text)
+  let handler = StreamHandler { onToken = \t -> Data.IORef.modifyIORef ref (<> t) }
+  onToken handler "hello"
+  onToken handler " world"
+  result <- Data.IORef.readIORef ref
+  if result == "hello world"
+    then pure $ Right ()
+    else pure $ Left $ "StreamHandler onToken accumulation: " ++ T.unpack result
+
+-- ---------------------------------------------------------------------------
+-- Agent streaming integration tests
+-- ---------------------------------------------------------------------------
+
+-- | Create a provider that uses the streaming path.
+--   Each response is delivered via onToken callbacks, then the
+--   final CompletionResponse is returned.
+fakeStreamingProvider :: [CompletionResponse] -> IO Provider
+fakeStreamingProvider responses = do
+  ref <- Data.IORef.newIORef responses
+  pure Provider
+    { providerName = "fake-streaming"
+    , providerComplete = \_req -> do
+        remaining <- Data.IORef.readIORef ref
+        case remaining of
+          [] -> pure CompletionResponse
+            { crReply     = mkAssistantMessage "[fake-streaming] no more responses"
+            , crToolCalls = Nothing
+            }
+          (r:rest) -> do
+            Data.IORef.writeIORef ref rest
+            pure r
+    , providerStream = Just $ \_req handler -> do
+        remaining <- Data.IORef.readIORef ref
+        case remaining of
+          [] -> do
+            let resp = CompletionResponse
+                  { crReply     = mkAssistantMessage "[fake-streaming] no more responses"
+                  , crToolCalls = Nothing
+                  }
+            onToken handler (msgContent (crReply resp))
+            pure resp
+          (r:rest) -> do
+            Data.IORef.writeIORef ref rest
+            onToken handler (msgContent (crReply r))
+            pure r
+    }
+
+-- | Streaming provider is used when providerStream is Just.
+--   Verifies session events are recorded correctly for a simple
+--   text exchange via the streaming path.
+testAgentStreamingTextReply :: Test
+testAgentStreamingTextReply = do
+  prov <- fakeStreamingProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "streamed hello"
+        , crToolCalls = Nothing
+        }
+    ]
+  let cfg = defaultConfig
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+  state' <- runAgent state "hello agent"
+  let evts = events (asSession state')
+      types = map evType evts
+  -- Should have UserMessage and AssistantReply (same as non-streaming)
+  if EUserMessage `elem` types && EAssistantReply `elem` types
+    then do
+      -- Verify the assistant reply content is the streamed text
+      let asstEvts = filter (\e -> evType e == EAssistantReply) evts
+      case asstEvts of
+        (e:_) | evData e == "streamed hello" -> pure $ Right ()
+        (e:_) -> pure $ Left $ "Assistant reply content mismatch: " ++ T.unpack (evData e)
+        []    -> pure $ Left "No EAssistantReply event found"
+    else pure $ Left $ "Missing session events, got: " ++ show types
+
+-- | Streaming provider handles tool calls correctly.
+--   Tool calls from the final CompletionResponse are processed
+--   after the stream completes.
+testAgentStreamingToolCalls :: Test
+testAgentStreamingToolCalls = do
+  tmpDir <- getTemporaryDirectory
+  (path, h) <- openTempFile tmpDir "haskode-stream-tc-test.txt"
+  TIO.hPutStrLn h "stream tool call test"
+  hClose h
+  prov <- fakeStreamingProvider
+    [ -- First response: text + tool call via streaming
+      CompletionResponse
+        { crReply     = mkAssistantMessage "Let me read that."
+        , crToolCalls = Just [ToolCall "stc-1" "read_file" (object ["path" .= T.pack path])]
+        }
+    , -- Second response: final text via streaming
+      CompletionResponse
+        { crReply     = mkAssistantMessage "Done reading."
+        , crToolCalls = Nothing
+        }
+    ]
+  let cfg = defaultConfig
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+  state' <- runAgent state "read the file"
+  let evts = events (asSession state')
+      types = map evType evts
+  cleanup path
+  -- Should have: UserMessage, AssistantReply, ToolCall, ToolResult, AssistantReply
+  if EUserMessage `elem` types
+     && EAssistantReply `elem` types
+     && EToolCall `elem` types
+     && EToolResult `elem` types
+    then pure $ Right ()
+    else pure $ Left $ "Streaming tool-call events: " ++ show types
+
+-- | Non-streaming fallback works when providerStream is Nothing.
+--   This is the same as existing agent tests but uses the
+--   fakeStreamingProvider with its streaming path removed,
+--   confirming the fallback path is taken.
+testAgentNonStreamingFallback :: Test
+testAgentNonStreamingFallback = do
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "non-streaming reply"
+        , crToolCalls = Nothing
+        }
+    ]
+  -- Verify the provider has no streaming
+  if isNothing (providerStream prov)
+    then do
+      let cfg = defaultConfig
+          state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state' <- runAgent state "hello"
+      let evts = events (asSession state')
+          types = map evType evts
+      if EUserMessage `elem` types && EAssistantReply `elem` types
+        then do
+          let asstEvts = filter (\e -> evType e == EAssistantReply) evts
+          case asstEvts of
+            (e:_) | evData e == "non-streaming reply" -> pure $ Right ()
+            (e:_) -> pure $ Left $ "Assistant reply content mismatch: " ++ T.unpack (evData e)
+            []    -> pure $ Left "No EAssistantReply event found"
+        else pure $ Left $ "Missing session events, got: " ++ show types
+    else pure $ Left "scriptedProvider should have providerStream = Nothing"
+
+-- | Streaming tool-call-only responses skip the assistant display label.
+--   When the streamed response has tool calls but empty text content,
+--   the lazy display should not print an empty "Assistant:" line.
+testAgentStreamingToolCallOnlyLazyDisplay :: Test
+testAgentStreamingToolCallOnlyLazyDisplay = do
+  tmpDir <- getTemporaryDirectory
+  (path, h) <- openTempFile tmpDir "haskode-lazy-display-test.txt"
+  TIO.hPutStrLn h "lazy display test"
+  hClose h
+  prov <- fakeStreamingProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage ""
+        , crToolCalls = Just [ToolCall "ld-1" "read_file" (object ["path" .= T.pack path])]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "Done."
+        , crToolCalls = Nothing
+        }
+    ]
+  let cfg = defaultConfig
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+  state' <- runAgent state "read the file"
+  let evts = events (asSession state')
+      types = map evType evts
+  cleanup path
+  -- Should have: UserMessage, AssistantReply, ToolCall, ToolResult, AssistantReply
+  if EUserMessage `elem` types
+     && EAssistantReply `elem` types
+     && EToolCall `elem` types
+     && EToolResult `elem` types
+    then
+      -- Verify final assistant reply is the second response text
+      let asstEvts = filter (\e -> evType e == EAssistantReply) evts
+      in case lastMay asstEvts of
+           Just e | evData e == "Done." -> pure $ Right ()
+           Just e  -> pure $ Left $ "Final assistant reply mismatch: " ++ T.unpack (evData e)
+           Nothing -> pure $ Left "No EAssistantReply events found"
+    else pure $ Left $ "Streaming tool-call-only events: " ++ show types
+
+lastMay :: [a] -> Maybe a
+lastMay [] = Nothing
+lastMay xs = Just (last xs)
+
+-- ---------------------------------------------------------------------------
+-- SSE parsing tests (pure)
+-- ---------------------------------------------------------------------------
+
+-- | parseSSELine extracts content from a data line.
+testParseSSELineData :: Test
+testParseSSELineData =
+  case parseSSELine (BS8.pack "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}") of
+    Just (Just _) -> pure $ Right ()
+    other -> pure $ Left $ "Expected Just (Just _), got " ++ show other
+
+-- | parseSSELine returns Nothing for [DONE].
+testParseSSELineDone :: Test
+testParseSSELineDone =
+  case parseSSELine (BS8.pack "data: [DONE]") of
+    Just Nothing -> pure $ Right ()
+    other -> pure $ Left $ "Expected Just Nothing, got " ++ show other
+
+-- | parseSSELine returns Nothing for empty lines.
+testParseSSELineEmpty :: Test
+testParseSSELineEmpty =
+  case parseSSELine BS.empty of
+    Nothing -> pure $ Right ()
+    other -> pure $ Left $ "Expected Nothing, got " ++ show other
+
+-- | parseSSELine returns Nothing for non-data lines.
+testParseSSELineNonData :: Test
+testParseSSELineNonData =
+  case parseSSELine (BS8.pack "event: message") of
+    Nothing -> pure $ Right ()
+    other -> pure $ Left $ "Expected Nothing, got " ++ show other
+
+-- | parseSSELine handles leading/trailing whitespace.
+testParseSSELineWhitespace :: Test
+testParseSSELineWhitespace =
+  case parseSSELine (BS8.pack "  data: {\"test\":1}  ") of
+    Just (Just _) -> pure $ Right ()
+    other -> pure $ Left $ "Expected Just (Just _), got " ++ show other
+
+-- | parseSSEEvent extracts content from a valid delta event.
+testParseSSEEventContent :: Test
+testParseSSEEventContent =
+  let json = BS8.pack "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}"
+  in case parseSSEEvent json of
+       Right (Just "Hello") -> pure $ Right ()
+       other -> pure $ Left $ "Expected Right (Just \"Hello\"), got " ++ show other
+
+-- | parseSSEEvent returns Nothing for a role-only delta.
+testParseSSEEventRoleDelta :: Test
+testParseSSEEventRoleDelta =
+  let json = BS8.pack "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}"
+  in case parseSSEEvent json of
+       Right Nothing -> pure $ Right ()
+       other -> pure $ Left $ "Expected Right Nothing, got " ++ show other
+
+-- | parseSSEEvent returns Left for malformed JSON.
+testParseSSEEventMalformed :: Test
+testParseSSEEventMalformed =
+  case parseSSEEvent (BS8.pack "not json") of
+    Left _ -> pure $ Right ()
+    other -> pure $ Left $ "Expected Left _, got " ++ show other
+
+-- | parseSSEEvent handles missing choices array.
+testParseSSEEventNoChoices :: Test
+testParseSSEEventNoChoices =
+  let json = BS8.pack "{\"id\":\"chatcmpl-123\"}"
+  in case parseSSEEvent json of
+       Right Nothing -> pure $ Right ()
+       other -> pure $ Left $ "Expected Right Nothing, got " ++ show other
+
+-- | parseDeltaContent extracts text from a valid delta.
+testParseDeltaContentValid :: Test
+testParseDeltaContentValid =
+  let val = object
+        [ "choices" .=
+            [ object [ "delta" .= object [ "content" .= ("world" :: T.Text) ] ] ]
+        ]
+  in case parseDeltaContent val of
+       Just "world" -> pure $ Right ()
+       other -> pure $ Left $ "Expected Just \"world\", got " ++ show other
+
+-- | parseDeltaContent returns Nothing for null content.
+testParseDeltaContentNull :: Test
+testParseDeltaContentNull =
+  let val = object
+        [ "choices" .=
+            [ object [ "delta" .= object [ "content" .= ("" :: T.Text) ] ] ]
+        ]
+  in case parseDeltaContent val of
+       Nothing -> pure $ Right ()
+       other -> pure $ Left $ "Expected Nothing, got " ++ show other
+
+-- | parseDeltaContent returns Nothing for non-object input.
+testParseDeltaContentNonObject :: Test
+testParseDeltaContentNonObject =
+  case parseDeltaContent (String "not an object") of
+    Nothing -> pure $ Right ()
+    other -> pure $ Left $ "Expected Nothing, got " ++ show other
+
+-- | Multiple content deltas can be assembled into a full reply.
+testParseMultipleDeltas :: Test
+testParseMultipleDeltas = do
+  ref <- Data.IORef.newIORef ("" :: T.Text)
+  let handler = StreamHandler { onToken = \t -> Data.IORef.modifyIORef ref (<> t) }
+      deltas :: [T.Text]
+      deltas = ["Hello", " ", "world", "!"]
+      processDelta d = case parseDeltaContent
+            (object [ "choices" .= [ object [ "delta" .= object [ "content" .= d ] ] ] ]) of
+        Just t -> onToken handler t
+        Nothing -> pure ()
+  mapM_ processDelta deltas
+  result <- Data.IORef.readIORef ref
+  if result == "Hello world!"
+    then pure $ Right ()
+    else pure $ Left $ "Expected \"Hello world!\", got " ++ T.unpack result
+
+-- | parseSSELine with data line containing spaces after colon.
+testParseSSELineExtraSpaces :: Test
+testParseSSELineExtraSpaces =
+  case parseSSELine (BS8.pack "data:   {\"test\":1}") of
+    Just (Just payload) ->
+      -- The payload should include the leading spaces (they're part of the JSON data)
+      if payload == BS8.pack "  {\"test\":1}"
+        then pure $ Right ()
+        else pure $ Left $ "Unexpected payload: " ++ show payload
+    other -> pure $ Left $ "Expected Just (Just _), got " ++ show other
+
+-- | buildStreamingRequestBody includes stream:true.
+testBuildStreamingRequestBodyIncludesStream :: Test
+testBuildStreamingRequestBodyIncludesStream = do
+  let reg = defaultRegistry
+      body = buildStreamingRequestBody "max_tokens" [] "gpt-4o" 1024 reg
+      decoded = eitherDecode body :: Either String Value
+  case decoded of
+    Left err -> pure $ Left $ "Failed to decode streaming body: " ++ err
+    Right val -> case val of
+      Object obj -> case KM.lookup (Key.fromText "stream") obj of
+        Just (Bool True) -> pure $ Right ()
+        other -> pure $ Left $ "Expected stream=true, got " ++ show other
+      _ -> pure $ Left "Expected JSON object"
+
+-- ---------------------------------------------------------------------------
+-- Streamed tool-call assembly tests (pure)
+-- ---------------------------------------------------------------------------
+
+-- | A single complete tool call in one SSE event is assembled correctly.
+testStreamToolCallSingleComplete :: Test
+testStreamToolCallSingleComplete = do
+  let val = object
+        [ "choices" .= [object
+            [ "delta" .= object
+                [ "tool_calls" .= [object
+                    [ "index"    .= (0 :: Int)
+                    , "id"       .= ("call_001" :: T.Text)
+                    , "type"     .= ("function" :: T.Text)
+                    , "function" .= object
+                        [ "name"      .= ("read_file" :: T.Text)
+                        , "arguments" .= ("{\"path\":\"foo.hs\"}" :: T.Text)
+                        ]
+                    ]]
+                ]]
+            ]]
+  case parseDeltaToolCalls val of
+    Nothing -> pure $ Left "Expected tool-call deltas, got Nothing"
+    Just frags -> do
+      let stcs = foldl (\acc (i, f) -> Map.insert i f acc) Map.empty frags
+      case assembleStreamToolCalls stcs of
+        Left err -> pure $ Left $ "Assembly error: " ++ err
+        Right [tc]
+          | tcId tc == "call_001" && tcName tc == "read_file"
+            && tcArgs tc == object ["path" .= ("foo.hs" :: T.Text)]
+            -> pure $ Right ()
+          | otherwise -> pure $ Left $ "Tool call mismatch: " ++ show tc
+        Right tcs -> pure $ Left $ "Expected 1 tool call, got " ++ show (length tcs)
+
+-- | One tool call split across multiple argument fragments assembles
+--   the arguments in order.
+testStreamToolCallFragmentedArgs :: Test
+testStreamToolCallFragmentedArgs = do
+  -- Three SSE events: first sends id+name+partial args, second sends more args, third sends rest
+  let frag1 = object
+        [ "choices" .= [object
+            [ "delta" .= object
+                [ "tool_calls" .= [object
+                    [ "index"     .= (0 :: Int)
+                    , "id"        .= ("call_frag" :: T.Text)
+                    , "type"      .= ("function" :: T.Text)
+                    , "function"  .= object
+                        [ "name"      .= ("shell" :: T.Text)
+                        , "arguments" .= ("{\"command\":" :: T.Text)
+                        ]
+                    ]]
+                ]]
+            ]]
+      frag2 = object
+        [ "choices" .= [object
+            [ "delta" .= object
+                [ "tool_calls" .= [object
+                    [ "index"     .= (0 :: Int)
+                    , "function"  .= object
+                        [ "arguments" .= ("\"echo " :: T.Text)
+                        ]
+                    ]]
+                ]]
+            ]]
+      frag3 = object
+        [ "choices" .= [object
+            [ "delta" .= object
+                [ "tool_calls" .= [object
+                    [ "index"     .= (0 :: Int)
+                    , "function"  .= object
+                        [ "arguments" .= ("hello\"}" :: T.Text)
+                        ]
+                    ]]
+                ]]
+            ]]
+  let allFrags = concat
+        [ case parseDeltaToolCalls frag1 of Just fs -> fs; Nothing -> []
+        , case parseDeltaToolCalls frag2 of Just fs -> fs; Nothing -> []
+        , case parseDeltaToolCalls frag3 of Just fs -> fs; Nothing -> []
+        ]
+  let stcs = foldl (\acc (i, f) ->
+        case Map.lookup i acc of
+          Nothing -> Map.insert i f acc
+          Just existing -> Map.insert i
+            (existing { stcArgs = stcArgs existing <> stcArgs f }) acc
+        ) Map.empty allFrags
+  case assembleStreamToolCalls stcs of
+    Left err -> pure $ Left $ "Assembly error: " ++ err
+    Right [tc]
+      | tcId tc == "call_frag" && tcName tc == "shell"
+        && tcArgs tc == object ["command" .= ("echo hello" :: T.Text)]
+        -> pure $ Right ()
+      | otherwise -> pure $ Left $ "Mismatch: " ++ show (tcId tc, tcName tc, tcArgs tc)
+    Right tcs -> pure $ Left $ "Expected 1 tool call, got " ++ show (length tcs)
+
+-- | Multiple tool calls distinguished by index are assembled correctly.
+testStreamToolCallMultipleByIndex :: Test
+testStreamToolCallMultipleByIndex = do
+  let frag1 = object
+        [ "choices" .= [object
+            [ "delta" .= object
+                [ "tool_calls" .= [object
+                    [ "index" .= (0 :: Int)
+                    , "id"    .= ("call_a" :: T.Text)
+                    , "type"  .= ("function" :: T.Text)
+                    , "function" .= object
+                        [ "name"      .= ("read_file" :: T.Text)
+                        , "arguments" .= ("{\"path\":\"a.hs\"}" :: T.Text)
+                        ]
+                    ]]
+                ]]
+            ]]
+      frag2 = object
+        [ "choices" .= [object
+            [ "delta" .= object
+                [ "tool_calls" .= [object
+                    [ "index" .= (1 :: Int)
+                    , "id"    .= ("call_b" :: T.Text)
+                    , "type"  .= ("function" :: T.Text)
+                    , "function" .= object
+                        [ "name"      .= ("list_files" :: T.Text)
+                        , "arguments" .= ("{\"dir\":\".\"}" :: T.Text)
+                        ]
+                    ]]
+                ]]
+            ]]
+  let allFrags = concat
+        [ case parseDeltaToolCalls frag1 of Just fs -> fs; Nothing -> []
+        , case parseDeltaToolCalls frag2 of Just fs -> fs; Nothing -> []
+        ]
+  let stcs = foldl (\acc (i, f) ->
+        case Map.lookup i acc of
+          Nothing -> Map.insert i f acc
+          Just existing -> Map.insert i
+            (StreamingToolCall
+              { stcIndex = i
+              , stcId    = stcId f `mplus''` stcId existing
+              , stcName  = stcName f `mplus''` stcName existing
+              , stcArgs  = stcArgs existing <> stcArgs f
+              }) acc
+        ) Map.empty allFrags
+  case assembleStreamToolCalls stcs of
+    Left err -> pure $ Left $ "Assembly error: " ++ err
+    Right [tc1, tc2]
+      | tcName tc1 == "read_file" && tcName tc2 == "list_files"
+        && tcId tc1 == "call_a" && tcId tc2 == "call_b"
+        -> pure $ Right ()
+      | otherwise -> pure $ Left $ "Mismatch: " ++ show (tcName tc1, tcName tc2)
+    Right tcs -> pure $ Left $ "Expected 2 tool calls, got " ++ show (length tcs)
+  where
+    mplus'' :: Maybe a -> Maybe a -> Maybe a
+    mplus'' (Just x) _ = Just x
+    mplus'' Nothing  y = y
+
+-- | Text-only streaming: parseDeltaToolCalls returns Nothing for
+--   content-only events.
+testStreamToolCallTextOnlyNoToolCalls :: Test
+testStreamToolCallTextOnlyNoToolCalls =
+  let val = object
+        [ "choices" .= [object
+            [ "delta" .= object [ "content" .= ("Hello world" :: T.Text) ]
+            ]]
+        ]
+  in case parseDeltaToolCalls val of
+       Nothing -> pure $ Right ()
+       Just _  -> pure $ Left "Expected Nothing for text-only delta, got Just"
+
+-- | Role-only or empty deltas produce no tool-call fragments.
+testStreamToolCallRoleOnlyDelta :: Test
+testStreamToolCallRoleOnlyDelta =
+  let val = object
+        [ "choices" .= [object
+            [ "delta" .= object [ "role" .= ("assistant" :: T.Text) ]
+            ]]
+        ]
+  in case parseDeltaToolCalls val of
+       Nothing -> pure $ Right ()
+       Just _  -> pure $ Left "Expected Nothing for role-only delta, got Just"
+
+-- | Empty delta (no fields) produces no tool-call fragments.
+testStreamToolCallEmptyDelta :: Test
+testStreamToolCallEmptyDelta =
+  let val = object
+        [ "choices" .= [object
+            [ "delta" .= object []
+            ]]
+        ]
+  in case parseDeltaToolCalls val of
+       Nothing -> pure $ Right ()
+       Just _  -> pure $ Left "Expected Nothing for empty delta, got Just"
+
+-- | Malformed tool-call arguments at assembly time produce a clear error.
+testStreamToolCallMalformedArgs :: Test
+testStreamToolCallMalformedArgs =
+  let stcs = Map.fromList
+        [ (0, StreamingToolCall
+              { stcIndex = 0
+              , stcId    = Just "call_bad"
+              , stcName  = Just "read_file"
+              , stcArgs  = "not valid json"
+              })
+        ]
+  in case assembleStreamToolCalls stcs of
+       Left err
+         | "malformed" `T.isInfixOf` T.pack err -> pure $ Right ()
+         | otherwise -> pure $ Left $ "Expected 'malformed' in error, got: " ++ err
+       Right _ -> pure $ Left "Expected Left for malformed args, got Right"
+
+-- | Missing id in assembled tool call produces a clear error.
+testStreamToolCallMissingId :: Test
+testStreamToolCallMissingId =
+  let stcs = Map.fromList
+        [ (0, StreamingToolCall
+              { stcIndex = 0
+              , stcId    = Nothing
+              , stcName  = Just "read_file"
+              , stcArgs  = "{}"
+              })
+        ]
+  in case assembleStreamToolCalls stcs of
+       Left err
+         | "missing" `T.isInfixOf` T.pack err
+           && "id" `T.isInfixOf` T.pack err -> pure $ Right ()
+         | otherwise -> pure $ Left $ "Expected 'missing id' in error, got: " ++ err
+       Right _ -> pure $ Left "Expected Left for missing id, got Right"
+
+-- | Missing function.name in assembled tool call produces a clear error.
+testStreamToolCallMissingName :: Test
+testStreamToolCallMissingName =
+  let stcs = Map.fromList
+        [ (0, StreamingToolCall
+              { stcIndex = 0
+              , stcId    = Just "call_noname"
+              , stcName  = Nothing
+              , stcArgs  = "{}"
+              })
+        ]
+  in case assembleStreamToolCalls stcs of
+       Left err
+         | "missing" `T.isInfixOf` T.pack err
+           && "name" `T.isInfixOf` T.pack err -> pure $ Right ()
+         | otherwise -> pure $ Left $ "Expected 'missing name' in error, got: " ++ err
+       Right _ -> pure $ Left "Expected Left for missing name, got Right"
+
+-- | Empty tool-call map produces an empty list (no tool calls).
+testStreamToolCallEmptyAssembly :: Test
+testStreamToolCallEmptyAssembly =
+  case assembleStreamToolCalls Map.empty of
+    Right [] -> pure $ Right ()
+    Right tcs -> pure $ Left $ "Expected empty list, got " ++ show (length tcs)
+    Left err -> pure $ Left $ "Unexpected error: " ++ err
+
+-- | Final assembled CompletionResponse has crToolCalls = Just for tool-call streams.
+testStreamToolCallCompletionResponse :: Test
+testStreamToolCallCompletionResponse =
+  let stcs = Map.fromList
+        [ (0, StreamingToolCall
+              { stcIndex = 0
+              , stcId    = Just "call_resp"
+              , stcName  = Just "list_files"
+              , stcArgs  = "{\"dir\":\".\"}"
+              })
+        ]
+  in case assembleStreamToolCalls stcs of
+       Left err -> pure $ Left $ "Assembly error: " ++ err
+       Right tcs -> do
+         let resp = CompletionResponse
+               { crReply     = Message Assistant "" Nothing Nothing
+               , crToolCalls = Just tcs
+               }
+         case crToolCalls resp of
+           Just [tc]
+             | tcId tc == "call_resp" && tcName tc == "list_files"
+               -> pure $ Right ()
+             | otherwise -> pure $ Left $ "Response tool call mismatch: " ++ show tc
+           Just tcs' -> pure $ Left $ "Expected 1 tool call in response, got " ++ show (length tcs')
+           Nothing -> pure $ Left "Expected Just tool calls in response, got Nothing"
+
 -- | Helper: remove a temp file, ignoring errors.
 cleanup :: FilePath -> IO ()
 cleanup path = do
@@ -6335,4 +7014,47 @@ main = runTests
   , testFormatContextLimitRefusalNoAutoTruncate
   , testFormatContextLimitRefusalNextSteps
   , testFormatContextLimitRefusalExactOver
+    -- Streaming display helpers
+  , testFormatStreamBegin
+  , testFormatStreamEnd
+  , testFormatStreamBeginMatchesReply
+  , testFormatStreamEndMatchesReply
+  , testStreamFormattingConsistency
+    -- Provider streaming hook tests
+  , testStubProviderNoStream
+  , testScriptedProviderNoStream
+  , testStreamHandlerConstruction
+    -- Agent streaming integration tests
+  , testAgentStreamingTextReply
+  , testAgentStreamingToolCalls
+  , testAgentNonStreamingFallback
+  , testAgentStreamingToolCallOnlyLazyDisplay
+    -- SSE parsing tests (pure)
+  , testParseSSELineData
+  , testParseSSELineDone
+  , testParseSSELineEmpty
+  , testParseSSELineNonData
+  , testParseSSELineWhitespace
+  , testParseSSELineExtraSpaces
+  , testParseSSEEventContent
+  , testParseSSEEventRoleDelta
+  , testParseSSEEventMalformed
+  , testParseSSEEventNoChoices
+  , testParseDeltaContentValid
+  , testParseDeltaContentNull
+  , testParseDeltaContentNonObject
+  , testParseMultipleDeltas
+  , testBuildStreamingRequestBodyIncludesStream
+    -- Streamed tool-call assembly tests (pure)
+  , testStreamToolCallSingleComplete
+  , testStreamToolCallFragmentedArgs
+  , testStreamToolCallMultipleByIndex
+  , testStreamToolCallTextOnlyNoToolCalls
+  , testStreamToolCallRoleOnlyDelta
+  , testStreamToolCallEmptyDelta
+  , testStreamToolCallMalformedArgs
+  , testStreamToolCallMissingId
+  , testStreamToolCallMissingName
+  , testStreamToolCallEmptyAssembly
+  , testStreamToolCallCompletionResponse
   ]

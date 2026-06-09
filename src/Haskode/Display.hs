@@ -18,6 +18,19 @@ module Haskode.Display
     indentBlock
     -- * Assistant output
   , formatAssistantReply
+    -- * Streaming assistant output
+    --
+    -- These helpers provide the display boundary for streaming
+    -- providers.  The pure formatters are tested; the IO helpers
+    -- centralise @putStr@/@hFlush@ so that 'Haskode.Agent'
+    -- never needs to call them directly for streaming output.
+    -- The OpenAI provider now uses these via the agent's streaming
+    -- path.
+  , formatStreamBegin
+  , formatStreamEnd
+  , streamBegin
+  , streamChunk
+  , streamEnd
     -- * Tool output
   , formatToolExecuting
   , formatToolResult
@@ -44,7 +57,9 @@ module Haskode.Display
   ) where
 
 import Data.Text          (Text)
-import qualified Data.Text as T
+import qualified Data.Text    as T
+import qualified Data.Text.IO as TIO
+import System.IO             (hFlush, hSetBuffering, stdout, BufferMode (..))
 
 -- ---------------------------------------------------------------------------
 -- Indentation
@@ -78,6 +93,61 @@ indentBlock n t
 -- @
 formatAssistantReply :: Text -> Text
 formatAssistantReply content = "\nAssistant: " <> content <> "\n"
+
+-- ---------------------------------------------------------------------------
+-- Streaming assistant output
+--
+-- These helpers provide the display boundary for streaming providers.
+-- The pure formatters ('formatStreamBegin', 'formatStreamEnd') produce
+-- the label text and are unit-tested.
+--
+-- The IO helpers ('streamBegin', 'streamChunk', 'streamEnd') centralise
+-- @putStr@ and @hFlush stdout@ so that 'Haskode.Agent' never needs to
+-- call them directly.  The OpenAI provider uses these via the agent's
+-- streaming path.
+-- ---------------------------------------------------------------------------
+
+-- | Pure formatter: the label that precedes streaming assistant text.
+--
+-- Produces: @"\nAssistant: "@
+formatStreamBegin :: Text
+formatStreamBegin = "\nAssistant: "
+
+-- | Pure formatter: the suffix that follows streaming assistant text.
+--
+-- Produces: @"\n"@
+formatStreamEnd :: Text
+formatStreamEnd = "\n"
+
+-- | Begin streaming assistant output.
+--
+-- Prints the @"\\nAssistant: "@ label and sets stdout to
+-- 'NoBuffering' so that subsequent 'streamChunk' calls
+-- appear immediately on the terminal.
+streamBegin :: IO ()
+streamBegin = do
+  hSetBuffering stdout NoBuffering
+  TIO.putStr formatStreamBegin
+  hFlush stdout
+
+-- | Append one text chunk to the streaming assistant output.
+--
+-- Prints the chunk and flushes stdout.  Safe to call from a
+-- token callback; does not add newlines.
+streamChunk :: Text -> IO ()
+streamChunk chunk = do
+  TIO.putStr chunk
+  hFlush stdout
+
+-- | End streaming assistant output.
+--
+-- Prints a trailing newline and restores stdout buffering to
+-- 'LineBuffering' (the common default).
+streamEnd :: IO ()
+streamEnd = do
+  TIO.putStr formatStreamEnd
+  hFlush stdout
+  hSetBuffering stdout LineBuffering
 
 -- ---------------------------------------------------------------------------
 -- Tool output

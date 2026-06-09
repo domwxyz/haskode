@@ -24,6 +24,9 @@
 module Haskode.Provider
   ( -- * Provider interface
     Provider (..)
+    -- * Streaming types
+  , ProviderStream
+  , StreamHandler (..)
     -- * Built-in providers
   , stubProvider
   , scriptedProvider
@@ -56,13 +59,50 @@ data CompletionResponse = CompletionResponse
   } deriving stock (Show, Eq)
 
 -- ---------------------------------------------------------------------------
+-- Streaming types
+--
+-- These types define the optional streaming interface for providers.
+-- The OpenAI provider now implements streaming for text-only replies.
+-- The agent uses providerStream when available, falling back to
+-- providerComplete when not.
+-- ---------------------------------------------------------------------------
+
+-- | A callback record for receiving streamed text chunks.
+--
+--   The streaming provider calls 'onToken' for each assistant text
+--   chunk as it arrives.  The handler is responsible for display
+--   (e.g. printing to stdout and flushing).  Tool calls are not
+--   streamed — they are only parsed from the final assembled
+--   'CompletionResponse'.
+data StreamHandler = StreamHandler
+  { onToken :: Text -> IO ()  -- ^ Called for each text chunk
+  }
+
+-- | A streaming completion function.
+--
+--   Takes a 'CompletionRequest' and a 'StreamHandler', emits text
+--   chunks via the handler, and returns the final assembled
+--   'CompletionResponse'.  This is the same return type as
+--   'providerComplete' so that downstream consumers (tool calls,
+--   session logging, conversation state) see no difference.
+type ProviderStream = CompletionRequest -> StreamHandler -> IO CompletionResponse
+
+-- ---------------------------------------------------------------------------
 -- Provider record
 -- ---------------------------------------------------------------------------
 
 -- | A pluggable LLM backend.
 data Provider = Provider
-  { providerName    :: !Text
+  { providerName     :: !Text
   , providerComplete :: CompletionRequest -> IO CompletionResponse
+    -- | Optional streaming completion path.
+    --
+    --   When 'Just', the provider supports streaming assistant text
+    --   chunks via a callback.  When 'Nothing' (the common case),
+    --   only the non-streaming 'providerComplete' path is available.
+    --
+    --   The OpenAI provider implements streaming for text-only replies.
+  , providerStream   :: Maybe ProviderStream
   }
 
 -- ---------------------------------------------------------------------------
@@ -82,6 +122,7 @@ stubProvider = Provider
         { crReply     = reply
         , crToolCalls = Nothing
         }
+  , providerStream = Nothing  -- streaming not implemented
   }
 
 -- ---------------------------------------------------------------------------
@@ -110,4 +151,5 @@ scriptedProvider responses = do
           (r:rest) -> do
             writeIORef ref rest
             pure r
+    , providerStream = Nothing  -- streaming not implemented
     }
