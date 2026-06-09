@@ -12,16 +12,18 @@ module Haskode.Test.Util
   , toolDescriptionFromRegistry
   ) where
 
-import Control.Exception (IOException, try)
-import System.Directory  (createDirectory, createFileLink, getTemporaryDirectory,
-                          removeDirectoryRecursive, removeFile)
-import System.Exit       (exitFailure, exitSuccess)
-import System.FilePath   ((</>))
-import System.Info       (os)
-import qualified Data.Text as T
-
-import Haskode.Tools (Tool (..), defaultRegistry, lookupTool)
-
+import Control.Exception ( IOException, try )
+import Haskode.Tools ( Tool(..), defaultRegistry, lookupTool )
+import System.Directory
+    ( createDirectory,
+      createFileLink,
+      getTemporaryDirectory,
+      removeDirectoryRecursive,
+      removeFile )
+import System.Exit ( exitFailure, exitSuccess )
+import System.FilePath ( (</>) )
+import System.Info ( os )
+import qualified Data.Text as T ( Text )
 -- | Tests return Right for pass, Left with a useful failure message otherwise.
 type Test = IO (Either String ())
 
