@@ -78,6 +78,18 @@ test-suite haskode-test
   type:             exitcode-stdio-1.0
   hs-source-dirs:   test
   main-is:          Spec.hs
+  other-modules:
+    Haskode.Test.Commands
+    Haskode.Test.Config
+    Haskode.Test.Core
+    Haskode.Test.Display
+    Haskode.Test.OpenAI
+    Haskode.Test.Patch
+    Haskode.Test.Policy
+    Haskode.Test.Provider
+    Haskode.Test.Session
+    Haskode.Test.Tools
+    Haskode.Test.Util
   build-depends:
       haskode
     , bytestring >= 0.11 && < 0.13
