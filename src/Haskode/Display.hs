@@ -4,7 +4,7 @@
 --
 -- These functions produce consistent, bracketed-label output for
 -- the agent loop, tool execution, policy decisions, and errors.
--- All output is plain text — no ANSI colors, no TUI dependencies.
+-- No ANSI colors, no TUI dependencies.
 --
 -- Style:
 --
@@ -12,6 +12,13 @@
 -- * 2-space indent for body lines under a label
 -- * Multiline content is indented uniformly
 -- * Readable on dumb terminals and Windows consoles
+--
+-- Note: The startup banner ('Haskode.Main.printBanner') and batch
+-- preview separators ('Haskode.Patch.batchOpPreview') use Unicode
+-- box-drawing characters (@┌@, @─@, @│@, @└@) for cosmetic
+-- framing.  These are intentional and not required for functionality.
+-- On Windows consoles without UTF-8 support, they may render as
+-- fallback glyphs but the surrounding text remains readable.
 
 module Haskode.Display
   ( -- * Indentation
@@ -263,20 +270,21 @@ formatError msg = "  [error] " <> msg
 
 -- | Format a refusal message when the conversation exceeds the context limit.
 --
--- Includes estimated size, configured limit, over-limit delta, and a note
--- that Haskode does not auto-truncate or summarize.
+-- Includes estimated size, configured limit, percentage used, over-limit
+-- delta, and a note that Haskode does not auto-truncate or summarize.
+-- The layout mirrors 'Haskode.Commands.formatContextUsage' used by /status.
 --
 -- >>> formatContextLimitRefusal 130000 120000
--- "Error: conversation is too large to send (130000 chars estimated, limit 120000).\n  ..."
+-- "Error: conversation is too large to send\n  Context est: 130000 chars (108% used)\n  ..."
 formatContextLimitRefusal :: Int -> Int -> Text
 formatContextLimitRefusal estimated maxChars =
   let overBy = estimated - maxChars
-      overLine | overBy > 0 = "  Over limit by: " <> T.pack (show overBy) <> " chars\n"
-               | otherwise  = ""
-  in "Error: conversation is too large to send ("
-     <> T.pack (show estimated) <> " chars estimated, limit "
-     <> T.pack (show maxChars) <> ").\n"
-     <> overLine
+      pct    = if maxChars > 0 then estimated * 100 `div` maxChars else 0
+  in "Error: conversation is too large to send\n"
+     <> "  Context est:    " <> T.pack (show estimated) <> " chars ("
+                            <> T.pack (show pct) <> "% used)\n"
+     <> "  Limit:          " <> T.pack (show maxChars) <> " chars\n"
+     <> "  Over limit by:  " <> T.pack (show overBy) <> " chars\n"
      <> "  Note: Haskode does not auto-truncate or summarize conversations.\n"
      <> "  Suggested next steps:\n"
      <> "    - Start a fresh session (/new or restart)\n"

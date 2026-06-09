@@ -62,7 +62,8 @@ data CompletionResponse = CompletionResponse
 -- Streaming types
 --
 -- These types define the optional streaming interface for providers.
--- The OpenAI provider now implements streaming for text-only replies.
+-- The OpenAI provider streams text deltas to the handler and assembles
+-- streamed tool-call deltas into the final 'CompletionResponse'.
 -- The agent uses providerStream when available, falling back to
 -- providerComplete when not.
 -- ---------------------------------------------------------------------------
@@ -71,8 +72,8 @@ data CompletionResponse = CompletionResponse
 --
 --   The streaming provider calls 'onToken' for each assistant text
 --   chunk as it arrives.  The handler is responsible for display
---   (e.g. printing to stdout and flushing).  Tool calls are not
---   streamed — they are only parsed from the final assembled
+--   (e.g. printing to stdout and flushing).  Streamed tool-call
+--   deltas are assembled internally and returned in the final
 --   'CompletionResponse'.
 data StreamHandler = StreamHandler
   { onToken :: Text -> IO ()  -- ^ Called for each text chunk
@@ -101,7 +102,8 @@ data Provider = Provider
     --   chunks via a callback.  When 'Nothing' (the common case),
     --   only the non-streaming 'providerComplete' path is available.
     --
-    --   The OpenAI provider implements streaming for text-only replies.
+    --   The OpenAI provider streams text deltas and assembles
+    --   streamed tool-call deltas into the final response.
   , providerStream   :: Maybe ProviderStream
   }
 

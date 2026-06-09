@@ -10,11 +10,13 @@
 --
 --   1. A full audit trail for debugging.
 --   2. Read-only inspection via @--show-session@ (event counts, timestamps).
---   3. Potential training data for fine-tuning (export only; no replay).
+--   3. Conservative session resume via @--resume@ (non-replaying).
+--   4. Potential training data for fine-tuning (export only; no replay).
 --
 -- Events are stored in-memory during a session and flushed to a
--- JSON-lines file on exit.  The log is write-only: no conversation
--- restoration, replay, or tool/provider re-execution is supported.
+-- JSON-lines file on exit.  Resume reconstructs safe text context
+-- (user messages and assistant replies after the last reset boundary)
+-- without re-executing tools or provider calls.
 
 module Haskode.Session
   ( -- * Event types
@@ -34,6 +36,11 @@ module Haskode.Session
   , SessionSummary (..)
   , summarizeSession
   , formatSessionSummary
+    -- * Resume (phase zero)
+  , ResumeResult (..)
+  , loadResumeEvents
+  , resumeContextEventsToConversation
+  , formatResumeSummary
   ) where
 
 import Control.Exception     (IOException, onException, try)
@@ -43,6 +50,7 @@ import Data.Aeson            (ToJSON (..), FromJSON (..), Value (..),
 import qualified Data.Aeson  as Aeson
 import qualified Data.ByteString.Lazy as LBS
 import Data.ByteString.Lazy  (appendFile)
+import Data.Either           (partitionEithers)
 import Data.Map.Strict       (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text             (Text)
@@ -52,6 +60,9 @@ import Data.Time.Format      (defaultTimeLocale, formatTime)
 import Prelude               hiding (appendFile)
 import System.Directory      (doesFileExist, getFileSize, renameFile)
 import System.FilePath       ((</>))
+
+import Haskode.Core          (Conversation,
+                              mkUserMessage, mkAssistantMessage)
 
 -- ---------------------------------------------------------------------------
 -- Events
@@ -208,6 +219,8 @@ data SessionSummary = SessionSummary
   , ssLastTime      :: !(Maybe UTCTime)
   , ssTypeCounts    :: !(Map EventType Int)
   , ssMalformedLines :: !Int
+  , ssLogPath       :: !FilePath     -- ^ Absolute path to the inspected log
+  , ssBackupExists  :: !Bool         -- ^ Whether session.jsonl.1 exists
   } deriving stock (Show)
 
 -- | Read a @session.jsonl@ file and produce a concise summary.
@@ -217,27 +230,30 @@ data SessionSummary = SessionSummary
 --   * Lines that fail to decode as valid 'Event' values are counted
 --     in 'ssMalformedLines' rather than causing an error.
 --   * Only the active @session.jsonl@ is inspected; any rotated
---     @session.jsonl.1@ backup is ignored.
+--     @session.jsonl.1@ backup is reported but not read.
 summarizeSession :: FilePath -> IO SessionSummary
 summarizeSession dir = do
-  let path = dir </> "session.jsonl"
-  exists <- doesFileExist path
+  let path   = dir </> "session.jsonl"
+      backup = dir </> "session.jsonl.1"
+  exists   <- doesFileExist path
+  backupOk <- doesFileExist backup
   if not exists
-    then pure emptySummary
+    then pure (emptySummary path backupOk)
     else do
       bytes <- LBS.readFile path
       if LBS.null bytes
-        then pure emptySummary
-        else pure $ summarizeLines (LBS.split (fromIntegral (fromEnum '\n')) bytes)
+        then pure (emptySummary path backupOk)
+        else pure $ summarizeLines path backupOk (LBS.split (fromIntegral (fromEnum '\n')) bytes)
   where
-    emptySummary = SessionSummary 0 Nothing Nothing Map.empty 0
+    emptySummary path backupOk =
+      SessionSummary 0 Nothing Nothing Map.empty 0 path backupOk
 
 -- | Pure summary builder from a list of lazy byte-string lines.
 --   Empty lines are silently skipped.
-summarizeLines :: [LBS.ByteString] -> SessionSummary
-summarizeLines = foldl step emptySummary
+summarizeLines :: FilePath -> Bool -> [LBS.ByteString] -> SessionSummary
+summarizeLines path backupOk = foldl step emptySummary
   where
-    emptySummary = SessionSummary 0 Nothing Nothing Map.empty 0
+    emptySummary = SessionSummary 0 Nothing Nothing Map.empty 0 path backupOk
 
     step acc line
       | LBS.null line = acc
@@ -282,11 +298,130 @@ formatSessionSummary ss =
       fmtTypeCount (ety, label) =
         let n = Map.findWithDefault 0 ety (ssTypeCounts ss)
         in "  " <> label <> ": " <> T.pack (show n)
-      malformedLine = if malformed > 0
-        then "\n  Malformed lines: " <> T.pack (show malformed)
-        else ""
+      backupLine = if ssBackupExists ss
+        then "  Backup:        session.jsonl.1 exists"
+        else "  Backup:        (none)"
   in "Session summary:\n"
+  <> "  Log:           " <> T.pack (ssLogPath ss) <> "\n"
   <> "  Total events:  " <> T.pack (show total) <> "\n"
   <> timeRange <> "\n"
   <> T.unlines typeLines
-  <> malformedLine
+  <> "  Malformed:     " <> T.pack (show malformed) <> "\n"
+  <> backupLine
+
+-- ---------------------------------------------------------------------------
+-- Resume (phase zero)
+-- ---------------------------------------------------------------------------
+
+-- | The result of loading a session log for resume context.
+data ResumeResult = ResumeResult
+  { rrResumeContext      :: !Conversation   -- ^ Safe text messages used as resume context
+  , rrMessageEventCount  :: !Int            -- ^ Conversation message events in the file (user + assistant, before reset filter)
+  , rrMalformed          :: !Int            -- ^ Number of malformed lines skipped
+  , rrParsedValid        :: !Int            -- ^ Total valid events parsed (all types)
+  , rrSkipped            :: !Int            -- ^ Valid events skipped (tool, policy, lifecycle types)
+  , rrUsedResetBoundary  :: !Bool           -- ^ True if a conversation_reset boundary was found
+  , rrMessageCount       :: !Int            -- ^ Safe text messages in the resume context (after reset filter)
+  } deriving stock (Show)
+
+-- | Load conservative resume context from @session.jsonl@ in the given directory.
+--
+--   * Returns 'Nothing' when the file does not exist or is empty.
+--   * Skips malformed lines (counted in 'rrMalformed').
+--   * Only the active @session.jsonl@ is read; rotated backups are ignored.
+--   * Reconstructs only safe text messages; tool calls, tool results,
+--     policy decisions, and lifecycle events are never replayed.
+loadResumeEvents :: FilePath -> IO (Maybe ResumeResult)
+loadResumeEvents dir = do
+  let path = dir </> "session.jsonl"
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      bytes <- LBS.readFile path
+      if LBS.null bytes
+        then pure Nothing
+        else do
+          let rawLines = LBS.split (fromIntegral (fromEnum '\n')) bytes
+              -- Drop empty lines (e.g. trailing newline)
+              nonEmpty = filter (not . LBS.null) rawLines
+              (badLines, goodEvents) = partitionEithers
+                [ case Aeson.decode line :: Maybe Event of
+                    Nothing -> Left ()
+                    Just ev -> Right ev
+                | line <- nonEmpty
+                ]
+              -- Keep only events that can contribute to text resume context.
+              -- Include EConversationReset so the converter can apply the
+              -- last-reset boundary correctly.
+              resumeContextEvents = filter isResumeContextEvent goodEvents
+              malCount  = length badLines
+              validCount = length goodEvents
+              resumeContextEventCount = length resumeContextEvents
+              -- Skipped = valid events that are not safe text context
+              -- (lifecycle, tool, and policy events are completely ignored).
+              skippedCount = validCount - resumeContextEventCount
+              hasReset = any (\ev -> evType ev == EConversationReset) goodEvents
+              -- Count only actual conversation messages (not reset markers)
+              messageEventCount = length
+                [ ev | ev <- resumeContextEvents
+                , evType ev `elem` [EUserMessage, EAssistantReply]
+                ]
+              conv = resumeContextEventsToConversation resumeContextEvents
+          pure $ Just ResumeResult
+            { rrResumeContext     = conv
+            , rrMessageEventCount = messageEventCount
+            , rrMalformed         = malCount
+            , rrParsedValid       = validCount
+            , rrSkipped           = skippedCount
+            , rrUsedResetBoundary = hasReset
+            , rrMessageCount      = length conv
+            }
+  where
+    -- | Phase zero: user messages, assistant replies, and conversation
+    --   reset boundaries contribute to resume context.  Tool calls, tool
+    --   results, policy decisions, and lifecycle events are intentionally
+    --   skipped rather than replayed or restored.
+    isResumeContextEvent :: Event -> Bool
+    isResumeContextEvent ev =
+      evType ev `elem` [EUserMessage, EAssistantReply, EConversationReset]
+
+-- | Convert resume-context events into safe text 'Conversation' messages.
+--
+--   * @EUserMessage@ → user message
+--   * @EAssistantReply@ → assistant message (including any tool-call
+--     summary text that was recorded in the event data)
+--   * @EConversationReset@ clears the conversation (loads only events
+--     after the last reset)
+--
+--   Events appear in the order provided (expected: chronological).
+resumeContextEventsToConversation :: [Event] -> Conversation
+resumeContextEventsToConversation = foldl step []
+  where
+    step :: Conversation -> Event -> Conversation
+    step msgs ev = case evType ev of
+      EUserMessage ->
+        msgs ++ [mkUserMessage (evData ev)]
+      EAssistantReply ->
+        msgs ++ [mkAssistantMessage (evData ev)]
+      EConversationReset ->
+        -- Clear conversation on reset; resume from this point forward
+        []
+      _ -> msgs
+
+-- | Format a concise resume summary for terminal output.
+--
+--   Shows the active log path, safe text message count, parsed
+--   event counts, skipped events, malformed lines, and whether a
+--   conversation reset boundary was found.
+formatResumeSummary :: FilePath -> ResumeResult -> Text
+formatResumeSummary logPath rr =
+  T.unlines
+    [ "Resumed from:   " <> T.pack logPath
+    , "Messages:       " <> T.pack (show (rrMessageCount rr))
+    , "Valid events:   " <> T.pack (show (rrParsedValid rr))
+    , "Message events: " <> T.pack (show (rrMessageEventCount rr))
+    , "Skipped:        " <> T.pack (show (rrSkipped rr))
+    , "Malformed:      " <> T.pack (show (rrMalformed rr))
+    , "Reset boundary: " <> (if rrUsedResetBoundary rr then "yes" else "no")
+    ]

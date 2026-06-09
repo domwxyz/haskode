@@ -256,6 +256,14 @@ testFormatContextLimitRefusalDelta =
        then pure $ Right ()
        else pure $ Left $ "Missing delta in: " ++ T.unpack msg
 
+-- | formatContextLimitRefusal includes percentage used.
+testFormatContextLimitRefusalPercent :: Test
+testFormatContextLimitRefusalPercent =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "108%" `T.isInfixOf` msg && "% used" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing percent in: " ++ T.unpack msg
+
 -- | formatContextLimitRefusal states no auto-truncation or summarization.
 testFormatContextLimitRefusalNoAutoTruncate :: Test
 testFormatContextLimitRefusalNoAutoTruncate =
@@ -278,7 +286,7 @@ testFormatContextLimitRefusalNextSteps =
 testFormatContextLimitRefusalExactOver :: Test
 testFormatContextLimitRefusalExactOver =
   let msg = formatContextLimitRefusal 120001 120000
-  in if "1" `T.isInfixOf` msg && "Over limit by" `T.isInfixOf` msg
+  in if "Over limit by:  1 chars" `T.isInfixOf` msg
        then pure $ Right ()
        else pure $ Left $ "Exact-over case failed: " ++ T.unpack msg
 
@@ -358,6 +366,7 @@ tests =
   , testFormatContextLimitRefusalEstimate
   , testFormatContextLimitRefusalLimit
   , testFormatContextLimitRefusalDelta
+  , testFormatContextLimitRefusalPercent
   , testFormatContextLimitRefusalNoAutoTruncate
   , testFormatContextLimitRefusalNextSteps
   , testFormatContextLimitRefusalExactOver

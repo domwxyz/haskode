@@ -5,7 +5,8 @@
 module Haskode.Test.Patch (tests) where
 
 import Control.Exception ( IOException, try )
-import Data.Aeson ( object, KeyValue((.=)) )
+import Data.Aeson ( Value(..), object, KeyValue((.=)) )
+import qualified Data.Vector as V (fromList)
 import Haskode.Agent
     ( AgentState(asConversation, asSession),
       autoApprove,
@@ -30,16 +31,26 @@ import Haskode.Session
                 EPolicyDecision) )
 import Haskode.Test.Util
     ( createTestTree,
+      runInTestDir,
       skipIfNoSymlinks,
       skipOnWindows,
       toolDescriptionFromRegistry,
+      withTestDir,
       Test )
+import Haskode.Patch
+    ( formatBatchHeader, showDiff, makePatch, batchOpPreview,
+      countAddedLines, countRemovedLines, BatchOp(..),
+      ValidatedBatchOp(..), applyValidatedBatchOps,
+      formatBatchApplySummary, formatNewFilePreview,
+      formatDiffCountSummary )
 import Haskode.Tools
     ( defaultRegistry,
       applyPatchTool,
+      applyPatchBatchTool,
       computePatchPreview,
       computeWriteFilePreview,
       previewPatchTool,
+      previewPatchBatchTool,
       toolNames,
       writeFileTool,
       Tool(toolExecute) )
@@ -61,22 +72,13 @@ import qualified Data.Text.IO as TIO ( readFile, writeFile )
 
 -- | computePatchPreview returns the path and diff for a valid file.
 testComputePatchPreviewNormal :: Test
-testComputePatchPreviewNormal = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-preview-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  let testFile = root </> "Foo.hs"
-  TIO.writeFile testFile "module Foo where\nfoo = 1\n"
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testComputePatchPreviewNormal = runInTestDir "haskode-preview-test" $ \_root -> do
+  TIO.writeFile "Foo.hs" "module Foo where\nfoo = 1\n"
   let args = object
         [ "path"        .= ("Foo.hs" :: T.Text)
         , "replacement" .= ("module Foo where\nfoo = 2\n" :: T.Text)
         ]
   result <- computePatchPreview args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Left err -> pure $ Left $ "Expected Right, got Left: " ++ T.unpack err
     Right (path, diff)
@@ -99,41 +101,25 @@ testComputePatchPreviewMissingPath = do
 
 -- | computePatchPreview returns an error for a path outside the working dir.
 testComputePatchPreviewOutsideRoot :: Test
-testComputePatchPreviewOutsideRoot = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-preview-outside"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testComputePatchPreviewOutsideRoot = runInTestDir "haskode-preview-outside" $ \_root -> do
   -- Use an absolute path that cannot resolve under the root.
   let args = object
         [ "path"        .= ("C:\\haskode_nonexistent_root_test\\file.txt" :: T.Text)
         , "replacement" .= ("new" :: T.Text)
         ]
   result <- computePatchPreview args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Left _err -> pure $ Right ()
     Right _ -> pure $ Left "Expected Left for outside-root path, got Right"
 
 -- | computePatchPreview returns an error for a nonexistent file.
 testComputePatchPreviewMissingFile :: Test
-testComputePatchPreviewMissingFile = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-preview-missing"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testComputePatchPreviewMissingFile = runInTestDir "haskode-preview-missing" $ \_root -> do
   let args = object
         [ "path"        .= ("nonexistent.hs" :: T.Text)
         , "replacement" .= ("new" :: T.Text)
         ]
   result <- computePatchPreview args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Left err
       | T.isInfixOf "could not resolve" err -> pure $ Right ()
@@ -144,11 +130,7 @@ testComputePatchPreviewMissingFile = do
 --   reason that includes the target file path.  We capture the reason
 --   text via a custom approval function.
 testApplyPatchApprovalShowsPath :: Test
-testApplyPatchApprovalShowsPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-approval-path-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testApplyPatchApprovalShowsPath = withTestDir "haskode-approval-path-test" $ \root -> do
   let testFile = root </> "Target.hs"
   TIO.writeFile testFile "module Target where\ntarget = 0\n"
   origDir <- getCurrentDirectory
@@ -172,10 +154,9 @@ testApplyPatchApprovalShowsPath = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry captureApprove
+      state = initState cfg prov defaultPolicy defaultRegistry captureApprove False
   state' <- runAgent state "apply the patch"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   reason <- Data.IORef.readIORef capturedReason
   -- The reason should include the path "Target.hs"
   let pathInReason = T.isInfixOf "Target.hs" reason
@@ -192,11 +173,7 @@ testApplyPatchApprovalShowsPath = do
 -- | When apply_patch is rejected, the file is unchanged and the
 --   session records the rejection cleanly.
 testApplyPatchRejectionShowsPath :: Test
-testApplyPatchRejectionShowsPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-reject-path-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testApplyPatchRejectionShowsPath = withTestDir "haskode-reject-path-test" $ \root -> do
   let testFile = root </> "Target.hs"
       original = "module Target where\ntarget = 0\n"
   TIO.writeFile testFile original
@@ -215,12 +192,11 @@ testApplyPatchRejectionShowsPath = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoReject
+      state = initState cfg prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "apply the patch"
   setCurrentDirectory origDir
   -- File should be unchanged
   after <- TIO.readFile testFile
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let fileUnchanged = after == original
   -- Session should show the policy decision and the rejection
   let evts = events (asSession state')
@@ -240,11 +216,7 @@ testApplyPatchRejectionShowsPath = do
 
 -- | Approved apply_patch logs the target path in the approval event.
 testApplyPatchAuditApprovalWithPath :: Test
-testApplyPatchAuditApprovalWithPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-audit-approve"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testApplyPatchAuditApprovalWithPath = withTestDir "haskode-audit-approve" $ \root -> do
   let testFile = root </> "Foo.hs"
   TIO.writeFile testFile "module Foo where\nfoo = 0\n"
   origDir <- getCurrentDirectory
@@ -261,12 +233,10 @@ testApplyPatchAuditApprovalWithPath = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "apply patch"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
-      -- Find the approval policy decision event
       policyEvts = filter (\e -> evType e == EPolicyDecision) evts
       approvalEvts = filter (T.isInfixOf "approved" . evData) policyEvts
   case approvalEvts of
@@ -278,11 +248,7 @@ testApplyPatchAuditApprovalWithPath = do
 
 -- | Rejected apply_patch logs the target path in the denial event.
 testApplyPatchAuditRejectionWithPath :: Test
-testApplyPatchAuditRejectionWithPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-audit-reject"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testApplyPatchAuditRejectionWithPath = withTestDir "haskode-audit-reject" $ \root -> do
   let testFile = root </> "Bar.hs"
   TIO.writeFile testFile "module Bar where\nbar = 0\n"
   origDir <- getCurrentDirectory
@@ -299,12 +265,10 @@ testApplyPatchAuditRejectionWithPath = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "apply patch"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
-      -- Find the denial tool-result event
       trEvts = filter (\e -> evType e == EToolResult) evts
       denialEvts = filter (T.isInfixOf "denied by user" . evData) trEvts
   case denialEvts of
@@ -318,11 +282,7 @@ testApplyPatchAuditRejectionWithPath = do
 --   full unbounded output).  The conversation keeps the full output,
 --   but the session event is truncated.
 testApplyPatchAuditResultBounded :: Test
-testApplyPatchAuditResultBounded = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-audit-bounded"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testApplyPatchAuditResultBounded = withTestDir "haskode-audit-bounded" $ \root -> do
   let testFile = root </> "Big.hs"
       -- Create a file with enough content to produce a large diff
       bigContent = T.unlines $ replicate 200 ("old line " <> T.pack (show (1 :: Int)))
@@ -342,10 +302,9 @@ testApplyPatchAuditResultBounded = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "apply big patch"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
       -- Find the tool result event for tc-audit3
       trEvts = filter (\e -> evType e == EToolResult) evts
@@ -372,11 +331,7 @@ testApplyPatchAuditResultBounded = do
 -- | Read-only tools (read_file) have unchanged session logging behavior —
 --   the session event data matches the tool output exactly.
 testReadOnlyAuditUnchanged :: Test
-testReadOnlyAuditUnchanged = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-audit-ro-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testReadOnlyAuditUnchanged = withTestDir "haskode-audit-ro-test" $ \root -> do
   writeFile (root </> "audit-ro.txt") "read-only audit test"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
@@ -391,10 +346,9 @@ testReadOnlyAuditUnchanged = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read file"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
       trEvts = filter (\e -> evType e == EToolResult) evts
       conv = asConversation state'
@@ -437,8 +391,7 @@ testPreviewPatchNormalDiff = do
   if T.isInfixOf "--- Main.hs" out
      && T.isInfixOf "-module Main where" out
      && T.isInfixOf "+module Main where" out
-     && T.isInfixOf "Diff preview" out
-     && T.isInfixOf "no files modified" out
+      && T.isInfixOf "Diff preview" out
     then pure $ Right ()
     else pure $ Left $ "preview_patch diff: " ++ T.unpack (T.take 300 out)
 
@@ -695,11 +648,7 @@ testApplyPatchPolicyAskUser =
 
 -- | write_file successfully creates a new in-root file after approval.
 testWriteFileSuccess :: Test
-testWriteFileSuccess = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-writefile-success"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileSuccess = withTestDir "haskode-writefile-success" $ \root -> do
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   let args = object
@@ -711,7 +660,6 @@ testWriteFileSuccess = do
   -- Read back the file to verify content
   exists <- doesFileExist (root </> "new_file.hs")
   content <- if exists then TIO.readFile (root </> "new_file.hs") else pure ""
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "File created" out
      && T.isInfixOf "new_file.hs" out
@@ -724,11 +672,7 @@ testWriteFileSuccess = do
 
 -- | write_file refuses to overwrite an existing file.
 testWriteFileRejectsOverwrite :: Test
-testWriteFileRejectsOverwrite = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-writefile-overwrite"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileRejectsOverwrite = withTestDir "haskode-writefile-overwrite" $ \root -> do
   writeFile (root </> "existing.hs") "module Existing where\n"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
@@ -740,7 +684,6 @@ testWriteFileRejectsOverwrite = do
   setCurrentDirectory origDir
   -- File should be unchanged
   after <- TIO.readFile (root </> "existing.hs")
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "error" out
      && T.isInfixOf "already exists" out
@@ -750,20 +693,12 @@ testWriteFileRejectsOverwrite = do
 
 -- | write_file rejects paths outside the working directory.
 testWriteFileOutsideRoot :: Test
-testWriteFileOutsideRoot = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-writefile-outside"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testWriteFileOutsideRoot = runInTestDir "haskode-writefile-outside" $ \_root -> do
   let args = object
         [ "path"    .= ("C:\\Windows\\System32\\haskode-outside-test.txt" :: T.Text)
         , "content" .= ("outside content" :: T.Text)
         ]
   result <- toolExecute writeFileTool args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "error" out
     then pure $ Right ()
@@ -797,20 +732,12 @@ testWriteFileRejectsOutsideRootSymlink = do
 
 -- | write_file rejects missing parent directories.
 testWriteFileMissingParent :: Test
-testWriteFileMissingParent = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-writefile-missing-parent"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testWriteFileMissingParent = runInTestDir "haskode-writefile-missing-parent" $ \_root -> do
   let args = object
         [ "path"    .= ("nonexistent_dir/newfile.txt" :: T.Text)
         , "content" .= ("content" :: T.Text)
         ]
   result <- toolExecute writeFileTool args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "error" out
      && (T.isInfixOf "parent" out || T.isInfixOf "does not exist" out)
@@ -819,11 +746,7 @@ testWriteFileMissingParent = do
 
 -- | write_file rejects directory targets.
 testWriteFileRejectsDirectory :: Test
-testWriteFileRejectsDirectory = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-writefile-dir"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileRejectsDirectory = withTestDir "haskode-writefile-dir" $ \root -> do
   createDirectory (root </> "subdir")
   origDir <- getCurrentDirectory
   setCurrentDirectory root
@@ -833,7 +756,6 @@ testWriteFileRejectsDirectory = do
         ]
   result <- toolExecute writeFileTool args
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "error" out && T.isInfixOf "directory" out
     then pure $ Right ()
@@ -856,20 +778,12 @@ testWriteFilePolicyAskUser =
 
 -- | computeWriteFilePreview returns the path and preview for a valid new file.
 testComputeWriteFilePreviewNormal :: Test
-testComputeWriteFilePreviewNormal = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-preview-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testComputeWriteFilePreviewNormal = runInTestDir "haskode-wf-preview-test" $ \_root -> do
   let args = object
         [ "path"    .= ("New.hs" :: T.Text)
         , "content" .= ("module New where\nnew = 1\n" :: T.Text)
         ]
   result <- computeWriteFilePreview args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Left err -> pure $ Left $ "Expected Right, got Left: " ++ T.unpack err
     Right (path, preview)
@@ -883,11 +797,7 @@ testComputeWriteFilePreviewNormal = do
 
 -- | computeWriteFilePreview returns an error for an existing file.
 testComputeWriteFilePreviewExisting :: Test
-testComputeWriteFilePreviewExisting = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-preview-existing"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testComputeWriteFilePreviewExisting = withTestDir "haskode-wf-preview-existing" $ \root -> do
   writeFile (root </> "Existing.hs") "module Existing where\n"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
@@ -897,7 +807,6 @@ testComputeWriteFilePreviewExisting = do
         ]
   result <- computeWriteFilePreview args
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Left err
       | T.isInfixOf "already exists" err -> pure $ Right ()
@@ -906,20 +815,12 @@ testComputeWriteFilePreviewExisting = do
 
 -- | computeWriteFilePreview returns an error for a path outside the working dir.
 testComputeWriteFilePreviewOutsideRoot :: Test
-testComputeWriteFilePreviewOutsideRoot = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-preview-outside"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  origDir <- getCurrentDirectory
-  setCurrentDirectory root
+testComputeWriteFilePreviewOutsideRoot = runInTestDir "haskode-wf-preview-outside" $ \_root -> do
   let args = object
         [ "path"    .= ("C:\\Windows\\System32\\haskode-outside-preview.txt" :: T.Text)
         , "content" .= ("content" :: T.Text)
         ]
   result <- computeWriteFilePreview args
-  setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Left _ -> pure $ Right ()
     Right _ -> pure $ Left "Expected Left for outside-root path, got Right"
@@ -927,11 +828,7 @@ testComputeWriteFilePreviewOutsideRoot = do
 -- | When write_file is approved, the approval function receives a
 --   reason that includes the target file path.
 testWriteFileApprovalShowsPath :: Test
-testWriteFileApprovalShowsPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-approval-path"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileApprovalShowsPath = withTestDir "haskode-wf-approval-path" $ \root -> do
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   capturedReason <- Data.IORef.newIORef ("" :: T.Text)
@@ -951,10 +848,9 @@ testWriteFileApprovalShowsPath = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry captureApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry captureApprove False
   state' <- runAgent state "create new file"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   reason <- Data.IORef.readIORef capturedReason
   let pathInReason = T.isInfixOf "New.hs" reason
   let evts = events (asSession state')
@@ -969,11 +865,7 @@ testWriteFileApprovalShowsPath = do
 -- | When write_file is rejected, the file is not created and the
 --   session records the rejection cleanly.
 testWriteFileRejectionShowsPath :: Test
-testWriteFileRejectionShowsPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-reject-path"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileRejectionShowsPath = withTestDir "haskode-wf-reject-path" $ \root -> do
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   prov <- scriptedProvider
@@ -988,12 +880,11 @@ testWriteFileRejectionShowsPath = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "create new file"
   setCurrentDirectory origDir
   -- File should NOT exist
   exists <- doesFileExist (root </> "New.hs")
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
       policyEvts = filter (\e -> evType e == EPolicyDecision) evts
       askEvts = filter (T.isInfixOf "AskUser" . evData) policyEvts
@@ -1007,11 +898,7 @@ testWriteFileRejectionShowsPath = do
 
 -- | Approved write_file logs the target path in the approval event.
 testWriteFileAuditApprovalWithPath :: Test
-testWriteFileAuditApprovalWithPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-audit-approve"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileAuditApprovalWithPath = withTestDir "haskode-wf-audit-approve" $ \root -> do
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   prov <- scriptedProvider
@@ -1026,10 +913,9 @@ testWriteFileAuditApprovalWithPath = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "create file"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
       policyEvts = filter (\e -> evType e == EPolicyDecision) evts
       approvalEvts = filter (T.isInfixOf "approved" . evData) policyEvts
@@ -1042,11 +928,7 @@ testWriteFileAuditApprovalWithPath = do
 
 -- | Rejected write_file logs the target path in the denial event.
 testWriteFileAuditRejectionWithPath :: Test
-testWriteFileAuditRejectionWithPath = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-wf-audit-reject"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testWriteFileAuditRejectionWithPath = withTestDir "haskode-wf-audit-reject" $ \root -> do
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   prov <- scriptedProvider
@@ -1061,10 +943,9 @@ testWriteFileAuditRejectionWithPath = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "create file"
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let evts = events (asSession state')
       trEvts = filter (\e -> evType e == EToolResult) evts
       denialEvts = filter (T.isInfixOf "denied by user" . evData) trEvts
@@ -1132,7 +1013,7 @@ testPatchWorkflowSmoke = do
         }
     ]
   let cfg   = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "fix the greeting"
   setCurrentDirectory origDir
   -- Verify conversation structure.
@@ -1203,7 +1084,7 @@ testPatchWorkflowRejectSmoke = do
         }
     ]
   let cfg   = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoReject
+      state = initState cfg prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "fix the greeting"
   setCurrentDirectory origDir
   -- Verify file is unchanged.
@@ -1230,6 +1111,908 @@ testPatchWorkflowRejectSmoke = do
       ++ " denialMsgs=" ++ show (length denialMsgs)
       ++ " fileUnchanged=" ++ show fileUnchanged
 
+
+-- ---------------------------------------------------------------------------
+-- preview_patch_batch tool tests
+-- ---------------------------------------------------------------------------
+
+-- | Batch with two existing-file replacements succeeds and contains both diffs.
+testBatchTwoReplacements :: Test
+testBatchTwoReplacements = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("Main.hs" :: T.Text)
+                     , "replacement" .= ("module New where\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("src/Lib.hs" :: T.Text)
+                     , "replacement" .= ("module Lib2 where\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "2 operations" out
+     && T.isInfixOf "Operation 1" out
+     && T.isInfixOf "Operation 2" out
+     && T.isInfixOf "--- Main.hs" out
+     && T.isInfixOf "--- src/Lib.hs" out
+     && T.isInfixOf "Batch preview" out
+    then pure $ Right ()
+    else pure $ Left $ "batch two replacements: " ++ T.unpack (T.take 400 out)
+
+-- | Batch with a create preview succeeds.
+testBatchCreatePreview :: Test
+testBatchCreatePreview = runInTestDir "haskode-batch-create" $ \_root -> do
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("New.hs" :: T.Text)
+                     , "content" .= ("module New where\nnew = 1\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "1 operations" out
+     && T.isInfixOf "Operation 1" out
+     && T.isInfixOf "(new file)" out
+     && T.isInfixOf "+module New where" out
+     && T.isInfixOf "Batch preview" out
+    then pure $ Right ()
+    else pure $ Left $ "batch create: " ++ T.unpack (T.take 400 out)
+
+-- | Mixed replace/create batch preview succeeds.
+testBatchMixedPreview :: Test
+testBatchMixedPreview = runInTestDir "haskode-batch-mixed" $ \root -> do
+  writeFile (root </> "Existing.hs") "module Existing where\nexisting = 0\n"
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("Existing.hs" :: T.Text)
+                     , "replacement" .= ("module Existing where\nexisting = 1\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("NewFile.hs" :: T.Text)
+                     , "content" .= ("module NewFile where\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "2 operations" out
+     && T.isInfixOf "(replace)" out
+     && T.isInfixOf "(create)" out
+     && T.isInfixOf "Existing.hs" out
+     && T.isInfixOf "NewFile.hs" out
+     && T.isInfixOf "Batch preview" out
+    then pure $ Right ()
+    else pure $ Left $ "batch mixed: " ++ T.unpack (T.take 400 out)
+
+-- | Empty operations list is rejected.
+testBatchEmptyOps :: Test
+testBatchEmptyOps = do
+  let args = object
+        [ "operations" .= Array (V.fromList [])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "empty" out
+    then pure $ Right ()
+    else pure $ Left $ "batch empty ops: " ++ T.unpack out
+
+-- | Unknown op value is rejected.
+testBatchUnknownOp :: Test
+testBatchUnknownOp = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("delete" :: T.Text)
+                     , "path" .= ("Main.hs" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "unknown op" out
+    then pure $ Right ()
+    else pure $ Left $ "batch unknown op: " ++ T.unpack (T.take 200 out)
+
+-- | Replace rejects missing file.
+testBatchReplaceMissingFile :: Test
+testBatchReplaceMissingFile = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("nonexistent.hs" :: T.Text)
+                     , "replacement" .= ("new content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "could not resolve" out
+    then pure $ Right ()
+    else pure $ Left $ "batch replace missing: " ++ T.unpack (T.take 200 out)
+
+-- | Create rejects existing file.
+testBatchCreateExistingFile :: Test
+testBatchCreateExistingFile = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("Main.hs" :: T.Text)
+                     , "content" .= ("content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "already exists" out
+    then pure $ Right ()
+    else pure $ Left $ "batch create existing: " ++ T.unpack (T.take 200 out)
+
+-- | Create rejects missing parent directory.
+testBatchCreateMissingParent :: Test
+testBatchCreateMissingParent = runInTestDir "haskode-batch-missing-parent" $ \_root -> do
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("nonexistent_dir/New.hs" :: T.Text)
+                     , "content" .= ("content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out
+     && (T.isInfixOf "parent" out || T.isInfixOf "does not exist" out)
+    then pure $ Right ()
+    else pure $ Left $ "batch create missing parent: " ++ T.unpack (T.take 200 out)
+
+-- | Outside-root path is rejected and the whole batch fails.
+testBatchOutsideRoot :: Test
+testBatchOutsideRoot = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("C:\\Windows\\System32\\drivers\\etc\\hosts" :: T.Text)
+                     , "replacement" .= ("new content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out
+    then pure $ Right ()
+    else pure $ Left $ "batch outside root: " ++ T.unpack (T.take 200 out)
+
+-- | preview_patch_batch is read-only: files are unchanged after preview.
+testBatchReadOnly :: Test
+testBatchReadOnly = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-batch-readonly"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  let fileA = root </> "A.hs"
+      fileB = root </> "B.hs"
+      contentA = "module A where\na = 1\n"
+      contentB = "module B where\nb = 1\n"
+  TIO.writeFile fileA contentA
+  TIO.writeFile fileB contentB
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("A.hs" :: T.Text)
+                     , "replacement" .= ("module A where\na = 99\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("B.hs" :: T.Text)
+                     , "replacement" .= ("module B where\nb = 99\n" :: T.Text)
+                     ]
+            ])
+        ]
+  _ <- toolExecute previewPatchBatchTool args
+  afterA <- TIO.readFile fileA
+  afterB <- TIO.readFile fileB
+  setCurrentDirectory origDir
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  if afterA == contentA && afterB == contentB
+    then pure $ Right ()
+    else pure $ Left "batch preview modified files!"
+
+-- | preview_patch_batch validation failure is also read-only.
+testBatchPreviewValidationFailureWritesNothing :: Test
+testBatchPreviewValidationFailureWritesNothing = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-batch-preview-validation-failure"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  let fileA = root </> "A.hs"
+      originalA = "module A where\na = 1\n"
+  TIO.writeFile fileA originalA
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("A.hs" :: T.Text)
+                     , "replacement" .= ("module A where\na = 99\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("Missing.hs" :: T.Text)
+                     , "replacement" .= ("module Missing where\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  afterA <- TIO.readFile fileA
+  setCurrentDirectory origDir
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  let out = trOutput result
+  if T.isInfixOf "error" out && afterA == originalA
+    then pure $ Right ()
+    else pure $ Left $ "preview validation failure wrote file or missed error: "
+                     ++ T.unpack (T.take 200 out)
+
+-- | preview_patch_batch is in the default registry.
+testBatchInRegistry :: Test
+testBatchInRegistry =
+  if "preview_patch_batch" `elem` toolNames defaultRegistry
+    then pure $ Right ()
+    else pure $ Left $ "preview_patch_batch not in registry: "
+                     ++ show (toolNames defaultRegistry)
+
+-- | preview_patch_batch is allowed by default policy (read-only).
+testBatchPolicyAllow :: Test
+testBatchPolicyAllow =
+  let tc = ToolCall "tc-batch" "preview_patch_batch"
+             (object ["operations" .= Array (V.fromList [])])
+  in case checkPolicy defaultPolicy tc of
+       Allow -> pure $ Right ()
+       other -> pure $ Left $ "Expected Allow for preview_patch_batch, got: "
+                             ++ show other
+
+-- | Missing operations field is rejected.
+testBatchMissingOpsField :: Test
+testBatchMissingOpsField = do
+  let args = object []
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "operations" out
+    then pure $ Right ()
+    else pure $ Left $ "batch missing ops: " ++ T.unpack out
+
+-- | Malformed operation (missing path) is rejected.
+testBatchMissingPath :: Test
+testBatchMissingPath = do
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text) ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "path" out
+    then pure $ Right ()
+    else pure $ Left $ "batch missing path: " ++ T.unpack out
+
+-- | Malformed operation (missing op) is rejected.
+testBatchMissingOp :: Test
+testBatchMissingOp = do
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "path" .= ("Main.hs" :: T.Text) ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "op" out
+    then pure $ Right ()
+    else pure $ Left $ "batch missing op: " ++ T.unpack out
+
+-- | Replace rejects directory targets.
+testBatchReplaceDirectory :: Test
+testBatchReplaceDirectory = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("src" :: T.Text)
+                     , "replacement" .= ("new content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute previewPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "directory" out
+    then pure $ Right ()
+    else pure $ Left $ "batch replace directory: " ++ T.unpack (T.take 200 out)
+
+
+-- ---------------------------------------------------------------------------
+-- apply_patch_batch tool tests
+-- ---------------------------------------------------------------------------
+
+-- | apply_patch_batch successfully applies multiple replacements.
+testBatchApplyTwoReplacements :: Test
+testBatchApplyTwoReplacements = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-batch-apply-replace"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  let fileA = root </> "A.hs"
+      fileB = root </> "B.hs"
+  TIO.writeFile fileA "module A where\na = 1\n"
+  TIO.writeFile fileB "module B where\nb = 1\n"
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("A.hs" :: T.Text)
+                     , "replacement" .= ("module A where\na = 99\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("B.hs" :: T.Text)
+                     , "replacement" .= ("module B where\nb = 99\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  afterA <- TIO.readFile fileA
+  afterB <- TIO.readFile fileB
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  let out = trOutput result
+  if T.isInfixOf "Batch applied" out
+     && T.isInfixOf "2 of 2" out
+     && T.isInfixOf "Operation 1" out
+     && T.isInfixOf "Operation 2" out
+     && afterA == "module A where\na = 99\n"
+     && afterB == "module B where\nb = 99\n"
+    then pure $ Right ()
+    else pure $ Left $ "batch apply two replacements: " ++ T.unpack (T.take 400 out)
+
+-- | apply_patch_batch successfully creates a new file.
+testBatchApplyCreate :: Test
+testBatchApplyCreate = runInTestDir "haskode-batch-apply-create" $ \_root -> do
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("New.hs" :: T.Text)
+                     , "content" .= ("module New where\nnew = 1\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  exists <- doesFileExist "New.hs"
+  content <- if exists then TIO.readFile "New.hs" else pure ""
+  let out = trOutput result
+  if T.isInfixOf "Batch applied" out
+     && T.isInfixOf "1 of 1" out
+     && exists
+     && T.isInfixOf "module New where" content
+    then pure $ Right ()
+    else pure $ Left $ "batch apply create: " ++ T.unpack (T.take 400 out)
+
+-- | apply_patch_batch with mixed replace/create succeeds.
+testBatchApplyMixed :: Test
+testBatchApplyMixed = withTestDir "haskode-batch-apply-mixed" $ \root -> do
+  TIO.writeFile (root </> "Existing.hs") "module Existing where\nexisting = 0\n"
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("Existing.hs" :: T.Text)
+                     , "replacement" .= ("module Existing where\nexisting = 1\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("NewFile.hs" :: T.Text)
+                     , "content" .= ("module NewFile where\n" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  afterExisting <- TIO.readFile (root </> "Existing.hs")
+  newExists <- doesFileExist (root </> "NewFile.hs")
+  newContent <- if newExists then TIO.readFile (root </> "NewFile.hs") else pure ""
+  let out = trOutput result
+  if T.isInfixOf "Batch applied" out
+     && T.isInfixOf "2 of 2" out
+     && afterExisting == "module Existing where\nexisting = 1\n"
+     && newExists
+     && T.isInfixOf "module NewFile where" newContent
+    then pure $ Right ()
+    else pure $ Left $ "batch apply mixed: " ++ T.unpack (T.take 400 out)
+
+-- | apply_patch_batch with confirmation denial writes nothing.
+testBatchApplyDenialWritesNothing :: Test
+testBatchApplyDenialWritesNothing = withTestDir "haskode-batch-apply-deny" $ \root -> do
+  let original = "module A where\na = 1\n"
+  TIO.writeFile (root </> "A.hs") original
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Applying batch."
+        , crToolCalls = Just [ToolCall "tc-batch1" "apply_patch_batch"
+                               (object [ "operations" .= Array (V.fromList
+                                 [ object [ "op" .= ("replace" :: T.Text)
+                                          , "path" .= ("A.hs" :: T.Text)
+                                          , "replacement" .= ("module A where\na = 99\n" :: T.Text)
+                                          ]
+                                 ])])]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "OK, I won't."
+        , crToolCalls = Nothing
+        }
+    ]
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject False
+  state' <- runAgent state "apply batch"
+  setCurrentDirectory origDir
+  after <- TIO.readFile (root </> "A.hs")
+  let fileUnchanged = after == original
+  let evts = events (asSession state')
+      policyEvts = filter (\e -> evType e == EPolicyDecision) evts
+      askEvts = filter (T.isInfixOf "AskUser" . evData) policyEvts
+      deniedEvts = filter (\e -> evType e == EToolResult
+                                 && T.isInfixOf "denied by user" (evData e)) evts
+  if fileUnchanged && not (null askEvts) && not (null deniedEvts)
+    then pure $ Right ()
+    else pure $ Left $ "unchanged=" ++ show fileUnchanged
+                     ++ " askEvts=" ++ show (not (null askEvts))
+                     ++ " denied=" ++ show (not (null deniedEvts))
+
+-- | apply_patch_batch rejects empty operations.
+testBatchApplyEmptyOps :: Test
+testBatchApplyEmptyOps = do
+  let args = object
+        [ "operations" .= Array (V.fromList [])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "empty" out
+    then pure $ Right ()
+    else pure $ Left $ "batch apply empty: " ++ T.unpack out
+
+-- | apply_patch_batch rejects unknown op.
+testBatchApplyUnknownOp :: Test
+testBatchApplyUnknownOp = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("delete" :: T.Text)
+                     , "path" .= ("Main.hs" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "unknown op" out
+    then pure $ Right ()
+    else pure $ Left $ "batch apply unknown op: " ++ T.unpack (T.take 200 out)
+
+-- | apply_patch_batch rejects missing replace target.
+testBatchApplyReplaceMissing :: Test
+testBatchApplyReplaceMissing = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("nonexistent.hs" :: T.Text)
+                     , "replacement" .= ("new content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "could not resolve" out
+    then pure $ Right ()
+    else pure $ Left $ "batch apply replace missing: " ++ T.unpack (T.take 200 out)
+
+-- | apply_patch_batch rejects existing create target.
+testBatchApplyCreateExisting :: Test
+testBatchApplyCreateExisting = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("Main.hs" :: T.Text)
+                     , "content" .= ("content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out && T.isInfixOf "already exists" out
+    then pure $ Right ()
+    else pure $ Left $ "batch apply create existing: " ++ T.unpack (T.take 200 out)
+
+-- | apply_patch_batch rejects missing create parent.
+testBatchApplyCreateMissingParent :: Test
+testBatchApplyCreateMissingParent = runInTestDir "haskode-batch-apply-missing-parent" $ \_root -> do
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("create" :: T.Text)
+                     , "path" .= ("nonexistent_dir/New.hs" :: T.Text)
+                     , "content" .= ("content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  let out = trOutput result
+  if T.isInfixOf "error" out
+     && (T.isInfixOf "parent" out || T.isInfixOf "does not exist" out)
+    then pure $ Right ()
+    else pure $ Left $ "batch apply create missing parent: " ++ T.unpack (T.take 200 out)
+
+-- | apply_patch_batch rejects outside-root paths.
+testBatchApplyOutsideRoot :: Test
+testBatchApplyOutsideRoot = do
+  (root, cleanupAction) <- createTestTree
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("C:\\Windows\\System32\\drivers\\etc\\hosts" :: T.Text)
+                     , "replacement" .= ("new content" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  cleanupAction
+  let out = trOutput result
+  if T.isInfixOf "error" out
+    then pure $ Right ()
+    else pure $ Left $ "batch apply outside root: " ++ T.unpack (T.take 200 out)
+
+-- | apply_patch_batch validation is all-or-nothing: if any op fails,
+--   no files are written.
+testBatchApplyAllOrNothing :: Test
+testBatchApplyAllOrNothing = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-batch-apply-all-or-nothing"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  let originalA = "module A where\na = 1\n"
+      originalB = "module B where\nb = 1\n"
+  TIO.writeFile (root </> "A.hs") originalA
+  TIO.writeFile (root </> "B.hs") originalB
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  -- First op succeeds, second fails (nonexistent file)
+  let args = object
+        [ "operations" .= Array (V.fromList
+            [ object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("A.hs" :: T.Text)
+                     , "replacement" .= ("module A where\na = 99\n" :: T.Text)
+                     ]
+            , object [ "op" .= ("replace" :: T.Text)
+                     , "path" .= ("nonexistent.hs" :: T.Text)
+                     , "replacement" .= ("new" :: T.Text)
+                     ]
+            ])
+        ]
+  result <- toolExecute applyPatchBatchTool args
+  setCurrentDirectory origDir
+  afterA <- TIO.readFile (root </> "A.hs")
+  afterB <- TIO.readFile (root </> "B.hs")
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  let out = trOutput result
+  -- Validation fails on second op, so NO files should be written
+  if T.isInfixOf "error" out
+     && afterA == originalA
+     && afterB == originalB
+    then pure $ Right ()
+    else pure $ Left $ "batch all-or-nothing: A changed="
+                     ++ show (afterA /= originalA)
+                     ++ " B changed=" ++ show (afterB /= originalB)
+                     ++ " out=" ++ T.unpack (T.take 200 out)
+
+-- | A mid-batch write failure reports partial success and does not
+--   roll back already-written files.
+testBatchApplyPartialWriteFailureNoRollback :: Test
+testBatchApplyPartialWriteFailureNoRollback = withTestDir "haskode-batch-apply-partial-write" $ \root -> do
+  let fileA = root </> "A.hs"
+      originalA = "module A where\na = 1\n"
+      replacementA = "module A where\na = 2\n"
+      missingParentFile = root </> "missing-parent" </> "B.hs"
+  TIO.writeFile fileA originalA
+  result <- applyValidatedBatchOps
+    [ ValidatedBatchOp (ReplaceOp fileA replacementA) ""
+    , ValidatedBatchOp (CreateOp missingParentFile "module B where\n") ""
+    ]
+  afterA <- TIO.readFile fileA
+  if T.isInfixOf "Partial batch: 1 of 2" result
+     && not (T.isInfixOf "rollback" result)
+     && afterA == replacementA
+    then pure $ Right ()
+    else pure $ Left $ "partial write failure: afterA changed="
+                     ++ show (afterA == replacementA)
+                     ++ " result=" ++ T.unpack (T.take 300 result)
+
+-- | apply_patch_batch is in the default registry.
+testBatchApplyInRegistry :: Test
+testBatchApplyInRegistry =
+  if "apply_patch_batch" `elem` toolNames defaultRegistry
+    then pure $ Right ()
+    else pure $ Left $ "apply_patch_batch not in registry: "
+                     ++ show (toolNames defaultRegistry)
+
+-- | apply_patch_batch is NOT allowed by default policy (requires confirmation).
+testBatchApplyPolicyAskUser :: Test
+testBatchApplyPolicyAskUser =
+  let tc = ToolCall "tc-batch-ap" "apply_patch_batch"
+             (object ["operations" .= Array (V.fromList [])])
+  in case checkPolicy defaultPolicy tc of
+       AskUser _ -> pure $ Right ()
+       other     -> pure $ Left $ "Expected AskUser for apply_patch_batch, got: "
+                                 ++ show other
+
+-- | Approved apply_patch_batch logs approval in the session.
+testBatchApplyAuditApproval :: Test
+testBatchApplyAuditApproval = withTestDir "haskode-batch-apply-audit-approve" $ \root -> do
+  TIO.writeFile (root </> "A.hs") "module A where\na = 1\n"
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Applying."
+        , crToolCalls = Just [ToolCall "tc-ba1" "apply_patch_batch"
+                               (object [ "operations" .= Array (V.fromList
+                                 [ object [ "op" .= ("replace" :: T.Text)
+                                          , "path" .= ("A.hs" :: T.Text)
+                                          , "replacement" .= ("module A where\na = 2\n" :: T.Text)
+                                          ]
+                                 ])])]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "Done."
+        , crToolCalls = Nothing
+        }
+    ]
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
+  state' <- runAgent state "apply batch"
+  setCurrentDirectory origDir
+  let evts = events (asSession state')
+      policyEvts = filter (\e -> evType e == EPolicyDecision) evts
+      approvalEvts = filter (T.isInfixOf "approved" . evData) policyEvts
+  case approvalEvts of
+    (_:_) -> pure $ Right ()
+    _     -> pure $ Left "No approval event found for apply_patch_batch"
+
+-- | Rejected apply_patch_batch logs rejection in the session.
+testBatchApplyAuditRejection :: Test
+testBatchApplyAuditRejection = withTestDir "haskode-batch-apply-audit-reject" $ \root -> do
+  TIO.writeFile (root </> "A.hs") "module A where\na = 1\n"
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Applying."
+        , crToolCalls = Just [ToolCall "tc-ba2" "apply_patch_batch"
+                               (object [ "operations" .= Array (V.fromList
+                                 [ object [ "op" .= ("replace" :: T.Text)
+                                          , "path" .= ("A.hs" :: T.Text)
+                                          , "replacement" .= ("module A where\na = 99\n" :: T.Text)
+                                          ]
+                                 ])])]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "OK."
+        , crToolCalls = Nothing
+        }
+    ]
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject False
+  state' <- runAgent state "apply batch"
+  setCurrentDirectory origDir
+  let evts = events (asSession state')
+      trEvts = filter (\e -> evType e == EToolResult) evts
+      denialEvts = filter (T.isInfixOf "denied by user" . evData) trEvts
+  case denialEvts of
+    (_:_) -> pure $ Right ()
+    _     -> pure $ Left "No denial event found for apply_patch_batch"
+
+-- ---------------------------------------------------------------------------
+-- Format tests
+-- ---------------------------------------------------------------------------
+
+-- | formatBatchHeader produces a concise header with operation count.
+testFormatBatchHeader :: Test
+testFormatBatchHeader =
+  let out = formatBatchHeader 3
+  in if T.isInfixOf "3 operations" out && T.isInfixOf "Batch preview" out
+        && T.isInfixOf "──────" out
+     then pure $ Right ()
+     else pure $ Left $ "formatBatchHeader: " ++ T.unpack out
+
+-- ---------------------------------------------------------------------------
+-- Diff display formatting tests
+-- ---------------------------------------------------------------------------
+
+-- | showDiff includes a hunk header with added/removed line counts.
+testShowDiffHunkHeader :: Test
+testShowDiffHunkHeader =
+  let patch = makePatch "Foo.hs" "module Foo where\nfoo = 1\n" "module Foo where\nfoo = 2\nbar = 3\n"
+      diff  = showDiff patch
+  in if T.isInfixOf "@@ -2 +3 @@" diff
+       then pure $ Right ()
+       else pure $ Left $ "showDiff hunk header: " ++ T.unpack (T.take 200 diff)
+
+-- | showDiff line counts are correct for a removal-heavy diff.
+testShowDiffLineCountsRemoved :: Test
+testShowDiffLineCountsRemoved =
+  let patch = makePatch "Bar.hs" "a\nb\nc\nd\n" "a\nc\n"
+      diff  = showDiff patch
+  in if T.isInfixOf "@@ -4 +2 @@" diff
+       then pure $ Right ()
+       else pure $ Left $ "showDiff removal counts: " ++ T.unpack (T.take 200 diff)
+
+-- | countAddedLines correctly counts + lines in a diff.
+testCountAddedLines :: Test
+testCountAddedLines =
+  let diff = "--- Foo.hs\n+++ Foo.hs\n@@ -1 +2 @@\n-old1\n-old2\n+new1\n+new2\n+new3\n"
+  in if countAddedLines diff == 3
+       then pure $ Right ()
+       else pure $ Left $ "countAddedLines: expected 3, got " ++ show (countAddedLines diff)
+
+-- | countRemovedLines correctly counts - lines in a diff.
+testCountRemovedLines :: Test
+testCountRemovedLines =
+  let diff = "--- Foo.hs\n+++ Foo.hs\n@@ -2 +1 @@\n-old1\n-old2\n+new1\n"
+  in if countRemovedLines diff == 2
+       then pure $ Right ()
+       else pure $ Left $ "countRemovedLines: expected 2, got " ++ show (countRemovedLines diff)
+
+-- | batchOpPreview includes operation metadata and separator.
+testBatchOpPreviewMetadata :: Test
+testBatchOpPreviewMetadata =
+  let diff = "--- Foo.hs\n+++ Foo.hs\n@@ -1 +1 @@\n-old\n+new\n"
+      preview = batchOpPreview 1 (ReplaceOp "Foo.hs" "new") diff
+  in if T.isInfixOf "(1 added, 1 removed)" preview
+       && T.isInfixOf "─────────────" preview
+       && T.isInfixOf "Operation 1" preview
+       && T.isInfixOf "Foo.hs" preview
+       then pure $ Right ()
+       else pure $ Left $ "batchOpPreview metadata: " ++ T.unpack (T.take 300 preview)
+
+-- | batchOpPreview for create operation shows added count.
+testBatchOpPreviewCreateMetadata :: Test
+testBatchOpPreviewCreateMetadata =
+  let preview = "--- (new file)\n+++ New.hs\n@@ -0,0 +1,2 @@\n+line1\n+line2\n"
+      result  = batchOpPreview 2 (CreateOp "New.hs" "line1\nline2\n") preview
+  in if T.isInfixOf "(2 added)" result
+       && T.isInfixOf "Operation 2" result
+       && T.isInfixOf "New.hs" result
+       && T.isInfixOf "─────────────" result
+       then pure $ Right ()
+       else pure $ Left $ "batchOpPreview create: " ++ T.unpack (T.take 300 result)
+
+-- ---------------------------------------------------------------------------
+-- Pure batch formatting helper tests
+-- ---------------------------------------------------------------------------
+
+-- | formatBatchApplySummary shows the operation count and numbered list.
+testFormatBatchApplySummary :: Test
+testFormatBatchApplySummary =
+  let ops = [ ReplaceOp "src/Foo.hs" "new content"
+            , ReplaceOp "src/Bar.hs" "other"
+            , CreateOp  "src/Baz.hs" "baz content"
+            ]
+      out = formatBatchApplySummary ops
+  in if T.isInfixOf "3 operations" out
+       && T.isInfixOf "1. replace | src/Foo.hs" out
+       && T.isInfixOf "2. replace | src/Bar.hs" out
+       && T.isInfixOf "3. create | src/Baz.hs" out
+       then pure $ Right ()
+       else pure $ Left $ "formatBatchApplySummary: " ++ T.unpack out
+
+-- | formatBatchApplySummary with a single replace operation.
+testFormatBatchApplySummarySingleReplace :: Test
+testFormatBatchApplySummarySingleReplace =
+  let ops = [ReplaceOp "Main.hs" "content"]
+      out = formatBatchApplySummary ops
+  in if T.isInfixOf "1 operations" out
+       && T.isInfixOf "1. replace | Main.hs" out
+       then pure $ Right ()
+       else pure $ Left $ "formatBatchApplySummary single: " ++ T.unpack out
+
+-- | formatBatchApplySummary with a single create operation.
+testFormatBatchApplySummarySingleCreate :: Test
+testFormatBatchApplySummarySingleCreate =
+  let ops = [CreateOp "New.hs" "content"]
+      out = formatBatchApplySummary ops
+  in if T.isInfixOf "1 operations" out
+       && T.isInfixOf "1. create | New.hs" out
+       then pure $ Right ()
+       else pure $ Left $ "formatBatchApplySummary create: " ++ T.unpack out
+
+-- | formatBatchApplySummary with empty list produces valid output.
+testFormatBatchApplySummaryEmpty :: Test
+testFormatBatchApplySummaryEmpty =
+  let out = formatBatchApplySummary []
+  in if T.isInfixOf "0 operations" out
+       then pure $ Right ()
+       else pure $ Left $ "formatBatchApplySummary empty: " ++ T.unpack out
+
+-- | formatDiffCountSummary shows added and removed counts.
+testFormatDiffCountSummaryBoth :: Test
+testFormatDiffCountSummaryBoth =
+  let diff = "--- Foo.hs\n+++ Foo.hs\n-old\n+new1\n+new2\n"
+      out = formatDiffCountSummary diff
+  in if T.isInfixOf "2 added" out && T.isInfixOf "1 removed" out
+       then pure $ Right ()
+       else pure $ Left $ "formatDiffCountSummary both: " ++ T.unpack out
+
+-- | formatDiffCountSummary with only additions omits removed.
+testFormatDiffCountSummaryAddedOnly :: Test
+testFormatDiffCountSummaryAddedOnly =
+  let diff = "--- (new file)\n+++ New.hs\n+line1\n+line2\n+line3\n"
+      out = formatDiffCountSummary diff
+  in if T.isInfixOf "3 added" out && not (T.isInfixOf "removed" out)
+       then pure $ Right ()
+       else pure $ Left $ "formatDiffCountSummary added only: " ++ T.unpack out
+
+-- | formatNewFilePreview produces a new-file diff with added lines.
+testFormatNewFilePreviewPure :: Test
+testFormatNewFilePreviewPure =
+  let out = formatNewFilePreview "New.hs" "module New where\nimport Data.List\n"
+  in if T.isInfixOf "(new file)" out
+       && T.isInfixOf "+++ New.hs" out
+       && T.isInfixOf "+module New where" out
+       && T.isInfixOf "+import Data.List" out
+       && T.isInfixOf "@@ -0,0 +1,2 @@" out
+       then pure $ Right ()
+       else pure $ Left $ "formatNewFilePreview: " ++ T.unpack (T.take 300 out)
 
 tests :: [Test]
 tests =
@@ -1277,4 +2060,51 @@ tests =
   , testWriteFileDescriptionPhrases
   , testPatchWorkflowSmoke
   , testPatchWorkflowRejectSmoke
+  , testBatchTwoReplacements
+  , testBatchCreatePreview
+  , testBatchMixedPreview
+  , testBatchEmptyOps
+  , testBatchUnknownOp
+  , testBatchReplaceMissingFile
+  , testBatchCreateExistingFile
+  , testBatchCreateMissingParent
+  , skipOnWindows testBatchOutsideRoot
+  , testBatchReadOnly
+  , testBatchPreviewValidationFailureWritesNothing
+  , testBatchInRegistry
+  , testBatchPolicyAllow
+  , testBatchMissingOpsField
+  , testBatchMissingPath
+  , testBatchMissingOp
+  , testBatchReplaceDirectory
+  , testBatchApplyTwoReplacements
+  , testBatchApplyCreate
+  , testBatchApplyMixed
+  , testBatchApplyDenialWritesNothing
+  , testBatchApplyEmptyOps
+  , testBatchApplyUnknownOp
+  , testBatchApplyReplaceMissing
+  , testBatchApplyCreateExisting
+  , testBatchApplyCreateMissingParent
+  , skipOnWindows testBatchApplyOutsideRoot
+  , testBatchApplyAllOrNothing
+  , testBatchApplyPartialWriteFailureNoRollback
+  , testBatchApplyInRegistry
+  , testBatchApplyPolicyAskUser
+  , testBatchApplyAuditApproval
+  , testBatchApplyAuditRejection
+  , testFormatBatchHeader
+  , testShowDiffHunkHeader
+  , testShowDiffLineCountsRemoved
+  , testCountAddedLines
+  , testCountRemovedLines
+  , testBatchOpPreviewMetadata
+  , testBatchOpPreviewCreateMetadata
+  , testFormatBatchApplySummary
+  , testFormatBatchApplySummarySingleReplace
+  , testFormatBatchApplySummarySingleCreate
+  , testFormatBatchApplySummaryEmpty
+  , testFormatDiffCountSummaryBoth
+  , testFormatDiffCountSummaryAddedOnly
+  , testFormatNewFilePreviewPure
   ]

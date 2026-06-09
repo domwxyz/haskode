@@ -52,7 +52,7 @@ testApprovalApproved = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "write the file"
   let evts = events (asSession state')
       types = map evType evts
@@ -82,7 +82,7 @@ testApprovalRejected = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoReject
+      state = initState cfg prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "write the file"
   let evts = events (asSession state')
       types = map evType evts
@@ -108,7 +108,7 @@ testApprovalSessionEvents = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "check"
   let evts = events (asSession state')
       policyEvts = filter (\e -> evType e == EPolicyDecision) evts
@@ -132,7 +132,7 @@ testRejectionSessionEvents = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoReject
+      state = initState cfg prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "check"
   let evts = events (asSession state')
       toolResultEvts = filter (\e -> evType e == EToolResult) evts
@@ -158,7 +158,7 @@ testDangerousDeniedWithoutPrompting = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "delete everything"
   let evts = events (asSession state')
       policyEvts = filter (\e -> evType e == EPolicyDecision) evts

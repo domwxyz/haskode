@@ -37,6 +37,7 @@ module Haskode.Agent
   , estimateContextChars
     -- * Session lifecycle helpers
   , recordSessionStart
+  , recordSessionStartWithResume
   , recordSessionEnd
   , recordConversationReset
     -- * Approval
@@ -80,7 +81,8 @@ import Haskode.Session    (Event (..), EventType (..), SessionLog,
 import Haskode.Tools      (Tool (..), ToolRegistry, toolNames, lookupTool,
                            safeCanonicalize, isUnderRoot,
                            extractTextField, computePatchPreview,
-                           computeWriteFilePreview)
+                           computeWriteFilePreview,
+                           computeBatchApplyPreview)
 import Data.Time.Clock    (getCurrentTime)
 
 -- ---------------------------------------------------------------------------
@@ -139,10 +141,11 @@ data AgentState = AgentState
   , asPolicy       :: !Policy
   , asRegistry     :: !ToolRegistry
   , asApproval     :: !ApprovalFunc
+  , asResumed      :: !Bool             -- ^ True when conversation was loaded from a prior session
   }
 
-initState :: Config -> Provider -> Policy -> ToolRegistry -> ApprovalFunc -> AgentState
-initState cfg prov pol reg approve = AgentState
+initState :: Config -> Provider -> Policy -> ToolRegistry -> ApprovalFunc -> Bool -> AgentState
+initState cfg prov pol reg approve resumed = AgentState
   { asConversation = emptyConversation
   , asSession      = emptyLog
   , asConfig       = cfg
@@ -150,6 +153,7 @@ initState cfg prov pol reg approve = AgentState
   , asPolicy       = pol
   , asRegistry     = reg
   , asApproval     = approve
+  , asResumed      = resumed
   }
 
 -- ---------------------------------------------------------------------------
@@ -162,6 +166,14 @@ recordSessionStart :: AgentState -> IO AgentState
 recordSessionStart st = do
   now <- getCurrentTime
   pure st { asSession = logEvent (Event now ESessionStart "session started") (asSession st) }
+
+-- | Record a @session_start@ event with resume information.
+--   Used when @\-\-resume@ loaded conversation history from a prior session.
+recordSessionStartWithResume :: AgentState -> Int -> IO AgentState
+recordSessionStartWithResume st msgCount = do
+  now <- getCurrentTime
+  let info = "session started (resumed: " <> T.pack (show msgCount) <> " messages)"
+  pure st { asSession = logEvent (Event now ESessionStart info) (asSession st) }
 
 -- | Record a @session_end@ event in the agent state's session log.
 --   Call once when the run exits normally, before flushing.
@@ -430,6 +442,64 @@ processToolCalls state (tc:tcs) = do
   state1 <- processSingleToolCall state tc
   processToolCalls state1 tcs
 
+-- | Write-like tools get a short action label in confirmation
+--   metadata.  These labels are user-facing, so keep them stable.
+writeLikeToolLabel :: ToolCall -> Maybe Text
+writeLikeToolLabel tc =
+  case tcName tc of
+    "apply_patch"       -> Just "patch"
+    "write_file"        -> Just "write"
+    "apply_patch_batch" -> Just "batch apply"
+    _                   -> Nothing
+
+-- | Extract the single target path used in confirmation metadata.
+--   Batch applies have per-operation paths, so they intentionally do
+--   not return a single display path here.
+writeLikeToolPath :: ToolCall -> Maybe Text
+writeLikeToolPath tc =
+  case tcName tc of
+    "apply_patch" -> extractTextField "path" (tcArgs tc)
+    "write_file"  -> extractTextField "path" (tcArgs tc)
+    _             -> Nothing
+
+-- | Reason text passed to approval functions and recorded for user
+--   rejection.  Preserves the existing wording for write-like tools.
+writeLikeDecisionReason :: ToolCall -> Text -> Text
+writeLikeDecisionReason tc reason =
+  case (writeLikeToolLabel tc, writeLikeToolPath tc) of
+    (Just label, Just path) -> label <> " " <> path <> " -- " <> reason
+    (Just "batch apply", _) -> "batch apply -- " <> reason
+    _                      -> reason
+
+-- | Audit text for an approved confirmation.  Single-file write-like
+--   tools include their target path when one was provided.
+approvalAuditText :: ToolCall -> Text
+approvalAuditText tc =
+  case writeLikeToolPath tc of
+    Just path -> tcName tc <> ": approved -- " <> path
+    Nothing   -> tcName tc <> ": approved by user"
+
+-- | Audit text for a rejected confirmation.
+denialAuditText :: ToolCall -> Text -> Text
+denialAuditText = writeLikeDecisionReason
+
+-- | Show any write-like confirmation preview for the tool call.
+showConfirmationPreview :: ToolCall -> IO ()
+showConfirmationPreview tc =
+  case tcName tc of
+    "apply_patch"       -> showPatchPreview tc
+    "write_file"        -> showWriteFilePreview tc
+    "apply_patch_batch" -> showBatchApplyPreview tc
+    _                   -> pure ()
+
+-- | Write-like tool results can contain large diffs, so their session
+--   event output is bounded.
+isWriteLikeTool :: ToolCall -> Bool
+isWriteLikeTool tc =
+  case writeLikeToolLabel tc of
+    Just _  -> True
+    Nothing -> False
+
 -- | Process a single tool call.
 processSingleToolCall :: AgentState -> ToolCall -> IO AgentState
 processSingleToolCall state tc = do
@@ -469,43 +539,17 @@ processSingleToolCall state tc = do
       -- Ask the user for confirmation via the injected approval function.
       -- In the CLI this prints tool info and reads y/N from stdin.
       -- In tests, autoApprove or autoReject is injected instead.
-      --
-      -- For apply_patch, show the target path and a unified diff preview
-      -- so the user can make an informed decision before approving.
       let approve  = asApproval state
-          enrichedReason = if tcName tc == "apply_patch"
-            then case extractTextField "path" (tcArgs tc) of
-              Just p  -> "patch " <> p <> " -- " <> reason
-              Nothing -> reason
-            else if tcName tc == "write_file"
-            then case extractTextField "path" (tcArgs tc) of
-              Just p  -> "write " <> p <> " -- " <> reason
-              Nothing -> reason
-            else reason
+          enrichedReason = writeLikeDecisionReason tc reason
       TIO.putStrLn $ formatPolicyConfirmationNeeded (tcName tc)
-      -- Show diff preview for apply_patch so the user sees what will change.
-      when (tcName tc == "apply_patch") $
-        showPatchPreview tc
-      -- Show file preview for write_file so the user sees what will be created.
-      when (tcName tc == "write_file") $
-        showWriteFilePreview tc
+      showConfirmationPreview tc
       approved <- approve tc enrichedReason
       if approved
         then do
           -- User approved — execute the tool (same path as Allow)
           TIO.putStrLn formatPolicyApproved
           now2 <- getCurrentTime
-          -- For apply_patch, include the target path in the audit event
-          -- so the session log records which file was approved.
-          let approvalData = if tcName tc == "apply_patch"
-                then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> tcName tc <> ": approved -- " <> p
-                  Nothing -> tcName tc <> ": approved by user"
-                else if tcName tc == "write_file"
-                then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> tcName tc <> ": approved -- " <> p
-                  Nothing -> tcName tc <> ": approved by user"
-                else tcName tc <> ": approved by user"
+          let approvalData = approvalAuditText tc
           let state2 = state1
                 { asSession = logEvent
                     (Event now2 EPolicyDecision approvalData)
@@ -516,17 +560,7 @@ processSingleToolCall state tc = do
           -- User rejected — log and return a denial result
           TIO.putStrLn formatPolicyRejected
           now2 <- getCurrentTime
-          -- For apply_patch, include the target path in the denial reason
-          -- so the session log records which file was rejected.
-          let denialReason = if tcName tc == "apply_patch"
-                then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> "patch " <> p <> " -- " <> reason
-                  Nothing -> reason
-                else if tcName tc == "write_file"
-                then case extractTextField "path" (tcArgs tc) of
-                  Just p  -> "write " <> p <> " -- " <> reason
-                  Nothing -> reason
-                else reason
+          let denialReason = denialAuditText tc reason
           let resultMsg = Message
                 { msgRole      = User
                 , msgContent   = "Tool '" <> tcName tc <> "' denied by user: " <> denialReason
@@ -593,7 +627,7 @@ executeTool state tc = do
       -- keep the JSONL audit trail bounded.
       now2 <- getCurrentTime
       let fullOutput   = trOutput result
-          sessionOutput = if tcName tc == "apply_patch" || tcName tc == "write_file"
+          sessionOutput = if isWriteLikeTool tc
                            then truncatePatchLog fullOutput
                            else fullOutput
           resultMsg = Message
@@ -645,6 +679,22 @@ showWriteFilePreview tc = do
       TIO.putStrLn $ formatConfirmFile (T.pack path)
       TIO.putStrLn   formatConfirmPreviewHeader
       TIO.putStrLn $ indentBlock 4 preview
+
+-- | Show a preview for an @apply_patch_batch@ tool call.
+--   Prints a concise per-file summary and bounded diff previews
+--   to the terminal so the user can see all changes before approving.
+--   Failures are silently ignored (the approval prompt still works;
+--   the preview just won't be shown).
+showBatchApplyPreview :: ToolCall -> IO ()
+showBatchApplyPreview tc = do
+  result <- computeBatchApplyPreview (tcArgs tc)
+  case result of
+    Left _err ->
+      -- Preview failed; the approval prompt still works without it.
+      pure ()
+    Right (summary, parts) -> do
+      TIO.putStrLn $ indentBlock 2 summary
+      mapM_ (\p -> TIO.putStrLn $ indentBlock 4 p) parts
 
 -- | Encode a JSON Value to Text (for logging).
 --   Produces clean JSON without Haskell string escaping.

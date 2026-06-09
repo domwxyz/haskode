@@ -282,7 +282,7 @@ testContextGuardUnderLimit = do
         }
     ]
   let cfg   = defaultConfig  -- 120K chars, way more than "hello"
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "hello"
   let evts = events (asSession state')
       types = map evType evts
@@ -301,7 +301,7 @@ testContextGuardOverLimit = do
         }
     ]
   let cfg   = defaultConfig { cfgMaxContextChars = 10 }  -- tiny limit
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   result <- try (runAgent state "hello this is a message") :: IO (Either IOException AgentState)
   case result of
     Left _ex -> pure $ Right ()  -- expected: fail throws IOException
@@ -317,7 +317,7 @@ testContextGuardErrorText = do
         }
     ]
   let cfg   = defaultConfig { cfgMaxContextChars = 10 }
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   -- Capture the error message from the exception
   result <- try (runAgent state "a long user message here") :: IO (Either IOException AgentState)
   case result of

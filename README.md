@@ -43,7 +43,7 @@ haskode/
 | `Haskode.Config` | Load `haskode.json` / `haskode.jsonc` / `~/.config/haskode/config.json`; fall back to defaults |
 | `Haskode.Provider` | Record-of-functions interface for LLM backends. Ships `stubProvider` (echo) and `scriptedProvider` (test replay) |
 | `Haskode.Provider.OpenAI` | Real OpenAI-compatible HTTP provider (`/v1/chat/completions`). Works with OpenAI, Ollama, vLLM, LiteLLM, OpenRouter |
-| `Haskode.Tools` | `Tool` type + `ToolRegistry` map. Built-in: `read_file`, `list_files`, `shell`, `glob`, `search`, `preview_patch`, `apply_patch`, `write_file` |
+| `Haskode.Tools` | `Tool` type + `ToolRegistry` map. Built-in: `read_file`, `list_files`, `shell`, `glob`, `search`, `preview_patch`, `preview_patch_batch`, `apply_patch`, `apply_patch_batch`, `write_file` |
 | `Haskode.Policy` | Composable rules: `Allow`, `Deny`, or `AskUser`. Default policy blocks `rm -rf /` |
 | `Haskode.Session` | In-memory event log flushed to `session.jsonl` for audit trail |
 | `Haskode.Patch` | Represent file changes, show unified diffs, apply/rollback |
@@ -97,6 +97,12 @@ cabal run haskode -- --provider openai -v --prompt "Hello"
 
 # Inspect session log (read-only, no replay)
 cabal run haskode -- --show-session
+
+# Resume conversation from session.jsonl
+cabal run haskode -- --resume
+
+# Resume with a real provider
+cabal run haskode -- --provider openai --resume
 
 # Show help
 cabal run haskode -- --help
@@ -193,6 +199,7 @@ You may also leave `pcApiKey` empty and rely on `OPENAI_API_KEY` directly
 | `--base-url`       | `pcBaseUrl`  |
 | `--verbose`, `-v`  | `cfgVerbose` |
 | `--show-session`   | *(n/a)*      |
+| `--resume`         | *(n/a)*      |
 
 ## Smoke test with a real model
 
@@ -326,9 +333,10 @@ Key properties:
   no new-file creation, no deletion.
 - **Safe** — same containment pattern as all other file tools.
 
-Haskode now supports single-file confirmed patch application.  Multi-file
-patch batching, session resume, and context window management are not
-yet implemented.
+Haskode supports single-file confirmed patch application, multi-file
+batch patching via `preview_patch_batch` and `apply_patch_batch`,
+a character-count context guard, and conservative session resume via
+`--resume`.
 
 ### write_file — new-file creation with confirmation
 
@@ -364,6 +372,73 @@ path and a concise preview before the y/N prompt:
   +module NewModule where
   +import Data.List
   +myFunc = sort
+  [confirm] Approve? (y/N)
+```
+
+### preview_patch_batch — read-only batch diff preview
+
+The `preview_patch_batch` tool lets the agent preview multiple file
+changes (replacements and new-file creations) in one read-only call.
+It accepts an `operations` array where each entry has an `op` tag
+(`"replace"` or `"create"`), a `path`, and the appropriate content
+field (`replacement` for replace, `content` for create).
+
+Key properties:
+
+- **Read-only** — never writes to disk, no approval required.
+- **All-or-nothing validation** — every operation is validated before
+  any preview is computed.  If any operation fails, the entire batch
+  is rejected with a clear error.
+- **Safe** — same `safeCanonicalize` + `isUnderRoot` containment
+  pattern as all other file tools.  Replace targets must exist and
+  be regular files; create targets must not exist and their parent
+  directory must already exist.
+- **Bounded output** — individual diffs are limited to 8 KB each;
+  combined output is limited to 32 KB.  Oversized batches are
+  rejected with a suggestion to split.
+
+### apply_patch_batch — confirmed multi-file batch write
+
+The `apply_patch_batch` tool applies multiple file changes (replacements
+and new-file creations) in one confirmed call.  It accepts the same
+`operations` array schema as `preview_patch_batch`.
+
+Key properties:
+
+- **Confirmed** — default policy requires user approval before
+  writing.  The confirmation prompt shows a concise per-file summary
+  and bounded diff previews for all operations.
+- **All-or-nothing validation** — every operation is validated before
+  any file is written.  If any operation fails validation, the entire
+  batch is rejected and no files are modified.
+- **Ordered execution** — after approval, operations are applied in
+  array order.  If a write fails mid-batch, remaining operations are
+  skipped and partial success is reported clearly.
+- **No rollback** — if a write fails after partial application, already
+  written files are not rolled back.  The result reports which
+  operations succeeded and which failed.
+- **Safe** — same `safeCanonicalize` + `isUnderRoot` containment
+  pattern as all other file tools.  Replace targets must exist and
+  be regular files; create targets must not exist and their parent
+  directory must already exist.
+- **Bounded output** — same per-file (8 KB) and combined (32 KB)
+  limits as `preview_patch_batch`.
+
+When confirmation is requested, the agent displays a concise summary
+and diff previews before the y/N prompt:
+
+```
+  [policy] Confirmation needed: apply_patch_batch
+  Batch: 3 operations
+    1. replace src/Foo.hs
+    2. replace src/Bar.hs
+    3. create src/Baz.hs
+    --- Operation 1 (replace): src/Foo.hs
+    --- src/Foo.hs
+    +++ src/Foo.hs
+    -old
+    +new
+    ...
   [confirm] Approve? (y/N)
 ```
 
@@ -411,10 +486,11 @@ to `session.jsonl` on normal exit (single-shot completion or typing
 `/exit` in interactive mode) and when the agent encounters a handled
 error (e.g. a provider failure).  The file is appended to — multiple
 runs in the same directory accumulate events.  The JSONL file is a
-write-only audit trail and cannot restore sessions.  Lifecycle events
+write-only audit trail and cannot restore executable session state.  Lifecycle events
 (`session_start`, `session_end`, `conversation_reset`) mark the
-boundaries of each run and `/new` resets but are not used for replay
-or resume.
+boundaries of each run and `/new` resets.  Resume uses
+`conversation_reset` only as a text-context boundary; lifecycle events
+are never used for executable replay.
 
 **Empty and command-only sessions.**  A session is flushed only when
 it contains at least one *content* event (`user_message`,
@@ -438,6 +514,7 @@ no replay):
 ```
 $ haskode --show-session
 Session summary:
+  Log:           /home/user/project/session.jsonl
   Total events:  12
   First event:   2025-06-06T10:30:00Z
   Last event:    2025-06-06T10:35:00Z
@@ -449,14 +526,39 @@ Session summary:
   session_start: 1
   session_end: 0
   conversation_reset: 0
+  Malformed:     0
+  Backup:        (none)
 ```
 
-The summary reports total event count, first/last timestamps, and
-counts by event type.  Malformed lines (if any) are counted rather
-than causing a crash.  Only the active `session.jsonl` is inspected;
-any rotated `.1` backup is ignored.  This is inspection-only
-groundwork — conversation restoration, replay, and provider/tool
-re-execution are not implemented.
+The summary reports the inspected log path, total event count,
+first/last timestamps, counts by event type, malformed line count
+(always shown), and whether a rotated `session.jsonl.1` backup exists.
+Only the active `session.jsonl` is inspected; any `.1` backup is
+reported but not read.
+
+**Resuming a session.**  The `--resume` flag loads safe text resume
+context from `session.jsonl` without re-executing tools or provider
+calls.  Only `user_message` and `assistant_reply` events after the
+last `/new` boundary are reconstructed.  Tool calls, tool results,
+policy decisions, and lifecycle events are skipped.  On startup a
+concise summary is printed:
+
+```
+$ haskode --resume
+Resumed from:   /home/user/project/session.jsonl
+Messages:       6
+Valid events:   14
+Message events: 7
+Skipped:        5
+Malformed:      0
+Reset boundary: yes
+```
+
+If no `session.jsonl` exists, a "starting fresh" message is shown.
+If the log exists but reconstructs zero messages, the summary is
+printed and the session continues normally.  `/status` shows
+`Resumed: yes/no`.  Full replay (re-running tools or provider calls)
+is not implemented.
 
 ### Known limitations (Phase 1)
 
@@ -470,14 +572,16 @@ re-execution are not implemented.
   oversized requests from reaching the provider and returns a clear
   error.  No truncation, summarization, or automatic message deletion
   is performed — the user must start a new session to continue.
-- **No session resume/replay** — the session log is write-only.
-  Log rotation (`cfgMaxSessionLogBytes`) keeps the file bounded, and
-  `--show-session` provides read-only inspection (event counts,
-  timestamps, type breakdown), but there is no mechanism to load
-  previous events back into a session or replay a conversation.
-- **No multi-file patch batching** — the agent can apply patches to
-  one file at a time via `apply_patch` and create new files via
-  `write_file`, but cannot batch multiple file changes in one call.
+- **Limited session resume; no full replay** — `--resume` loads safe
+  text resume context from `session.jsonl` (user messages and assistant
+  replies after the last `/new` boundary).  Tool calls, tool results,
+  policy decisions, and lifecycle events are not reconstructed.  No
+  tools or provider calls are re-executed.  Full replay (re-running
+  tool calls or provider turns from the log) is not implemented.
+- **No batch rollback** — the agent can preview and apply
+  multiple file changes via `preview_patch_batch` (read-only) and
+  `apply_patch_batch` (confirmed write).  Rollback of batch operations
+  is not implemented.
 - **Shell output truncation** — stdout/stderr beyond 4096 characters
   is truncated with a metadata line reporting original length, returned
   length, and how many characters were dropped, e.g.
@@ -516,9 +620,10 @@ re-execution are not implemented.
 ### Phase 2 — Usable daily driver
 - [x] Streaming token output
 - [ ] Rich diff display (colored, side-by-side)
-- [ ] Session save/resume
+- [x] Session save/resume (phase zero: conservative, non-replaying)
 - [x] `.agentignore` file support (root-level, shared by `glob` and `search`)
-- [ ] Multi-file patch batching
+- [x] Read-only batch preview (`preview_patch_batch`)
+- [x] Multi-file patch apply (`apply_patch_batch`)
 - [x] Environment variable expansion in config
 
 ### Phase 3 — TUI & polish

@@ -9,7 +9,7 @@ import Data.Aeson ( object, KeyValue((.=)) )
 import Haskode.Agent ( buildSystemPrompt, loadAgentsMd )
 import Haskode.Core ( ToolResult(trOutput) )
 import Haskode.Test.Util
-    ( createTestTree, skipIfNoSymlinks, skipOnWindows, Test )
+    ( createTestTree, skipIfNoSymlinks, skipOnWindows, withTestDir, Test )
 import Haskode.Tools
     ( defaultRegistry,
       emptyStats,
@@ -371,20 +371,14 @@ testSearchToolSingleFile = do
 
 -- | searchTool skips binary-extension files.
 testSearchToolSkipsBinary :: Test
-testSearchToolSkipsBinary = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-search-bin-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSearchToolSkipsBinary = withTestDir "haskode-search-bin-test" $ \root -> do
   writeFile (root </> "code.hs")  "foobar_unique_12345"
   writeFile (root </> "image.png") "foobar_unique_12345"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   result <- toolExecute searchTool (object ["query" .= ("foobar_unique_12345" :: T.Text)])
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
-  -- Should find code.hs but NOT image.png
   if T.isInfixOf "code.hs" out && not (T.isInfixOf "image.png" out)
     then pure $ Right ()
     else pure $ Left $ "search binary skip: " ++ T.unpack out
@@ -470,17 +464,12 @@ testSearchDefaultDir = do
 
 -- | searchTool default (case-sensitive) does NOT match wrong case.
 testSearchCaseSensitiveDefault :: Test
-testSearchCaseSensitiveDefault = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-search-cs-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSearchCaseSensitiveDefault = withTestDir "haskode-search-cs-test" $ \root -> do
   writeFile (root </> "a.hs") "module Main where\nimport Foo\n"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   result <- toolExecute searchTool (object ["query" .= ("MODULE" :: T.Text)])
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "0 matches" out
     then pure $ Right ()
@@ -488,11 +477,7 @@ testSearchCaseSensitiveDefault = do
 
 -- | searchTool with ignore_case:true finds mixed-case matches.
 testSearchIgnoreCaseTrue :: Test
-testSearchIgnoreCaseTrue = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-search-ic-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSearchIgnoreCaseTrue = withTestDir "haskode-search-ic-test" $ \root -> do
   writeFile (root </> "a.hs") "module Main where\nimport Foo\n"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
@@ -501,7 +486,6 @@ testSearchIgnoreCaseTrue = do
     , "ignore_case" .= True
     ])
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
   if T.isInfixOf "1 matches" out && T.isInfixOf "case-insensitive" out
     then pure $ Right ()
@@ -586,13 +570,8 @@ testSearchNotFound = do
 
 -- | searchTool skips files larger than searchMaxFileSize.
 testSearchSkipsLargeFile :: Test
-testSearchSkipsLargeFile = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-search-size-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSearchSkipsLargeFile = withTestDir "haskode-search-size-test" $ \root -> do
   writeFile (root </> "small.hs") "unique_token_abc123"
-  -- Write a file just over the limit.
   let bigSize = fromIntegral searchMaxFileSize + 1
   writeFile (root </> "big.hs") (replicate bigSize 'x' ++ "unique_token_abc123\n")
   origDir <- getCurrentDirectory
@@ -601,9 +580,7 @@ testSearchSkipsLargeFile = do
     [ "query" .= ("unique_token_abc123" :: T.Text)
     ])
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = trOutput result
-  -- Should find the match in small.hs but skip big.hs.
   if T.isInfixOf "small.hs:" out && T.isInfixOf "1 matches" out
      && T.isInfixOf "skipped" out && T.isInfixOf "1 large files" out
     then pure $ Right ()
@@ -660,14 +637,9 @@ testSafeCanonicalizeExisting = do
 
 -- | safeCanonicalize returns Nothing for a broken symlink.
 testSafeCanonicalizeBrokenSymlink :: Test
-testSafeCanonicalizeBrokenSymlink = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-canon-broken-test"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSafeCanonicalizeBrokenSymlink = withTestDir "haskode-canon-broken-test" $ \root -> do
   createFileLink (root </> "nonexistent") (root </> "broken")
   result <- safeCanonicalize (root </> "broken")
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Nothing -> pure $ Right ()
     Just _  -> pure $ Left "safeCanonicalize broken symlink should return Nothing"
@@ -1240,24 +1212,15 @@ testFormatStatsRevisited =
 
 -- | loadAgentIgnore returns an empty list when no .agentignore file exists.
 testLoadAgentIgnoreNoFile :: Test
-testLoadAgentIgnoreNoFile = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-agentignore-nofile"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testLoadAgentIgnoreNoFile = withTestDir "haskode-agentignore-nofile" $ \root -> do
   patterns <- loadAgentIgnore root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   if null patterns
     then pure $ Right ()
     else pure $ Left $ "Expected empty list, got: " ++ show patterns
 
 -- | loadAgentIgnore correctly parses comments, blanks, and patterns.
 testLoadAgentIgnoreParses :: Test
-testLoadAgentIgnoreParses = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-agentignore-parse"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testLoadAgentIgnoreParses = withTestDir "haskode-agentignore-parse" $ \root -> do
   writeFile (root </> ".agentignore")
     "# this is a comment\n\
     \\n\
@@ -1267,7 +1230,6 @@ testLoadAgentIgnoreParses = do
     \# another comment\n\
     \dist\n"
   patterns <- loadAgentIgnore root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   if patterns == ["build", "*.log", "dist"]
     then pure $ Right ()
     else pure $ Left $ "Parsed patterns: " ++ show patterns
@@ -1473,33 +1435,23 @@ testBuildSystemPromptWithAgentsMd = do
 
 -- | loadAgentsMd returns Nothing when no AGENTS.md exists.
 testLoadAgentsMdNoFile :: Test
-testLoadAgentsMdNoFile = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-agentsmd-nofile"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testLoadAgentsMdNoFile = withTestDir "haskode-agentsmd-nofile" $ \root -> do
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   result <- loadAgentsMd
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Nothing -> pure $ Right ()
     Just _  -> pure $ Left "loadAgentsMd should return Nothing when no file"
 
 -- | loadAgentsMd reads content correctly from a valid AGENTS.md.
 testLoadAgentsMdContent :: Test
-testLoadAgentsMdContent = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-agentsmd-content"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testLoadAgentsMdContent = withTestDir "haskode-agentsmd-content" $ \root -> do
   writeFile (root </> "AGENTS.md") "# Project rules\nUse Haskell.\n"
   origDir <- getCurrentDirectory
   setCurrentDirectory root
   result <- loadAgentsMd
   setCurrentDirectory origDir
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   case result of
     Just txt | T.isInfixOf "Use Haskell" txt -> pure $ Right ()
     other -> pure $ Left $ "loadAgentsMd content: " ++ show other

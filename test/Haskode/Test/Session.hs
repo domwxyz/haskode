@@ -16,14 +16,15 @@ import Haskode.Agent
       recordConversationReset,
       recordSessionEnd,
       recordSessionStart,
+      recordSessionStartWithResume,
       runAgent )
 import Haskode.Commands ( resetConversation )
 import Haskode.Config ( defaultConfig )
 import Haskode.Core
     ( ToolResult(trOutput),
       mkAssistantMessage,
-      Message(msgCallId, msgRole, msgToolCalls),
-      Role(Assistant),
+      Message(msgCallId, msgRole, msgToolCalls, msgContent),
+      Role(Assistant, User),
       ToolCall(ToolCall, tcId) )
 import Haskode.Policy ( defaultPolicy )
 import Haskode.Provider
@@ -41,8 +42,12 @@ import Haskode.Session
       SessionSummary(..),
       summarizeSession,
       formatSessionSummary,
-      isMeaningfulSession )
-import Haskode.Test.Util ( cleanup, Test )
+      isMeaningfulSession,
+      ResumeResult(..),
+      loadResumeEvents,
+      resumeContextEventsToConversation,
+      formatResumeSummary )
+import Haskode.Test.Util ( cleanup, withTestDir, Test )
 import Haskode.Tools
     ( defaultRegistry, shellTool, Tool(toolExecute) )
 import System.Directory
@@ -87,7 +92,7 @@ testMultiToolResultOrder = do
         }
     ]
   let cfg   = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "check files"
   let conv = asConversation state'
       -- Find tool-result messages (those with msgCallId set)
@@ -115,7 +120,7 @@ testMultiToolAssistantPreservesCalls = do
         }
     ]
   let cfg   = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "check"
   let conv = asConversation state'
       -- Find assistant messages with tool_calls
@@ -145,7 +150,7 @@ testMultiToolCallIdCorrespondence = do
         }
     ]
   let cfg   = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "check"
   let conv = asConversation state'
       -- Get tool_calls from the assistant message
@@ -219,7 +224,7 @@ testSessionEventAssistantReplyWithToolCalls = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "check"
   let evts = events (asSession state')
       -- Find the first EAssistantReply (the one with tool calls)
@@ -241,7 +246,7 @@ testSessionEventAssistantReplyTextOnly = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "hi"
   let evts = events (asSession state')
       asstEvts = filter (\e -> evType e == EAssistantReply) evts
@@ -266,7 +271,7 @@ testSessionEventToolCallData = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read foo"
   let evts = events (asSession state')
       toolCallEvts = filter (\e -> evType e == EToolCall) evts
@@ -299,7 +304,7 @@ testSessionEventToolResultData = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read file"
   setCurrentDirectory origDir
   _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
@@ -329,7 +334,7 @@ testSessionEventChronologicalOrder = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read x"
   let types = map evType (events (asSession state'))
   -- Expected order: UserMessage, AssistantReply, PolicyDecision (Allow),
@@ -368,7 +373,7 @@ testMultiToolThenShellSessionEvents = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read files and run tests"
   let evts = events (asSession state')
       types = map evType evts
@@ -447,7 +452,7 @@ testSessionEventDenyData = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "delete"
   let evts = events (asSession state')
       policyEvts = filter (\e -> evType e == EPolicyDecision) evts
@@ -473,7 +478,7 @@ testSessionEventRejectData = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoReject False
   state' <- runAgent state "list"
   let evts = events (asSession state')
       trEvts = filter (\e -> evType e == EToolResult) evts
@@ -600,7 +605,7 @@ testFlushLogAgentIntegration = do
         , crToolCalls = Nothing
         }
     ]
-  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read foo"
   tmpDir <- getTemporaryDirectory
   let flushPath = tmpDir </> "session.jsonl"
@@ -856,27 +861,23 @@ testFlushLogRotationValidJsonl = do
 -- Session summary tests (--show-session groundwork)
 -- ---------------------------------------------------------------------------
 
--- | summarizeSession returns zero events for a missing file.
+-- | summarizeSession returns zero events for a missing file
+--   and reports the log path with no backup.
 testSummarizeSessionMissingFile :: Test
-testSummarizeSessionMissingFile = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-missing"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSummarizeSessionMissingFile = withTestDir "haskode-summarize-missing" $ \root -> do
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  if ssTotalEvents ss == 0 && ssMalformedLines ss == 0
+  let pathOk = ssLogPath ss == root </> "session.jsonl"
+      backupOk = not (ssBackupExists ss)
+  if ssTotalEvents ss == 0 && ssMalformedLines ss == 0 && pathOk && backupOk
     then pure $ Right ()
     else pure $ Left $ "Missing file: total=" ++ show (ssTotalEvents ss)
                      ++ " malformed=" ++ show (ssMalformedLines ss)
+                     ++ " pathOk=" ++ show pathOk
+                     ++ " backupOk=" ++ show backupOk
 
 -- | summarizeSession counts events by type from valid JSONL.
 testSummarizeSessionValidJsonl :: Test
-testSummarizeSessionValidJsonl = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-valid"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSummarizeSessionValidJsonl = withTestDir "haskode-summarize-valid" $ \root -> do
   now <- getCurrentTime
   let log' = foldl (\acc e -> logEvent e acc) emptyLog
         [ Event now EUserMessage "hello"
@@ -887,7 +888,6 @@ testSummarizeSessionValidJsonl = do
         ]
   flushLog root 0 log'
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let counts = ssTypeCounts ss
       ok = ssTotalEvents ss == 5
            && Map.findWithDefault 0 EUserMessage counts == 2
@@ -905,21 +905,14 @@ testSummarizeSessionValidJsonl = do
 
 -- | summarizeSession counts malformed lines without crashing.
 testSummarizeSessionMalformedLines :: Test
-testSummarizeSessionMalformedLines = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-malformed"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSummarizeSessionMalformedLines = withTestDir "haskode-summarize-malformed" $ \root -> do
   now <- getCurrentTime
-  -- Write one valid event and two malformed lines.
   let validLog = logEvent (Event now EUserMessage "ok") emptyLog
   flushLog root 0 validLog
-  -- Append malformed lines directly.
   let path = root </> "session.jsonl"
   LBS.appendFile path "not valid json at all\n"
   LBS.appendFile path "{\"incomplete\": true}\n"
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   if ssTotalEvents ss == 1 && ssMalformedLines ss == 2
     then pure $ Right ()
     else pure $ Left $ "Malformed: total=" ++ show (ssTotalEvents ss)
@@ -927,16 +920,10 @@ testSummarizeSessionMalformedLines = do
 
 -- | summarizeSession returns zero events for an empty file.
 testSummarizeSessionEmptyFile :: Test
-testSummarizeSessionEmptyFile = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-empty"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
-  -- Create an empty session.jsonl.
+testSummarizeSessionEmptyFile = withTestDir "haskode-summarize-empty" $ \root -> do
   let path = root </> "session.jsonl"
   writeFile path ""
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   if ssTotalEvents ss == 0 && ssMalformedLines ss == 0
     then pure $ Right ()
     else pure $ Left $ "Empty file: total=" ++ show (ssTotalEvents ss)
@@ -984,7 +971,7 @@ testAgentUnchangedWithSessionSummary = do
         }
     ]
   let cfg   = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "hello"
   let evts = events (asSession state')
       types = map evType evts
@@ -994,11 +981,7 @@ testAgentUnchangedWithSessionSummary = do
 
 -- | formatSessionSummary includes key sections.
 testFormatSessionSummaryContainsSections :: Test
-testFormatSessionSummaryContainsSections = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-format"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testFormatSessionSummaryContainsSections = withTestDir "haskode-summarize-format" $ \root -> do
   now <- getCurrentTime
   let log' = foldl (\acc e -> logEvent e acc) emptyLog
         [ Event now EUserMessage "hello"
@@ -1006,10 +989,12 @@ testFormatSessionSummaryContainsSections = do
         ]
   flushLog root 0 log'
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = formatSessionSummary ss
   if T.isInfixOf "Session summary" out
+     && T.isInfixOf "Log:" out
      && T.isInfixOf "Total events:" out
+     && T.isInfixOf "Malformed:" out
+     && T.isInfixOf "Backup:" out
      && T.isInfixOf "user_message:" out
      && T.isInfixOf "assistant_reply:" out
     then pure $ Right ()
@@ -1033,11 +1018,7 @@ testConversationResetJSON = do
 
 -- | summarizeSession counts conversation_reset events.
 testSummarizeSessionConversationReset :: Test
-testSummarizeSessionConversationReset = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-reset"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testSummarizeSessionConversationReset = withTestDir "haskode-summarize-reset" $ \root -> do
   now <- getCurrentTime
   let log' = foldl (\acc e -> logEvent e acc) emptyLog
         [ Event now EUserMessage "hello"
@@ -1047,7 +1028,6 @@ testSummarizeSessionConversationReset = do
         ]
   flushLog root 0 log'
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let counts = ssTypeCounts ss
       ok = ssTotalEvents ss == 4
            && Map.findWithDefault 0 EConversationReset counts == 1
@@ -1059,16 +1039,11 @@ testSummarizeSessionConversationReset = do
 
 -- | formatSessionSummary includes conversation_reset line.
 testFormatSessionSummaryConversationReset :: Test
-testFormatSessionSummaryConversationReset = do
-  tmpDir <- getTemporaryDirectory
-  let root = tmpDir </> "haskode-summarize-format-reset"
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
-  createDirectory root
+testFormatSessionSummaryConversationReset = withTestDir "haskode-summarize-format-reset" $ \root -> do
   now <- getCurrentTime
   let log' = logEvent (Event now EConversationReset "reset") emptyLog
   flushLog root 0 log'
   ss <- summarizeSession root
-  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
   let out = formatSessionSummary ss
   if T.isInfixOf "conversation_reset:" out
     then pure $ Right ()
@@ -1078,7 +1053,7 @@ testFormatSessionSummaryConversationReset = do
 testRecordSessionStartEvent :: Test
 testRecordSessionStartEvent = do
   let cfg = defaultConfig
-      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
   state1 <- recordSessionStart state0
   let evts = events (asSession state1)
       types = map evType evts
@@ -1086,11 +1061,27 @@ testRecordSessionStartEvent = do
     then pure $ Right ()
     else pure $ Left $ "recordSessionStart events: " ++ show types
 
+-- | recordSessionStartWithResume produces an ESessionStart event with resume info.
+testRecordSessionStartWithResumeEvent :: Test
+testRecordSessionStartWithResumeEvent = do
+  let cfg = defaultConfig
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove True
+  state1 <- recordSessionStartWithResume state0 4
+  let evts = events (asSession state1)
+  case evts of
+    [ev] ->
+      if evType ev == ESessionStart
+         && T.isInfixOf "resumed" (evData ev)
+         && T.isInfixOf "4 messages" (evData ev)
+        then pure $ Right ()
+        else pure $ Left $ "Unexpected event data: " ++ T.unpack (evData ev)
+    _ -> pure $ Left $ "Expected 1 event, got " ++ show (length evts)
+
 -- | recordSessionEnd produces an ESessionEnd event.
 testRecordSessionEndEvent :: Test
 testRecordSessionEndEvent = do
   let cfg = defaultConfig
-      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
   state1 <- recordSessionEnd state0
   let evts = events (asSession state1)
       types = map evType evts
@@ -1102,7 +1093,7 @@ testRecordSessionEndEvent = do
 testRecordConversationResetEvent :: Test
 testRecordConversationResetEvent = do
   let cfg = defaultConfig
-      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
   state1 <- recordConversationReset state0
   let evts = events (asSession state1)
       types = map evType evts
@@ -1122,7 +1113,7 @@ testNewPreservesSessionAndAppendsReset = do
         }
     ]
   let cfg = defaultConfig
-      state0 = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   -- Run an agent turn to accumulate session events
   state1 <- runAgent state0 "hi"
   let evtsBefore = events (asSession state1)
@@ -1156,7 +1147,7 @@ testFullLifecycleEventSequence = do
         }
     ]
   let cfg = defaultConfig
-      state0 = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   -- session_start
   state1 <- recordSessionStart state0
   -- first turn
@@ -1304,6 +1295,604 @@ testFlushLogOnExceptionLifecycleOnly = do
     then pure $ Right ()
     else pure $ Left "lifecycle-only session should not create file on exception"
 
+-- | formatSessionSummary for missing log includes Log: and no backup.
+testFormatSessionSummaryMissingLog :: Test
+testFormatSessionSummaryMissingLog = withTestDir "haskode-summarize-fmt-missing" $ \root -> do
+  ss <- summarizeSession root
+  let out = formatSessionSummary ss
+  if T.isInfixOf "Log:" out
+     && T.isInfixOf "Total events:  0" out
+     && T.isInfixOf "Malformed:     0" out
+     && T.isInfixOf "Backup:        (none)" out
+     && T.isInfixOf "Time:          (none)" out
+    then pure $ Right ()
+    else pure $ Left $ "Missing log format: " ++ T.unpack (T.take 300 out)
+
+-- | formatSessionSummary shows malformed count even when zero.
+testFormatSessionSummaryMalformedZero :: Test
+testFormatSessionSummaryMalformedZero = withTestDir "haskode-summarize-fmt-malformed0" $ \root -> do
+  now <- getCurrentTime
+  let log' = logEvent (Event now EUserMessage "ok") emptyLog
+  flushLog root 0 log'
+  ss <- summarizeSession root
+  let out = formatSessionSummary ss
+  if T.isInfixOf "Malformed:     0" out
+    then pure $ Right ()
+    else pure $ Left $ "Malformed zero not shown: " ++ T.unpack (T.take 300 out)
+
+-- | formatSessionSummary shows malformed count when > 0.
+testFormatSessionSummaryMalformedNonZero :: Test
+testFormatSessionSummaryMalformedNonZero = withTestDir "haskode-summarize-fmt-malformed1" $ \root -> do
+  now <- getCurrentTime
+  let validLog = logEvent (Event now EUserMessage "ok") emptyLog
+  flushLog root 0 validLog
+  let path = root </> "session.jsonl"
+  LBS.appendFile path "bad json line\n"
+  ss <- summarizeSession root
+  let out = formatSessionSummary ss
+  if T.isInfixOf "Malformed:     1" out
+    then pure $ Right ()
+    else pure $ Left $ "Malformed non-zero not shown: " ++ T.unpack (T.take 300 out)
+
+-- | summarizeSession detects backup file when present.
+testSummarizeSessionBackupExists :: Test
+testSummarizeSessionBackupExists = withTestDir "haskode-summarize-backup-exists" $ \root -> do
+  let backup = root </> "session.jsonl.1"
+  now <- getCurrentTime
+  let log1 = logEvent (Event now EUserMessage "main") emptyLog
+  flushLog root 0 log1
+  writeFile backup "backup content"
+  ss <- summarizeSession root
+  if ssBackupExists ss
+    then pure $ Right ()
+    else pure $ Left "Expected ssBackupExists to be True"
+
+-- | summarizeSession reports no backup when file is absent.
+testSummarizeSessionBackupAbsent :: Test
+testSummarizeSessionBackupAbsent = withTestDir "haskode-summarize-backup-absent" $ \root -> do
+  let backup = root </> "session.jsonl.1"
+  _ <- try (removeFile backup) :: IO (Either IOException ())
+  now <- getCurrentTime
+  let log1 = logEvent (Event now EUserMessage "main") emptyLog
+  flushLog root 0 log1
+  ss <- summarizeSession root
+  if not (ssBackupExists ss)
+    then pure $ Right ()
+    else pure $ Left "Expected ssBackupExists to be False"
+
+-- | formatSessionSummary shows backup line when backup exists.
+testFormatSessionSummaryBackupExists :: Test
+testFormatSessionSummaryBackupExists = withTestDir "haskode-summarize-fmt-backup" $ \root -> do
+  let backup = root </> "session.jsonl.1"
+  writeFile backup "backup content"
+  now <- getCurrentTime
+  let log1 = logEvent (Event now EUserMessage "main") emptyLog
+  flushLog root 0 log1
+  ss <- summarizeSession root
+  let out = formatSessionSummary ss
+  if T.isInfixOf "Backup:        session.jsonl.1 exists" out
+    then pure $ Right ()
+    else pure $ Left $ "Backup exists line missing: " ++ T.unpack (T.take 300 out)
+
+-- ---------------------------------------------------------------------------
+-- Resume tests
+-- ---------------------------------------------------------------------------
+
+-- | Helper: write a JSONL file and run a test, cleaning up afterward.
+withJsonlFile :: FilePath -> [Event] -> (FilePath -> IO (Either String ())) -> IO (Either String ())
+withJsonlFile dir evts action = do
+  _ <- try (removeDirectoryRecursive dir) :: IO (Either IOException ())
+  createDirectory dir
+  flushLog dir 0 (foldl (\acc e -> logEvent e acc) emptyLog evts)
+  result <- action dir
+  _ <- try (removeDirectoryRecursive dir) :: IO (Either IOException ())
+  pure result
+
+-- | resumeContextEventsToConversation includes user messages.
+testResumeIncludesUserMessages :: Test
+testResumeIncludesUserMessages = do
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi there"
+             , Event now EUserMessage "how are you"
+             ]
+      conv = resumeContextEventsToConversation evts
+      contents = map msgContent conv
+  if contents == ["hello", "hi there", "how are you"]
+    then pure $ Right ()
+    else pure $ Left $ "User messages: " ++ show contents
+
+-- | resumeContextEventsToConversation includes assistant replies.
+testResumeIncludesAssistantReplies :: Test
+testResumeIncludesAssistantReplies = do
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "question"
+             , Event now EAssistantReply "answer"
+             ]
+      conv = resumeContextEventsToConversation evts
+      roles = map msgRole conv
+  if roles == [User, Assistant]
+    then pure $ Right ()
+    else pure $ Left $ "Roles: " ++ show roles
+
+-- | resumeContextEventsToConversation ignores lifecycle-only events.
+testResumeIgnoresLifecycleEvents :: Test
+testResumeIgnoresLifecycleEvents = do
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "session started"
+             , Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             , Event now ESessionEnd "session ended"
+             ]
+      conv = resumeContextEventsToConversation evts
+  if length conv == 2
+    then pure $ Right ()
+    else pure $ Left $ "Expected 2 messages, got " ++ show (length conv)
+
+-- | resumeContextEventsToConversation ignores policy decisions.
+testResumeIgnoresPolicyDecisions :: Test
+testResumeIgnoresPolicyDecisions = do
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "do something"
+             , Event now EAssistantReply "let me try"
+             , Event now EPolicyDecision "read_file: Allow"
+             , Event now EToolCall "tc-1 read_file {}"
+             , Event now EToolResult "tc-1 file contents"
+             , Event now EAssistantReply "done"
+             ]
+      conv = resumeContextEventsToConversation evts
+      roles = map msgRole conv
+  -- Only user_message and assistant_reply events are included
+  if roles == [User, Assistant, Assistant]
+    then pure $ Right ()
+    else pure $ Left $ "Roles: " ++ show roles
+
+-- | resumeContextEventsToConversation does NOT reconstruct tool_call as executable pending calls.
+testResumeDoesNotReconstructToolCalls :: Test
+testResumeDoesNotReconstructToolCalls = do
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "read file"
+             , Event now EAssistantReply "let me read | tool_calls: tc-1=read_file"
+             , Event now EToolCall "tc-1 read_file {\"path\":\"x.hs\"}"
+             , Event now EToolResult "tc-1 file contents"
+             , Event now EAssistantReply "done"
+             ]
+      conv = resumeContextEventsToConversation evts
+      -- No message should have tool_calls set
+      hasToolCalls = any (\m -> msgToolCalls m /= Nothing) conv
+  if not hasToolCalls
+    then pure $ Right ()
+    else pure $ Left "Tool calls should not be reconstructed"
+
+-- | loadResumeEvents returns Nothing for a missing file.
+testResumeLoadMissingFile :: Test
+testResumeLoadMissingFile = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-missing"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  result <- loadResumeEvents root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure $ Right ()
+    Just _  -> pure $ Left "Expected Nothing for missing file"
+
+-- | loadResumeEvents returns Nothing for an empty file.
+testResumeLoadEmptyFile :: Test
+testResumeLoadEmptyFile = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-empty"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  writeFile (root </> "session.jsonl") ""
+  result <- loadResumeEvents root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure $ Right ()
+    Just _  -> pure $ Left "Expected Nothing for empty file"
+
+-- | loadResumeEvents skips malformed lines without crashing.
+testResumeSkipsMalformedLines :: Test
+testResumeSkipsMalformedLines = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-malformed"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  now <- getCurrentTime
+  -- Write one valid event and two malformed lines
+  let validLog = logEvent (Event now EUserMessage "ok") emptyLog
+  flushLog root 0 validLog
+  let path = root </> "session.jsonl"
+  LBS.appendFile path "not valid json\n"
+  LBS.appendFile path "{\"incomplete\": true}\n"
+  result <- loadResumeEvents root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure $ Left "Expected Just for file with valid event"
+    Just rr ->
+      if rrMessageEventCount rr == 1 && rrMalformed rr == 2
+        then pure $ Right ()
+        else pure $ Left $ "eventCount=" ++ show (rrMessageEventCount rr)
+                         ++ " malformed=" ++ show (rrMalformed rr)
+
+-- | loadResumeEvents counts only safe text message events.
+testResumeCountsOnlySafeTextMessages :: Test
+testResumeCountsOnlySafeTextMessages = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-count"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "started"
+             , Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             , Event now EPolicyDecision "Allow"
+             , Event now EToolCall "tc-1 read_file"
+             , Event now EToolResult "tc-1 contents"
+             , Event now EConversationReset "reset"
+             , Event now EUserMessage "after reset"
+             , Event now EAssistantReply "reply after reset"
+             , Event now ESessionEnd "ended"
+             ]
+  flushLog root 0 (foldl (\acc e -> logEvent e acc) emptyLog evts)
+  result <- loadResumeEvents root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure $ Left "Expected Just"
+    Just rr ->
+      if rrMessageEventCount rr == 4
+        then pure $ Right ()
+        else pure $ Left $ "Expected 4 safe text message events, got " ++ show (rrMessageEventCount rr)
+
+-- | loadResumeEvents reconstructs safe text context, not executable replay state.
+testResumeLoadsOnlySafeTextContext :: Test
+testResumeLoadsOnlySafeTextContext = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-safe-text-context"
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "started"
+             , Event now EUserMessage "read the file"
+             , Event now EAssistantReply "let me read | tool_calls: tc-1=read_file"
+             , Event now EPolicyDecision "read_file: Allow"
+             , Event now EToolCall "tc-1 read_file {\"path\":\"x.hs\"}"
+             , Event now EToolResult "tc-1 file contents"
+             , Event now EAssistantReply "done"
+             , Event now ESessionEnd "ended"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr -> do
+        let conv = rrResumeContext rr
+            contents = map msgContent conv
+            hasExecutableToolCalls = any (\m -> msgToolCalls m /= Nothing) conv
+            hasToolResultMessages = any (\m -> msgCallId m /= Nothing) conv
+        if contents == ["read the file", "let me read | tool_calls: tc-1=read_file", "done"]
+           && not hasExecutableToolCalls
+           && not hasToolResultMessages
+           && rrSkipped rr == 5
+          then pure (Right ())
+          else pure (Left $ "contents=" ++ show contents
+                         ++ " executableToolCalls=" ++ show hasExecutableToolCalls
+                         ++ " toolResultMessages=" ++ show hasToolResultMessages
+                         ++ " skipped=" ++ show (rrSkipped rr))
+
+-- | resumeContextEventsToConversation respects EConversationReset boundary.
+testResumeRespectsConversationReset :: Test
+testResumeRespectsConversationReset = do
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "before reset"
+             , Event now EAssistantReply "reply before"
+             , Event now EConversationReset "reset"
+             , Event now EUserMessage "after reset"
+             , Event now EAssistantReply "reply after"
+             ]
+      conv = resumeContextEventsToConversation evts
+      contents = map msgContent conv
+  if contents == ["after reset", "reply after"]
+    then pure $ Right ()
+    else pure $ Left $ "Contents after reset: " ++ show contents
+
+-- | loadResumeEvents produces correct safe text context from a real JSONL file.
+testResumeEndToEnd :: Test
+testResumeEndToEnd = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-e2e"
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "started"
+             , Event now EUserMessage "what is 2+2"
+             , Event now EAssistantReply "The answer is 4."
+             , Event now EUserMessage "thanks"
+             , Event now EAssistantReply "You're welcome!"
+             , Event now ESessionEnd "ended"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just for valid file")
+      Just rr -> do
+        let conv = rrResumeContext rr
+            contents = map msgContent conv
+            roles = map msgRole conv
+        if contents == ["what is 2+2", "The answer is 4.", "thanks", "You're welcome!"]
+           && roles == [User, Assistant, User, Assistant]
+           && rrMessageEventCount rr == 4
+          then pure (Right ())
+          else pure (Left ("e2e: contents=" ++ show contents
+                           ++ " roles=" ++ show roles
+                           ++ " count=" ++ show (rrMessageEventCount rr)))
+
+-- ---------------------------------------------------------------------------
+-- Resume accounting tests (phase zero polish)
+-- ---------------------------------------------------------------------------
+
+-- | ResumeResult counts parsed valid events (all event types).
+testResumeParsedValidCount :: Test
+testResumeParsedValidCount = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-parsed-valid"
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "started"
+             , Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             , Event now EPolicyDecision "Allow"
+             , Event now EToolCall "tc-1 read_file"
+             , Event now EToolResult "tc-1 contents"
+             , Event now ESessionEnd "ended"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr ->
+        if rrParsedValid rr == 7
+          then pure (Right ())
+          else pure (Left $ "Expected 7 parsed valid events, got " ++ show (rrParsedValid rr))
+
+-- | ResumeResult counts skipped events (valid events outside safe text context).
+testResumeSkippedEventCount :: Test
+testResumeSkippedEventCount = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-skipped"
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "started"
+             , Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             , Event now EPolicyDecision "Allow"
+             , Event now EToolCall "tc-1 read_file"
+             , Event now EToolResult "tc-1 contents"
+             , Event now EConversationReset "reset"
+             , Event now EUserMessage "after"
+             , Event now EAssistantReply "reply"
+             , Event now ESessionEnd "ended"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr ->
+        -- 10 valid events total
+        -- Message events: 2 user + 2 assistant = 4
+        -- Skipped: session_start + policy_decision + tool_call + tool_result + session_end = 5
+        if rrParsedValid rr == 10 && rrSkipped rr == 5 && rrMessageEventCount rr == 4
+          then pure (Right ())
+          else pure (Left $ "parsedValid=" ++ show (rrParsedValid rr)
+                           ++ " skipped=" ++ show (rrSkipped rr)
+                           ++ " messageEvents=" ++ show (rrMessageEventCount rr))
+
+-- | ResumeResult detects conversation_reset boundary.
+testResumeResetBoundaryDetected :: Test
+testResumeResetBoundaryDetected = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-reset-boundary"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "before"
+             , Event now EAssistantReply "reply before"
+             , Event now EConversationReset "reset"
+             , Event now EUserMessage "after"
+             , Event now EAssistantReply "reply after"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr ->
+        if rrUsedResetBoundary rr
+          then pure (Right ())
+          else pure (Left "Expected reset boundary to be detected")
+
+-- | ResumeResult reports no reset boundary when none exists.
+testResumeNoResetBoundary :: Test
+testResumeNoResetBoundary = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-no-reset"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr ->
+        if not (rrUsedResetBoundary rr)
+          then pure (Right ())
+          else pure (Left "Expected no reset boundary")
+
+-- | ResumeResult counts safe text resume-context messages.
+testResumeMessageCount :: Test
+testResumeMessageCount = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-msg-count"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "q1"
+             , Event now EAssistantReply "a1"
+             , Event now EUserMessage "q2"
+             , Event now EAssistantReply "a2"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr ->
+        if rrMessageCount rr == 4
+          then pure (Right ())
+          else pure (Left $ "Expected 4 messages, got " ++ show (rrMessageCount rr))
+
+-- | ResumeResult message count respects reset boundary.
+testResumeMessageCountAfterReset :: Test
+testResumeMessageCountAfterReset = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-msg-count-reset"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "before1"
+             , Event now EAssistantReply "reply1"
+             , Event now EConversationReset "reset"
+             , Event now EUserMessage "after1"
+             , Event now EAssistantReply "reply2"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr ->
+        -- Only 2 messages after the reset boundary
+        if rrMessageCount rr == 2
+          then pure (Right ())
+          else pure (Left $ "Expected 2 messages after reset, got " ++ show (rrMessageCount rr))
+
+-- | ResumeResult with malformed lines counts them separately.
+testResumeAccountingWithMalformed :: Test
+testResumeAccountingWithMalformed = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-malformed-acct"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  now <- getCurrentTime
+  -- Write 2 valid events and 1 malformed line
+  let validLog = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now EUserMessage "hello"
+        , Event now EAssistantReply "hi"
+        ]
+  flushLog root 0 validLog
+  let path = root </> "session.jsonl"
+  LBS.appendFile path "bad json line\n"
+  result <- loadResumeEvents root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure (Left "Expected Just")
+    Just rr ->
+      if rrParsedValid rr == 2
+         && rrMalformed rr == 1
+         && rrMessageEventCount rr == 2
+         && rrSkipped rr == 0
+         && rrMessageCount rr == 2
+        then pure (Right ())
+        else pure (Left $ "parsedValid=" ++ show (rrParsedValid rr)
+                         ++ " malformed=" ++ show (rrMalformed rr)
+                         ++ " messageEvents=" ++ show (rrMessageEventCount rr)
+                         ++ " skipped=" ++ show (rrSkipped rr)
+                         ++ " messages=" ++ show (rrMessageCount rr))
+
+-- | formatResumeSummary includes key sections.
+testFormatResumeSummarySections :: Test
+testFormatResumeSummarySections = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-format"
+  now <- getCurrentTime
+  let evts = [ Event now ESessionStart "started"
+             , Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             , Event now EConversationReset "reset"
+             , Event now EUserMessage "after"
+             , Event now EAssistantReply "reply"
+             , Event now ESessionEnd "ended"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr -> do
+        let logPath = dir </> "session.jsonl"
+            out = formatResumeSummary logPath rr
+        if T.isInfixOf "Resumed from:" out
+           && T.isInfixOf "Messages:" out
+           && T.isInfixOf "Valid events:" out
+           && T.isInfixOf "Message events:" out
+           && T.isInfixOf "Skipped:" out
+           && T.isInfixOf "Malformed:" out
+           && T.isInfixOf "Reset boundary: yes" out
+          then pure (Right ())
+          else pure (Left $ "formatResumeSummary missing sections: " ++ T.unpack (T.take 400 out))
+
+-- | formatResumeSummary shows reset boundary: no when no reset.
+testFormatResumeSummaryNoResetBoundary :: Test
+testFormatResumeSummaryNoResetBoundary = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-format-noreset"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "hello"
+             , Event now EAssistantReply "hi"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr -> do
+        let logPath = dir </> "session.jsonl"
+            out = formatResumeSummary logPath rr
+        if T.isInfixOf "Reset boundary: no" out
+          then pure (Right ())
+          else pure (Left $ "Expected 'Reset boundary: no': " ++ T.unpack (T.take 300 out))
+
+-- | formatResumeSummary shows correct message count.
+testFormatResumeSummaryMessageCount :: Test
+testFormatResumeSummaryMessageCount = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-format-msgcount"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "q1"
+             , Event now EAssistantReply "a1"
+             , Event now EUserMessage "q2"
+             , Event now EAssistantReply "a2"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr -> do
+        let logPath = dir </> "session.jsonl"
+            out = formatResumeSummary logPath rr
+        if T.isInfixOf "Messages:       4" out
+          then pure (Right ())
+          else pure (Left $ "Expected 'Messages:       4': " ++ T.unpack (T.take 300 out))
+
+-- | Resume with zero safe text messages reports clearly.
+testResumeZeroMessages :: Test
+testResumeZeroMessages = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-zero-msgs"
+  now <- getCurrentTime
+  -- Only lifecycle events - no safe text message events
+  let evts = [ Event now ESessionStart "started"
+             , Event now ESessionEnd "ended"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just (file exists with valid events)")
+      Just rr ->
+        if rrMessageCount rr == 0
+           && rrMessageEventCount rr == 0
+           && rrParsedValid rr == 2
+           && rrSkipped rr == 2
+          then pure (Right ())
+          else pure (Left $ "messages=" ++ show (rrMessageCount rr)
+                           ++ " messageEvents=" ++ show (rrMessageEventCount rr)
+                           ++ " parsedValid=" ++ show (rrParsedValid rr)
+                           ++ " skipped=" ++ show (rrSkipped rr))
+
 tests :: [Test]
 tests =
   [ testMultiToolResultOrder
@@ -1342,6 +1931,7 @@ tests =
   , testSummarizeSessionConversationReset
   , testFormatSessionSummaryConversationReset
   , testRecordSessionStartEvent
+  , testRecordSessionStartWithResumeEvent
   , testRecordSessionEndEvent
   , testRecordConversationResetEvent
   , testNewPreservesSessionAndAppendsReset
@@ -1356,4 +1946,35 @@ tests =
   , testIsMeaningfulWithPolicyDecision
   , testIsMeaningfulFullLifecycle
   , testFlushLogOnExceptionLifecycleOnly
+  , testFormatSessionSummaryMissingLog
+  , testFormatSessionSummaryMalformedZero
+  , testFormatSessionSummaryMalformedNonZero
+  , testSummarizeSessionBackupExists
+  , testSummarizeSessionBackupAbsent
+  , testFormatSessionSummaryBackupExists
+  -- Resume tests
+  , testResumeIncludesUserMessages
+  , testResumeIncludesAssistantReplies
+  , testResumeIgnoresLifecycleEvents
+  , testResumeIgnoresPolicyDecisions
+  , testResumeDoesNotReconstructToolCalls
+  , testResumeLoadMissingFile
+  , testResumeLoadEmptyFile
+  , testResumeSkipsMalformedLines
+  , testResumeCountsOnlySafeTextMessages
+  , testResumeLoadsOnlySafeTextContext
+  , testResumeRespectsConversationReset
+  , testResumeEndToEnd
+  -- Resume accounting tests (phase zero polish)
+  , testResumeParsedValidCount
+  , testResumeSkippedEventCount
+  , testResumeResetBoundaryDetected
+  , testResumeNoResetBoundary
+  , testResumeMessageCount
+  , testResumeMessageCountAfterReset
+  , testResumeAccountingWithMalformed
+  , testFormatResumeSummarySections
+  , testFormatResumeSummaryNoResetBoundary
+  , testFormatResumeSummaryMessageCount
+  , testResumeZeroMessages
   ]

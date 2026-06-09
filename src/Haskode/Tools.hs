@@ -31,7 +31,9 @@ module Haskode.Tools
   , globTool
   , searchTool
   , previewPatchTool
+  , previewPatchBatchTool
   , applyPatchTool
+  , applyPatchBatchTool
   , writeFileTool
   , defaultRegistry
     -- * Helpers
@@ -39,6 +41,7 @@ module Haskode.Tools
   , extractBoolField
   , computePatchPreview
   , computeWriteFilePreview
+  , computeBatchApplyPreview
     -- * Shell output truncation
   , TruncResult (..)
   , truncateText
@@ -66,19 +69,23 @@ import Control.Monad     (foldM)
 import Data.Aeson       (Value (..), object, (.=))
 import qualified Data.Aeson.Key    as Key
 import qualified Data.Aeson.KeyMap as KM
-import Data.List        (isPrefixOf, tails)
+import Data.List        (tails)
 import Data.Map.Strict  (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text        (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, doesPathExist, getFileSize, listDirectory)
+import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, getFileSize, listDirectory)
 import System.FilePath  ((</>), takeExtension)
 import System.Process   (readCreateProcessWithExitCode, shell)
 
 import Haskode.Core (ToolResult (..))
-import Haskode.Patch (Patch (..), applyPatch, makePatch, showDiff)
+import Haskode.Patch
+    ( safeCanonicalize, isUnderRoot
+    , extractTextField
+    )
+import qualified Haskode.Tools.FileEdit as FileEdit
 
 -- ---------------------------------------------------------------------------
 -- Tool definition
@@ -145,14 +152,13 @@ withRootContainment path k = do
                <> T.pack path)
           | otherwise -> k rootCanon pathCanon
 
--- | Extract a text field from a JSON object.
---   Returns 'Nothing' if the field is missing or not a string.
-extractTextField :: Text -> Value -> Maybe Text
-extractTextField key (Object o) =
-  case KM.lookup (Key.fromText key) o of
-    Just (String s) -> Just s
-    _               -> Nothing
-extractTextField _ _ = Nothing
+fromToolSpec :: FileEdit.ToolSpec -> Tool
+fromToolSpec spec = Tool
+  { toolName        = FileEdit.specName spec
+  , toolDescription = FileEdit.specDescription spec
+  , toolSchema      = FileEdit.specSchema spec
+  , toolExecute     = FileEdit.specExecute spec
+  }
 
 -- | Extract a boolean field from a JSON object.
 --   Returns 'Nothing' if the field is missing or not a boolean.
@@ -569,28 +575,6 @@ binaryExtensions =
 isBinaryFile :: FilePath -> Bool
 isBinaryFile path = takeExtension path `elem` binaryExtensions
 
--- | Check whether @path@ is the same as, or a subdirectory of, @root@.
---   Both paths must already be canonicalized.
---   Handles both @/@ and @\\@ separators for Windows compatibility.
-isUnderRoot :: FilePath -> FilePath -> Bool
-isUnderRoot root path =
-  root == path
-  || (root ++ "/")  `isPrefixOf` path
-  || (root ++ "\\") `isPrefixOf` path
-
--- | Safely canonicalize a path.  Returns 'Nothing' on failure
--- (broken symlink, permission error, missing path, etc.).
---   After canonicalization, verifies the resolved path actually exists
---   so that broken symlinks (whose targets are missing) are caught.
-safeCanonicalize :: FilePath -> IO (Maybe FilePath)
-safeCanonicalize path = do
-  result <- try (canonicalizePath path) :: IO (Either IOException FilePath)
-  case result of
-    Left _  -> pure Nothing
-    Right p -> do
-      exists <- doesPathExist p
-      if exists then pure (Just p) else pure Nothing
-
 -- | Accumulated stats for a search or glob traversal.
 --   Tracks entries that were skipped for various reasons.
 data TraversalStats = TraversalStats
@@ -819,320 +803,32 @@ searchTool = Tool
   }
 
 -- ---------------------------------------------------------------------------
--- Preview-patch tool (read-only diff preview)
+-- File-edit tools
 -- ---------------------------------------------------------------------------
 
--- | Maximum character count for a preview diff.  Diffs larger than
---   this are refused with a conservative message so the output does
---   not flood the model context.
-previewDiffLimit :: Int
-previewDiffLimit = 8192
-
--- | Preview a unified diff for a proposed file replacement.
---
---   This tool is strictly read-only: it reads the current file,
---   computes a diff against the proposed replacement text, and
---   returns the diff.  It never modifies the filesystem.
---
---   Uses the same root-containment pattern as 'readFileTool':
---   'safeCanonicalize' + 'isUnderRoot' to prevent symlink escape
---   and path traversal.
 previewPatchTool :: Tool
-previewPatchTool = Tool
-  { toolName        = "preview_patch"
-  , toolDescription = "Preview a unified diff for a proposed file replacement without modifying the filesystem. Reads the current file and shows what would change. Use this before apply_patch to review changes. Does NOT write to disk."
-  , toolSchema      = object
-      [ "type"       .= ("object" :: Text)
-      , "properties" .= object
-          [ "path" .= object
-              [ "type"        .= ("string" :: Text)
-              , "description" .= ("Path to the existing file" :: Text)
-              ]
-          , "replacement" .= object
-              [ "type"        .= ("string" :: Text)
-              , "description" .= ("Proposed new content for the file" :: Text)
-              ]
-          ]
-      , "required"   .= (["path", "replacement"] :: [Text])
-      ]
-  , toolExecute = \args -> do
-      let path = case extractTextField "path" args of
-            Just p  -> T.unpack p
-            Nothing -> ""
-          replacement = case extractTextField "replacement" args of
-            Just r  -> r
-            Nothing -> ""
-      if null path
-        then pure $ ToolResult "" "error: missing required field 'path'"
-        else withRootContainment path $ \_rootCanon _pathCanon -> do
-          -- Read the current file content.
-          readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
-          case readResult of
-            Left e -> pure $ ToolResult ""
-              ("error reading " <> T.pack path <> ": " <> T.pack (show e))
-            Right current -> do
-              -- Compute the diff and apply the size limit.
-              let patch = makePatch path current replacement
-                  diff  = showDiff patch
-              if T.length diff > previewDiffLimit
-                then pure $ ToolResult ""
-                  ("error: diff too large ("
-                   <> T.pack (show (T.length diff))
-                   <> " chars, limit "
-                   <> T.pack (show previewDiffLimit)
-                   <> "). Consider reading the file and making the change manually.")
-                else pure $ ToolResult ""
-                  ("Diff preview (no files modified):\n" <> diff)
-  }
+previewPatchTool = fromToolSpec FileEdit.previewPatchToolSpec
 
--- | Apply a patch to a single existing in-root file.
---
---   This tool writes the replacement text to disk.  It is gated by
---   the policy system: the default policy treats it as 'AskUser',
---   so the user must confirm before the write happens.
---
---   Accepts the same arguments as 'previewPatchTool' (@path@ and
---   @replacement@) and enforces the same root-containment checks.
---   Returns the unified diff in the result so the user/agent can
---   see exactly what changed.
+previewPatchBatchTool :: Tool
+previewPatchBatchTool = fromToolSpec FileEdit.previewPatchBatchToolSpec
+
 applyPatchTool :: Tool
-applyPatchTool = Tool
-  { toolName        = "apply_patch"
-  , toolDescription = "Apply a patch to exactly one existing file under the working directory. Reads the current file, writes the replacement content, and returns the diff. Requires user confirmation before writing. Cannot create new files or delete files."
-  , toolSchema      = object
-      [ "type"       .= ("object" :: Text)
-      , "properties" .= object
-          [ "path" .= object
-              [ "type"        .= ("string" :: Text)
-              , "description" .= ("Path to the existing file to modify" :: Text)
-              ]
-          , "replacement" .= object
-              [ "type"        .= ("string" :: Text)
-              , "description" .= ("New content to write to the file" :: Text)
-              ]
-          ]
-      , "required"   .= (["path", "replacement"] :: [Text])
-      ]
-  , toolExecute = \args -> do
-      let path = case extractTextField "path" args of
-            Just p  -> T.unpack p
-            Nothing -> ""
-          replacement = case extractTextField "replacement" args of
-            Just r  -> r
-            Nothing -> ""
-      if null path
-        then pure $ ToolResult "" "error: missing required field 'path'"
-        else withRootContainment path $ \_rootCanon _pathCanon -> do
-          -- Read the current file content.
-          readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
-          case readResult of
-            Left e -> pure $ ToolResult ""
-              ("error reading " <> T.pack path <> ": " <> T.pack (show e))
-            Right current -> do
-              -- Compute the diff for the result message.
-              let patch = makePatch path current replacement
-                  diff  = showDiff patch
-              -- Apply the patch (writes to disk).
-              applyResult <- try (applyPatch patch) :: IO (Either IOException Patch)
-              case applyResult of
-                Left e -> pure $ ToolResult ""
-                  ("error writing " <> T.pack path <> ": " <> T.pack (show e))
-                Right _ -> pure $ ToolResult ""
-                  ("Patch applied:\n" <> diff)
-  }
+applyPatchTool = fromToolSpec FileEdit.applyPatchToolSpec
 
--- | Create a new file under the working directory.
---
---   This tool writes new content to a file that does not yet exist.
---   It is gated by the policy system: the default policy treats it as
---   'AskUser', so the user must confirm before the write happens.
---
---   Accepts @path@ (target file) and @content@ (file content).
---   Enforces the same root-containment checks as 'readFileTool'.
---   Refuses to overwrite existing files or write to directory paths.
---   The parent directory must already exist.
---
---   Returns a concise diff-like preview in the result so the user/agent
---   can see exactly what was created.
+applyPatchBatchTool :: Tool
+applyPatchBatchTool = fromToolSpec FileEdit.applyPatchBatchToolSpec
+
 writeFileTool :: Tool
-writeFileTool = Tool
-  { toolName        = "write_file"
-  , toolDescription = "Create a new file under the working directory with the given content. Requires user confirmation before writing. Cannot overwrite existing files or create directories. The parent directory must already exist."
-  , toolSchema      = object
-      [ "type"       .= ("object" :: Text)
-      , "properties" .= object
-          [ "path" .= object
-              [ "type"        .= ("string" :: Text)
-              , "description" .= ("Path for the new file to create" :: Text)
-              ]
-          , "content" .= object
-              [ "type"        .= ("string" :: Text)
-              , "description" .= ("Content to write to the new file" :: Text)
-              ]
-          ]
-      , "required"   .= (["path", "content"] :: [Text])
-      ]
-  , toolExecute = \args -> do
-      let path = case extractTextField "path" args of
-            Just p  -> T.unpack p
-            Nothing -> ""
-          content = case extractTextField "content" args of
-            Just c  -> c
-            Nothing -> ""
-      if null path
-        then pure $ ToolResult "" "error: missing required field 'path'"
-        else do
-          -- Resolve working directory for containment (same as read_file).
-          rootCanonResult <- safeCanonicalize "."
-          case rootCanonResult of
-            Nothing -> pure $ ToolResult ""
-              "error: could not resolve working directory"
-            Just rootCanon -> do
-              -- Check if the target path already exists (file or dir).
-              pathExists <- doesPathExist path
-              if pathExists
-                then do
-                  isDir <- doesDirectoryExist path
-                  if isDir
-                    then pure $ ToolResult ""
-                      ("error: path is a directory, not a file: " <> T.pack path)
-                    else pure $ ToolResult ""
-                      ("error: file already exists, will not overwrite: "
-                       <> T.pack path)
-                else do
-                  -- The path does not exist yet, so canonicalizePath
-                  -- will not resolve it.  Instead, canonicalize the
-                  -- parent directory and verify containment.
-                  let parentDir = takeParentDir path
-                  parentCanonResult <- safeCanonicalize parentDir
-                  case parentCanonResult of
-                    Nothing -> pure $ ToolResult ""
-                      ("error: parent directory does not exist or is not accessible: "
-                       <> T.pack parentDir)
-                    Just parentCanon
-                      | not (isUnderRoot rootCanon parentCanon) ->
-                        pure $ ToolResult ""
-                          ("error: path must be under the working directory: "
-                           <> T.pack path)
-                      | otherwise -> do
-                        -- Verify the resolved parent is a directory.
-                        parentIsDir <- doesDirectoryExist parentDir
-                        if not parentIsDir
-                          then pure $ ToolResult ""
-                            ("error: parent path is not a directory: "
-                             <> T.pack parentDir)
-                          else do
-                            -- Build the diff preview for the result.
-                            let preview = "--- (new file)\n+++ " <> T.pack path <> "\n"
-                                        <> T.unlines (map ("+" <>) (T.lines content))
-                            -- Write the file.
-                            writeResult <- try (TIO.writeFile path content)
-                                           :: IO (Either IOException ())
-                            case writeResult of
-                              Left e -> pure $ ToolResult ""
-                                ("error writing " <> T.pack path <> ": "
-                                 <> T.pack (show e))
-                              Right _ -> pure $ ToolResult ""
-                                ("File created:\n" <> preview)
-  }
+writeFileTool = fromToolSpec FileEdit.writeFileToolSpec
 
--- | Compute a preview for a @write_file@ tool call.
---   Returns @(path, preview)@ on success, or an error message on failure.
---   This is used by the agent to show the user a preview before asking
---   for confirmation.
---
---   This function does NOT write to disk.
-computeWriteFilePreview :: Value -> IO (Either Text (FilePath, Text))
-computeWriteFilePreview args = do
-  let path = case extractTextField "path" args of
-        Just p  -> T.unpack p
-        Nothing -> ""
-      content = case extractTextField "content" args of
-        Just c  -> c
-        Nothing -> ""
-  if null path
-    then pure $ Left "missing required field 'path'"
-    else do
-      rootCanonResult <- safeCanonicalize "."
-      case rootCanonResult of
-        Nothing -> pure $ Left "could not resolve working directory"
-        Just rootCanon -> do
-          pathExists <- doesPathExist path
-          if pathExists
-            then do
-              isDir <- doesDirectoryExist path
-              if isDir
-                then pure $ Left ("path is a directory, not a file: " <> T.pack path)
-                else pure $ Left ("file already exists, will not overwrite: " <> T.pack path)
-            else do
-              let parentDir = takeParentDir path
-              parentCanonResult <- safeCanonicalize parentDir
-              case parentCanonResult of
-                Nothing -> pure $ Left
-                  ("parent directory does not exist or is not accessible: "
-                   <> T.pack parentDir)
-                Just parentCanon
-                  | not (isUnderRoot rootCanon parentCanon) ->
-                    pure $ Left ("path must be under the working directory: " <> T.pack path)
-                  | otherwise -> do
-                    parentIsDir <- doesDirectoryExist parentDir
-                    if not parentIsDir
-                      then pure $ Left ("parent path is not a directory: " <> T.pack parentDir)
-                      else do
-                        let preview = "--- (new file)\n+++ " <> T.pack path <> "\n"
-                                    <> T.unlines (map ("+" <>) (T.lines content))
-                        pure $ Right (path, preview)
-
--- | Take the parent directory of a path.
---   Returns \".\" if the path has no directory component.
-takeParentDir :: FilePath -> FilePath
-takeParentDir path = case reverse (splitPath path) of
-  (_:rest) -> if null rest then "." else joinPath (reverse rest)
-  []       -> "."
-  where
-    splitPath [] = [""]
-    splitPath p  = case break (== '/') p of
-      (chunk, [])   -> [chunk]
-      (chunk, _:rest) -> chunk : splitPath rest
-    joinPath []     = "."
-    joinPath chunks = foldl1 (\a b -> a ++ "/" ++ b) chunks
-
--- | Compute a patch preview for a tool call that looks like an
---   @apply_patch@ invocation.  Returns @(path, diff)@ on success,
---   or an error message on failure.  This is used by the agent to
---   show the user a diff preview before asking for confirmation.
---
---   This function does NOT write to disk — it reuses 'makePatch' and
---   'showDiff' from "Haskode.Patch" for the diff computation.
 computePatchPreview :: Value -> IO (Either Text (FilePath, Text))
-computePatchPreview args = do
-  let path = case extractTextField "path" args of
-        Just p  -> T.unpack p
-        Nothing -> ""
-      replacement = case extractTextField "replacement" args of
-        Just r  -> r
-        Nothing -> ""
-  if null path
-    then pure $ Left "missing required field 'path'"
-    else do
-      rootCanonResult <- safeCanonicalize "."
-      case rootCanonResult of
-        Nothing -> pure $ Left "could not resolve working directory"
-        Just rootCanon -> do
-          pathCanonResult <- safeCanonicalize path
-          case pathCanonResult of
-            Nothing -> pure $ Left ("could not resolve path: " <> T.pack path)
-            Just pathCanon
-              | not (isUnderRoot rootCanon pathCanon) ->
-                pure $ Left ("path must be under the working directory: " <> T.pack path)
-              | otherwise -> do
-                readResult <- try (TIO.readFile path) :: IO (Either IOException Text)
-                case readResult of
-                  Left e -> pure $ Left ("error reading " <> T.pack path <> ": " <> T.pack (show e))
-                  Right current -> do
-                    let patch = makePatch path current replacement
-                        diff  = showDiff patch
-                    pure $ Right (path, diff)
+computePatchPreview = FileEdit.computePatchPreview
+
+computeWriteFilePreview :: Value -> IO (Either Text (FilePath, Text))
+computeWriteFilePreview = FileEdit.computeWriteFilePreview
+
+computeBatchApplyPreview :: Value -> IO (Either Text (Text, [Text]))
+computeBatchApplyPreview = FileEdit.computeBatchApplyPreview
 
 -- | Default registry with all built-in tools.
 defaultRegistry :: ToolRegistry
@@ -1143,6 +839,8 @@ defaultRegistry = foldr registerTool emptyRegistry
   , globTool
   , searchTool
   , previewPatchTool
+  , previewPatchBatchTool
   , applyPatchTool
+  , applyPatchBatchTool
   , writeFileTool
   ]

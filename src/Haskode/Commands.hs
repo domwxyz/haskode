@@ -22,6 +22,7 @@ import qualified Data.Text as T
 import Haskode.Agent      (AgentState (..), estimateContextChars)
 import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Core       (Conversation, emptyConversation)
+import Haskode.Provider   (Provider (..))
 import Haskode.Session    (events)
 import Haskode.Tools      (toolNames)
 
@@ -65,8 +66,9 @@ formatHelp = T.unlines
 
 -- | Format current runtime status.
 --
--- Shows provider, model, base URL, working directory, context limits,
--- session event count, and registered tool names.
+-- Shows provider, model, base URL, working directory, verbose mode,
+-- streaming availability, context limits, session event count, and
+-- registered tool names.
 --
 -- API keys are never printed.
 formatStatus :: AgentState -> Text
@@ -75,16 +77,25 @@ formatStatus st =
       pc  = cfgProvider cfg
       evs = events (asSession st)
       maxC = cfgMaxContextChars cfg
+      names = toolNames (asRegistry st)
+      hasStream = case providerStream (asProvider st) of
+                    Just _  -> ("yes" :: Text)
+                    Nothing -> "no"
   in T.unlines
        [ "Provider:        " <> T.pack (pcProvider pc)
        , "Model:           " <> T.pack (pcModel pc)
        , "Base URL:        " <> T.pack (pcBaseUrl pc)
        , "Working dir:     " <> T.pack (cfgWorkingDir cfg)
+       , "Verbose:         " <> (if cfgVerbose cfg then "on" else "off")
+       , "Streaming:       " <> hasStream
+       , "Resumed:         " <> (if asResumed st then "yes" else "no")
        , "Max context:     " <> T.pack (show maxC) <> " chars"
        , formatContextUsage (asConversation st) maxC
        , "Max session log: " <> T.pack (show (cfgMaxSessionLogBytes cfg)) <> " bytes"
        , "Session events:  " <> T.pack (show (length evs))
-       , "Tools:           " <> T.intercalate ", " (toolNames (asRegistry st))
+       , "Tools:           " <> T.pack (show (length names))
+                             <> " — "
+                             <> T.intercalate ", " names
        ]
 
 -- ---------------------------------------------------------------------------

@@ -109,7 +109,7 @@ testAgentStreamingTextReply = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "hello agent"
   let evts = events (asSession state')
       types = map evType evts
@@ -146,7 +146,7 @@ testAgentStreamingToolCalls = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read the file"
   let evts = events (asSession state')
       types = map evType evts
@@ -175,7 +175,7 @@ testAgentNonStreamingFallback = do
   if isNothing (providerStream prov)
     then do
       let cfg = defaultConfig
-          state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+          state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
       state' <- runAgent state "hello"
       let evts = events (asSession state')
           types = map evType evts
@@ -209,7 +209,7 @@ testAgentStreamingToolCallOnlyLazyDisplay = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read the file"
   let evts = events (asSession state')
       types = map evType evts

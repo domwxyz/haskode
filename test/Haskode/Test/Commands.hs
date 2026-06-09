@@ -19,7 +19,7 @@ import Haskode.Commands
       formatContextUsage )
 import Haskode.Config
     ( defaultConfig,
-      Config(cfgProvider),
+      Config(cfgProvider, cfgVerbose),
       ProviderConfig(pcApiKey, pcProvider, pcModel, pcBaseUrl) )
 import Haskode.Core ( mkUserMessage, Message(Message), Role(User) )
 import Haskode.Policy ( defaultPolicy )
@@ -104,7 +104,7 @@ testFormatStatusContent =
                             , pcApiKey   = "sk-secret-key-12345"
                             }
                           }
-      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
       out   = formatStatus state
   in if T.isInfixOf "openai" out
         && T.isInfixOf "gpt-4o" out
@@ -113,19 +113,56 @@ testFormatStatusContent =
         && T.isInfixOf "Tools:" out
         && T.isInfixOf "Context est:" out
         && T.isInfixOf "Remaining:" out
+        && T.isInfixOf "Verbose:" out
+        && T.isInfixOf "Streaming:" out
+        && T.isInfixOf "Resumed:" out
      then pure $ Right ()
-     else pure $ Left $ "formatStatus missing expected fields: " ++ T.unpack (T.take 400 out)
+     else pure $ Left $ "formatStatus missing expected fields: " ++ T.unpack (T.take 500 out)
 
 testFormatStatusNoApiKey :: Test
 testFormatStatusNoApiKey =
   let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
                             { pcApiKey = "sk-super-secret-key-DO-NOT-PRINT" }
                           }
-      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
       out   = formatStatus state
   in if T.isInfixOf "sk-super-secret-key-DO-NOT-PRINT" out
      then pure $ Left "formatStatus should not expose API key"
      else pure $ Right ()
+
+testFormatStatusVerboseOff :: Test
+testFormatStatusVerboseOff =
+  let cfg = defaultConfig { cfgVerbose = False }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+      out   = formatStatus state
+  in if T.isInfixOf "Verbose:         off" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus should show verbose off: " ++ T.unpack (T.take 300 out)
+
+testFormatStatusVerboseOn :: Test
+testFormatStatusVerboseOn =
+  let cfg = defaultConfig { cfgVerbose = True }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+      out   = formatStatus state
+  in if T.isInfixOf "Verbose:         on" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus should show verbose on: " ++ T.unpack (T.take 300 out)
+
+testFormatStatusStreamingNo :: Test
+testFormatStatusStreamingNo =
+  let state = initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False
+      out   = formatStatus state
+  in if T.isInfixOf "Streaming:       no" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus should show streaming no for stub: " ++ T.unpack (T.take 300 out)
+
+testFormatStatusToolCount :: Test
+testFormatStatusToolCount =
+  let state = initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False
+      out   = formatStatus state
+  in if T.isInfixOf "Tools:           " out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus missing tool count: " ++ T.unpack (T.take 300 out)
 
 testFormatUnknownCommandContent :: Test
 testFormatUnknownCommandContent =
@@ -195,7 +232,7 @@ testFormatNewConfirmationText =
 testResetConversationClearsMessages :: Test
 testResetConversationClearsMessages =
   let cfg = defaultConfig
-      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
       msg = Message User "hello" Nothing Nothing
       state1 = state0 { asConversation = [msg] }
       state2 = resetConversation state1
@@ -206,13 +243,29 @@ testResetConversationClearsMessages =
 testResetConversationPreservesSession :: Test
 testResetConversationPreservesSession =
   let cfg = defaultConfig
-      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove
+      state0 = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
       msg = Message User "hello" Nothing Nothing
       state1 = state0 { asConversation = [msg] }
       state2 = resetConversation state1
   in if length (events (asSession state2)) == length (events (asSession state1))
        then pure $ Right ()
        else pure $ Left "resetConversation should preserve session events"
+
+testFormatStatusResumedNo :: Test
+testFormatStatusResumedNo =
+  let state = initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False
+      out   = formatStatus state
+  in if T.isInfixOf "Resumed:         no" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus should show Resumed: no: " ++ T.unpack (T.take 300 out)
+
+testFormatStatusResumedYes :: Test
+testFormatStatusResumedYes =
+  let state = initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove True
+      out   = formatStatus state
+  in if T.isInfixOf "Resumed:         yes" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus should show Resumed: yes: " ++ T.unpack (T.take 300 out)
 
 
 tests :: [Test]
@@ -231,6 +284,10 @@ tests =
   , testFormatHelpContentIncludesNew
   , testFormatStatusContent
   , testFormatStatusNoApiKey
+  , testFormatStatusVerboseOff
+  , testFormatStatusVerboseOn
+  , testFormatStatusStreamingNo
+  , testFormatStatusToolCount
   , testFormatContextUsageUnderLimit
   , testFormatContextUsageExactLimit
   , testFormatContextUsageOverLimit
@@ -238,4 +295,6 @@ tests =
   , testFormatNewConfirmationText
   , testResetConversationClearsMessages
   , testResetConversationPreservesSession
+  , testFormatStatusResumedNo
+  , testFormatStatusResumedYes
   ]

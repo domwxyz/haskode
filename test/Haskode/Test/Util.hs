@@ -10,6 +10,8 @@ module Haskode.Test.Util
   , skipIfNoSymlinks
   , skipOnWindows
   , toolDescriptionFromRegistry
+  , withTestDir
+  , runInTestDir
   ) where
 
 import Control.Exception ( IOException, try )
@@ -17,9 +19,11 @@ import Haskode.Tools ( Tool(..), defaultRegistry, lookupTool )
 import System.Directory
     ( createDirectory,
       createFileLink,
+      getCurrentDirectory,
       getTemporaryDirectory,
       removeDirectoryRecursive,
-      removeFile )
+      removeFile,
+      setCurrentDirectory )
 import System.Exit ( exitFailure, exitSuccess )
 import System.FilePath ( (</>) )
 import System.Info ( os )
@@ -61,6 +65,30 @@ createTestTree = do
 
 toolDescriptionFromRegistry :: T.Text -> Maybe T.Text
 toolDescriptionFromRegistry name = toolDescription <$> lookupTool name defaultRegistry
+
+-- | Create a fresh temp directory, run the action, then clean up.
+--   The directory is removed even if the action throws.
+withTestDir :: String -> (FilePath -> IO a) -> IO a
+withTestDir name action = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> name
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  result <- action root
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  pure result
+
+-- | Create a fresh temp directory, cd into it, run the action, cd back,
+--   then clean up.  Saves and restores getCurrentDirectory so callers
+--   do not need to.
+runInTestDir :: String -> (FilePath -> IO (Either String a)) -> IO (Either String a)
+runInTestDir name action = do
+  origDir <- getCurrentDirectory
+  result <- withTestDir name $ \root -> do
+    setCurrentDirectory root
+    action root
+  setCurrentDirectory origDir
+  pure result
 
 -- | Check if the current process can create symbolic links.
 --   On Windows this typically requires Administrator privileges.

@@ -267,7 +267,7 @@ testMultiToolConversationHistory = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "check files"
   let conv = asConversation state'
       evts = events (asSession state')
@@ -306,7 +306,7 @@ testShellApprovalFlow = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "run echo"
   let evts = events (asSession state')
       types = map evType evts
@@ -350,7 +350,7 @@ testAgentLoopEvents = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "hello agent"
   let evts = events (asSession state')
       types = map evType evts
@@ -378,7 +378,7 @@ testAgentLoopToolExecution = do
         }
     ]
   let cfg = defaultConfig
-      state = initState cfg prov defaultPolicy defaultRegistry autoApprove
+      state = initState cfg prov defaultPolicy defaultRegistry autoApprove False
   state' <- runAgent state "read the test file"
   let evts = events (asSession state')
       types = map evType evts
