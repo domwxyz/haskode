@@ -38,12 +38,14 @@ import Haskode.Commands        (CommandAction (..), CommandSpec (..), parseSlash
                                 formatHelp, formatStatus, formatDoctor, formatUnknownCommand, formatNewConfirmation, resetConversation)
 import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig, loadConfigFrom)
 import Haskode.Display         (formatVerbose)
+import Haskode.Extension       (buildFinalRuntime)
+import Haskode.Extensions      (compiledExtensions)
 import Haskode.Provider        (Provider, stubProvider)
 import Haskode.Provider.Anthropic (anthropicProvider)
 import Haskode.Provider.OpenAI (openaiProviderWithApiKeyOverride)
-import Haskode.Policy          (defaultPolicy)
+import Haskode.Policy          (Policy, defaultPolicy)
 import Haskode.Session         (flushLog, flushLogOnException, summarizeSession, formatSessionSummary, isMeaningfulSession, loadResumeEvents, ResumeResult (..), formatResumeSummary)
-import Haskode.Tools           (ToolRegistry, defaultRegistry, disableTools)
+import Haskode.Tools           (ToolRegistry)
 import Haskode.Tui             (runTui)
 import Haskode.Agent           (AgentState (..), initState, runAgent, terminalApproval,
                                 recordSessionStart, recordSessionStartWithResume,
@@ -142,7 +144,7 @@ main = do
   opts' <- execParser opts
   cfg   <- maybe loadConfig loadConfigFrom (optConfig opts')
   let cfg' = applyOverrides cfg opts'
-  registry <- resolveToolRegistry cfg'
+  (registry, policy) <- resolveRuntime cfg'
 
   handleShowSession cfg' opts'
   unless (optTui opts') printBanner
@@ -150,7 +152,7 @@ main = do
   prov <- resolveProvider cfg' opts' registry
   unless (optTui opts') (printVerboseInfo cfg' opts')
 
-  state <- loadInitialState cfg' prov registry (optResume opts')
+  state <- loadInitialState cfg' prov registry policy (optResume opts')
   runSelectedMode opts' state
 
 -- ---------------------------------------------------------------------------
@@ -191,14 +193,14 @@ printVerboseInfo cfg' opts' =
     putStrLn $ formatVerbose "base url" (pcBaseUrl pc)
     putStrLn ""
 
--- | Build the runtime tool registry from config.
+-- | Build the runtime tool registry and policy from config.
 --
 -- A misspelled disabled-tool name is a config error: failing clearly is
 -- safer than silently leaving a tool enabled.
-resolveToolRegistry :: Config -> IO ToolRegistry
-resolveToolRegistry cfg' =
-  case disableTools (cfgDisabledTools cfg') defaultRegistry of
-    Right reg -> pure reg
+resolveRuntime :: Config -> IO (ToolRegistry, Policy)
+resolveRuntime cfg' =
+  case buildFinalRuntime defaultPolicy compiledExtensions (cfgDisabledTools cfg') of
+    Right runtime -> pure runtime
     Left err -> do
       TIO.putStrLn ("Error: " <> err)
       exitFailure
@@ -206,9 +208,9 @@ resolveToolRegistry cfg' =
 -- | Build the initial 'AgentState' and, when @\-\-resume@ is set,
 --   reconstruct safe text context from @session.jsonl@.
 --   Resume does not replay provider calls or tools.
-loadInitialState :: Config -> Provider -> ToolRegistry -> Bool -> IO AgentState
-loadInitialState cfg' prov registry resumed = do
-  let state0 = initState cfg' prov defaultPolicy registry terminalApproval resumed
+loadInitialState :: Config -> Provider -> ToolRegistry -> Policy -> Bool -> IO AgentState
+loadInitialState cfg' prov registry policy resumed = do
+  let state0 = initState cfg' prov policy registry terminalApproval resumed
   (state1, resumeInfo) <- if resumed
     then do
       let dir = cfgWorkingDir cfg'

@@ -50,6 +50,8 @@ library
   exposed-modules:
     Haskode.Commands
     Haskode.Display
+    Haskode.Extension
+    Haskode.Extensions
     Haskode.Core
     Haskode.Config
     Haskode.Provider
@@ -91,6 +93,7 @@ test-suite haskode-test
     Haskode.Test.Config
     Haskode.Test.Core
     Haskode.Test.Display
+    Haskode.Test.Extension
     Haskode.Test.OpenAI
     Haskode.Test.Patch
     Haskode.Test.Policy

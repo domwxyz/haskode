@@ -71,7 +71,7 @@ data Config = Config
   , cfgWorkingDir         :: !FilePath  -- ^ Project root (default: cwd)
   , cfgMaxContextChars    :: !Int       -- ^ Conservative context-window limit in characters
   , cfgMaxSessionLogBytes :: !Int       -- ^ Max session.jsonl size before rotation (bytes)
-  , cfgDisabledTools      :: ![Text]    -- ^ Built-in tool names to remove from the runtime registry
+  , cfgDisabledTools      :: ![Text]    -- ^ Compiled tool names to remove from the runtime registry
   } deriving stock (Show, Eq, Generic)
 
 instance ToJSON Config

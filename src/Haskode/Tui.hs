@@ -572,12 +572,11 @@ renderEntry entry =
       TuiSystemEntry    -> "[system] "
       TuiToolEntry      -> "[tool] "
 
--- | Render a list of transcript entries with separators between
---   entries of different kinds.
+-- | Render a list of transcript entries with a blank separator before
+--   every entry after the first.
 --
---   This improves readability by adding a visual break whenever
---   the entry type changes (e.g. from user to assistant, or from
---   tool to system).
+--   This improves readability by giving every transcript item a small
+--   visual break, regardless of entry kind.
 renderTranscript :: [TuiEntry] -> [Widget TuiName]
 renderTranscript [] = []
 renderTranscript (first:rest) =

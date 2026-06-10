@@ -124,7 +124,7 @@ lookupTool = Map.lookup
 toolNames :: ToolRegistry -> [Text]
 toolNames = Map.keys
 
--- | Remove named built-in tools from a registry.
+-- | Remove named tools from a registry.
 --
 -- Unknown names are rejected up front so a misspelled config entry does
 -- not silently leave a tool enabled.
@@ -136,7 +136,7 @@ disableTools disabled reg =
        else Left $
          "unknown disabled tool(s): "
          <> T.intercalate ", " unknown
-         <> ". Known built-in tools: "
+         <> ". Known compiled tools: "
          <> T.intercalate ", " (toolNames reg)
 
 uniqueInOrder :: Ord a => [a] -> [a]

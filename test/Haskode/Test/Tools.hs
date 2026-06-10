@@ -440,7 +440,7 @@ testDisableToolsUnknownNameFails =
   case disableTools ["shell", "bogus_tool", "also_missing"] defaultRegistry of
     Left err
       | "unknown disabled tool(s): bogus_tool, also_missing" `T.isInfixOf` err
-        && "Known built-in tools:" `T.isInfixOf` err ->
+        && "Known compiled tools:" `T.isInfixOf` err ->
           pure $ Right ()
       | otherwise -> pure $ Left $ "disableTools error was unclear: " ++ T.unpack err
     Right reg -> pure $ Left $

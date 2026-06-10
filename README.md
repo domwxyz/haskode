@@ -13,7 +13,6 @@ Haskode is a terminal coding agent where **Haskell owns the main loop**. Inspire
 - **Educational** — heavily commented, no clever tricks, learn-by-reading
 - **Native** — no Python, no Node, no wrapper scripts; just `cabal build` and go
 
-For the enforceable late-state design direction, see [docs/haskode-rulebook.md](docs/haskode-rulebook.md).
 
 The core loop: load config → build context → call LLM → manage typed tool
 calls → read/edit files → run shell commands → show diffs → record session
@@ -23,18 +22,30 @@ events → repeat.
 
 ```
 haskode/
-├── haskode.cabal          Build configuration
-├── app/Main.hs            CLI entry point (optparse-applicative)
-├── src/Haskode/
-│   ├── Core.hs            Core data types (Role, Message, ToolCall, etc.)
-│   ├── Config.hs          Config loading (haskode.json, defaults)
-│   ├── Provider.hs        LLM provider interface + stub provider
-│   ├── Tools.hs           Tool registry + built-in tools
-│   ├── Policy.hs          Permission gate (allow/deny/ask)
-│   ├── Session.hs         Session event log (JSONL audit trail)
-│   ├── Patch.hs           File patch manager + diff display
-│   └── Agent.hs           The agent loop (conversation state machine)
-└── test/Spec.hs           Test suite (no external framework needed)
+|-- haskode.cabal          Build configuration
+|-- app/Main.hs            CLI entry point (optparse-applicative)
+|-- src/Haskode/
+|   |-- Agent.hs           Agent loop and system-prompt construction
+|   |-- Commands.hs        Slash command registry, status, and doctor output
+|   |-- Config.hs          Config loading, defaults, and env expansion
+|   |-- Core.hs            Core data types (Role, Message, ToolCall, etc.)
+|   |-- Display.hs         CLI display formatting and display-event seam
+|   |-- Extension.hs       Compiled extension record and tool/policy finalization
+|   |-- Extensions.hs      Local compiled extension registration point
+|   |-- Patch.hs           Patch model, diff rendering, path safety, batch helpers
+|   |-- Policy.hs          Permission gate (allow/deny/ask)
+|   |-- Provider.hs        Provider interface plus stub/scripted providers
+|   |-- Provider/
+|   |   |-- Anthropic.hs    Anthropic Messages API provider
+|   |   `-- OpenAI.hs      OpenAI-compatible chat-completions provider
+|   |-- Session.hs         Session event log, summaries, rotation, resume context
+|   |-- Tools.hs           Public tool registry and read/search/shell tools
+|   |-- Tools/
+|   |   `-- FileEdit.hs    Patch, batch patch, and write-file tool implementations
+|   `-- Tui.hs             Experimental isolated Brick TUI wrapper
+`-- test/
+    |-- Spec.hs            No-framework test runner
+    `-- Haskode/Test/      Split focused test modules
 ```
 
 ### Module responsibilities
@@ -42,14 +53,22 @@ haskode/
 | Module | Purpose |
 |---|---|
 | `Haskode.Core` | Shared vocabulary: `Role`, `Message`, `ToolCall`, `ToolResult`, `Conversation` |
-| `Haskode.Config` | Load `haskode.json` / `haskode.jsonc` / `~/.config/haskode/config.json`; fall back to defaults |
+| `Haskode.Config` | Load `haskode.json` / `haskode.jsonc` / `~/.config/haskode/config.json`; parse optional context, session-log, and disabled-tool fields; expand environment variables |
+| `Haskode.Commands` | Pure slash-command registry and formatters for `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit` |
+| `Haskode.Display` | Terminal display formatting plus the small `DisplayEvent` seam consumed by CLI and TUI paths |
+| `Haskode.Extension` | Tiny compiled extension record plus registry and policy finalization helpers for extension tools and policy rules |
+| `Haskode.Extensions` | Empty-by-default local registration point for statically compiled extensions in a fork |
 | `Haskode.Provider` | Record-of-functions interface for LLM backends. Ships `stubProvider` (echo) and `scriptedProvider` (test replay) |
 | `Haskode.Provider.OpenAI` | Real OpenAI-compatible HTTP provider (`/v1/chat/completions`). Works with OpenAI, Ollama, vLLM, LiteLLM, OpenRouter |
-| `Haskode.Tools` | `Tool` type + `ToolRegistry` map. Built-in: `read_file`, `list_files`, `shell`, `glob`, `search`, `preview_patch`, `preview_patch_batch`, `apply_patch`, `apply_patch_batch`, `write_file` |
+| `Haskode.Provider.Anthropic` | Anthropic Messages API provider with native `tool_use` / `tool_result` handling and streaming assembly |
+| `Haskode.Tools` | `Tool` type, `ToolRegistry`, built-in registry, disabled-tool filtering, and read/search/shell tools |
+| `Haskode.Tools.FileEdit` | Internal implementations for `preview_patch`, `apply_patch`, `preview_patch_batch`, `apply_patch_batch`, and `write_file` |
 | `Haskode.Policy` | Composable rules: `Allow`, `Deny`, or `AskUser`. Default policy blocks `rm -rf /` |
-| `Haskode.Session` | In-memory event log flushed to `session.jsonl` for audit trail |
+| `Haskode.Session` | In-memory event log flushed to `session.jsonl`; summaries, rotation, and conservative text-only resume context |
 | `Haskode.Patch` | Represent file changes, show unified diffs, apply/rollback |
 | `Haskode.Agent` | The conversation state machine. Calls provider, processes tool calls, loops |
+| `Haskode.Tui` | Experimental Brick wrapper over the same agent state, command registry, display events, provider path, and session log |
+| `test/Haskode/Test.*` | Split no-framework test modules for config, providers, tools, commands, display, TUI helpers, session/resume, policy, patches, and core data |
 
 ### Design principles
 
@@ -57,7 +76,7 @@ haskode/
 2. **Text, not String** — strict `Text` everywhere for performance
 3. **JSON on the wire** — aeson instances follow the OpenAI chat-completion format
 4. **Conservative policy** — unknown tool calls require user confirmation by default
-5. **No framework** — just Cabal, just Haskell. No Template Haskell, no lens, no effect systems
+5. **No framework in the core** — the reference CLI path stays plain Cabal and plain Haskell. Brick is isolated to the explicit experimental TUI layer; no Template Haskell, no lens, no effect systems
 
 ## Build & run
 
@@ -129,7 +148,7 @@ In interactive mode, the following slash commands are available:
 | `/help` | Show available commands |
 | `/new` | Start a fresh conversation context |
 | `/status` | Show current provider, model, working dir, disabled/available tools, character-based context usage, and runtime info |
-| `/doctor` | Local diagnostic checks (read-only, no provider contact, no shell, no file writes) |
+| `/doctor` | Local diagnostic checks for provider/config, API-key presence, `SYSTEM.md`, `AGENTS.md`, disabled/available tools, and session-log settings. Read-only: no provider contact, no shell, no file writes |
 | `/exit` | Save session log and exit |
 | `/quit` | Same as `/exit` |
 
@@ -158,7 +177,7 @@ Supported in TUI mode:
   confirmation panel. The panel includes the tool name, reason, JSON
   arguments, and plain patch/write/batch preview text when available.
   Press `y` to approve; press `n`, `Esc`, `Enter`, or `Ctrl-C` to reject.
-- `Esc` or `Ctrl-C` exits the TUI cleanly.
+- Outside a confirmation panel, `Esc` or `Ctrl-C` exits the TUI cleanly.
 
 Current TUI limitations:
 
@@ -223,11 +242,12 @@ Anthropic config example:
 |---|---|---|---|
 | `cfgMaxContextChars` | int | `120000` | Conservative context-window limit in characters (~30K tokens). When the estimated conversation size exceeds this, the provider call is blocked with a clear error. |
 | `cfgMaxSessionLogBytes` | int | `5242880` | Maximum session.jsonl file size in bytes (5 MB). When the existing log exceeds this, it is rotated to `session.jsonl.1` before new events are appended. Set to `0` to disable rotation. |
-| `cfgDisabledTools` | array of strings | `[]` | Built-in tool names to remove from the runtime tool registry. Unknown names are a startup error. |
+| `cfgDisabledTools` | array of strings | `[]` | Compiled tool names to remove from the runtime tool registry. Unknown names are a startup error. |
 
-**Disabling built-in tools.**  `cfgDisabledTools` is a plain list of
-built-in tool names. The default is `[]`, which preserves the normal tool
-set. This is only an enable/disable switch for tools already compiled into
+**Disabling compiled tools.**  `cfgDisabledTools` is a plain list of tool
+names compiled into Haskode, including built-ins and any locally registered
+extension tools. The default is `[]`, which preserves the normal tool set.
+This is only an enable/disable switch for tools already compiled into
 Haskode; it is not a plugin system, executable-tool loader, or permission
 framework.
 
@@ -256,6 +276,33 @@ Haskode cannot execute it because the tool is no longer in the registry; the
 execution path reports it as an unknown or disabled tool. Misspelled or
 unknown names in `cfgDisabledTools` fail startup clearly instead of being
 ignored.
+
+### Compiled extensions
+
+Extensions are source-level Haskell additions compiled into Haskode.  They
+contribute tools to the same registry used by built-ins and may contribute
+policy rules for those tools through the same policy gate.  There is no
+runtime extension loader, no config-based code loading, and no external
+executable tool mechanism.
+
+To add a compiled extension in a fork:
+
+1. Create a module (e.g. `MyExtension.hs`) that exports an `Extension`
+   value with a unique name, one or more `Tool`s, and optional `Rule`s
+   for those tools.
+2. Import it in `src/Haskode/Extensions.hs` and add it to the
+   `compiledExtensions` list.
+3. Rebuild with `cabal build all`.
+
+Duplicate extension names and duplicate tool names (across built-ins and
+extensions) are rejected at startup with a clear error.  Extension tools
+use the same provider advertisement, policy confirmation, and session
+logging path as built-ins.  Extension policy rules are appended after the
+built-in/default policy and are scoped to enabled tools contributed by that
+extension.  This keeps built-in hard denials ahead of extension rules,
+prevents disabled extension tools from carrying allow rules, and leaves
+unknown/no-match calls on the existing `AskUser` fallback.  `cfgDisabledTools`
+applies to the final set of compiled tool names (built-ins + extensions).
 
 **Provider names:** `openai`, `ollama`, `vllm`, `litellm`, `openrouter` (all
 OpenAI-compatible HTTP endpoints), `anthropic` (Anthropic Messages API), or
@@ -799,7 +846,7 @@ is not implemented.
 - [ ] Conversation history browsing
 - [ ] Tool call inspector
 - [ ] Config TUI editor
-- [ ] Plugin system for custom tools
+- [x] Compiled extension seam for custom tools
 
 ### Phase 4 — Advanced
 - [ ] Multi-agent orchestration

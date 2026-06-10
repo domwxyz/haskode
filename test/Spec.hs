@@ -10,6 +10,7 @@ import qualified Haskode.Test.Anthropic as Anthropic
 import qualified Haskode.Test.Config   as Config
 import qualified Haskode.Test.Core     as Core
 import qualified Haskode.Test.Display  as Display
+import qualified Haskode.Test.Extension as Extension
 import qualified Haskode.Test.OpenAI   as OpenAI
 import qualified Haskode.Test.Patch    as Patch
 import qualified Haskode.Test.Policy   as Policy
@@ -31,5 +32,6 @@ main = runTests $
   ++ Session.tests
   ++ Commands.tests
   ++ Display.tests
+  ++ Extension.tests
   ++ Tui.tests
   ++ Provider.tests
