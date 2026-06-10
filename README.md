@@ -30,7 +30,7 @@ haskode/
 |   |-- Config.hs          Config loading, defaults, and env expansion
 |   |-- Core.hs            Core data types (Role, Message, ToolCall, etc.)
 |   |-- Display.hs         CLI display formatting and display-event seam
-|   |-- Extension.hs       Compiled extension record and tool/policy finalization
+|   |-- Extension.hs       Compiled extension record and tool/policy/command finalization
 |   |-- Extensions.hs      Local compiled extension registration point
 |   |-- Patch.hs           Patch model, diff rendering, path safety, batch helpers
 |   |-- Policy.hs          Permission gate (allow/deny/ask)
@@ -54,9 +54,9 @@ haskode/
 |---|---|
 | `Haskode.Core` | Shared vocabulary: `Role`, `Message`, `ToolCall`, `ToolResult`, `Conversation` |
 | `Haskode.Config` | Load `haskode.json` / `haskode.jsonc` / `~/.config/haskode/config.json`; parse optional context, session-log, and disabled-tool fields; expand environment variables |
-| `Haskode.Commands` | Pure slash-command registry and formatters for `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit` |
+| `Haskode.Commands` | Pure slash-command registry, extension command contribution shape, and formatters for `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit` |
 | `Haskode.Display` | Terminal display formatting plus the small `DisplayEvent` seam consumed by CLI and TUI paths |
-| `Haskode.Extension` | Tiny compiled extension record plus registry and policy finalization helpers for extension tools and policy rules |
+| `Haskode.Extension` | Tiny compiled extension record plus finalization helpers for extension tools, policy rules, and pure text slash commands |
 | `Haskode.Extensions` | Empty-by-default local registration point for statically compiled extensions in a fork |
 | `Haskode.Provider` | Record-of-functions interface for LLM backends. Ships `stubProvider` (echo) and `scriptedProvider` (test replay) |
 | `Haskode.Provider.OpenAI` | Real OpenAI-compatible HTTP provider (`/v1/chat/completions`). Works with OpenAI, Ollama, vLLM, LiteLLM, OpenRouter |
@@ -153,6 +153,8 @@ In interactive mode, the following slash commands are available:
 | `/quit` | Same as `/exit` |
 
 Unknown slash commands print a short hint.  Anything without a leading `/` is sent to the agent as a normal prompt.
+Forks may compile in additional pure text slash commands through
+`compiledExtensions`; those commands appear in `/help` only when registered.
 
 ### Experimental TUI mode
 
@@ -166,6 +168,8 @@ Supported in TUI mode:
 
 - Submit normal prompts, including the default local `stub` provider path.
 - `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit`.
+- Any compiled pure text extension commands registered in the final command
+  registry.
 - Basic display of assistant replies, tool notices, policy notices, and
   streaming chunks after the synchronous agent turn completes.
 - Transcript scrolling with PageUp/PageDown.
@@ -187,8 +191,8 @@ Current TUI limitations:
   during the agent turn rather than doing live background redraw.
 - The input line has no visual cursor; Ctrl-A/E (home/end) are not supported.
 - The CLI confirmation prompt and colored diff previews are unchanged.
-- The TUI does not include file trees, tabs, workspace browsing, plugin UI,
-  session browsing, a theme engine, or an async job dashboard.
+- The TUI does not include file trees, tabs, workspace browsing, extension
+  management UI, session browsing, a theme engine, or an async job dashboard.
 
 ### Configuration
 
@@ -280,29 +284,41 @@ ignored.
 ### Compiled extensions
 
 Extensions are source-level Haskell additions compiled into Haskode.  They
-contribute tools to the same registry used by built-ins and may contribute
-policy rules for those tools through the same policy gate.  There is no
-runtime extension loader, no config-based code loading, and no external
-executable tool mechanism.
+can contribute tools to the same registry used by built-ins, policy rules
+for those tools through the same policy gate, and pure text slash commands
+through the shared command registry.  There is no runtime extension loader,
+no config-based code loading, no external executable tool mechanism, and no
+external command mechanism.  This is not a runtime plugin system.
 
 To add a compiled extension in a fork:
 
 1. Create a module (e.g. `MyExtension.hs`) that exports an `Extension`
-   value with a unique name, one or more `Tool`s, and optional `Rule`s
-   for those tools.
+   value with a unique name, optional `Tool`s, optional `Rule`s for those
+   tools, and optional pure text `ExtensionCommand`s.
 2. Import it in `src/Haskode/Extensions.hs` and add it to the
    `compiledExtensions` list.
 3. Rebuild with `cabal build all`.
 
 Duplicate extension names and duplicate tool names (across built-ins and
-extensions) are rejected at startup with a clear error.  Extension tools
-use the same provider advertisement, policy confirmation, and session
-logging path as built-ins.  Extension policy rules are appended after the
-built-in/default policy and are scoped to enabled tools contributed by that
-extension.  This keeps built-in hard denials ahead of extension rules,
-prevents disabled extension tools from carrying allow rules, and leaves
-unknown/no-match calls on the existing `AskUser` fallback.  `cfgDisabledTools`
-applies to the final set of compiled tool names (built-ins + extensions).
+extensions) are rejected at startup with a clear error. Duplicate command
+names and aliases (across built-ins, extension commands, and extension
+aliases) are also rejected at startup.
+
+Extension tools use the same provider advertisement, policy confirmation,
+and session logging path as built-ins.  Extension policy rules are appended
+after the built-in/default policy and are scoped to enabled tools contributed
+by that extension.  This keeps built-in hard denials ahead of extension
+rules, prevents disabled extension tools from carrying allow rules, and
+leaves unknown/no-match calls on the existing `AskUser` fallback.
+`cfgDisabledTools` applies to the final set of compiled tool names
+(built-ins + extensions).
+
+Extension commands are deliberately limited for now. They can return pure
+text and may define aliases, but they cannot run IO, mutate `AgentState`,
+inspect tools, call providers, exit or reset the session, add display hooks,
+or load command code from config. CLI and TUI resolve them through the same
+final command registry, and `/help` lists them only when they are compiled
+into `compiledExtensions`.
 
 **Provider names:** `openai`, `ollama`, `vllm`, `litellm`, `openrouter` (all
 OpenAI-compatible HTTP endpoints), `anthropic` (Anthropic Messages API), or
@@ -846,13 +862,12 @@ is not implemented.
 - [ ] Conversation history browsing
 - [ ] Tool call inspector
 - [ ] Config TUI editor
-- [x] Compiled extension seam for custom tools
+- [x] Compiled extension support for custom tools, policy rules, and pure text commands
 
 ### Phase 4 — Advanced
 - [ ] Multi-agent orchestration
 - [ ] Fine-tuning data export from session logs
 - [ ] Local model integration (llama.cpp / GGUF)
-- [ ] MCP server support
 
 ## Philosophy
 

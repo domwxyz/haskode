@@ -8,12 +8,19 @@
 
 module Haskode.Commands
   ( CommandAction (..)
+  , CommandResolution (..)
   , CommandSpec (..)
+  , CommandRegistry
+  , ExtensionCommand (..)
   , DoctorCheck (..)
   , DoctorStatus (..)
   , commandRegistry
+  , mergeExtensionCommands
   , parseSlashCommand
   , lookupCommand
+  , lookupCommandIn
+  , resolveCommandFor
+  , resolveCommandActionFor
   , formatHelpFor
   , formatHelp
   , formatStatus
@@ -26,7 +33,9 @@ module Haskode.Commands
   , doctorChecks
   ) where
 
+import Data.Char          (isSpace)
 import Data.List          (find)
+import qualified Data.Set as Set
 import Data.Text          (Text)
 import qualified Data.Text as T
 import System.Directory   (doesFileExist)
@@ -45,15 +54,29 @@ import Haskode.Tools      (toolNames)
 -- ---------------------------------------------------------------------------
 
 -- | The small set of actions currently supported by slash commands.
---   The CLI dispatches on these tags; a future TUI can handle the
---   same actions without parsing terminal-specific text.
+--   Front ends dispatch on these tags after shared command resolution.
 data CommandAction
   = CmdHelp
   | CmdStatus
   | CmdNew
   | CmdExit
   | CmdDoctor
+  | CmdExtensionText !Text
   deriving (Eq, Show)
+
+-- | Pure text-only command contributed by a compiled extension.
+--
+-- This is intentionally narrow: extension commands can only return static
+-- text.  They cannot run IO, inspect or mutate agent state, call providers,
+-- request exit, or reset the conversation.  Names and aliases are written
+-- without a leading slash; aliases are displayed and resolved like ordinary
+-- slash-command entries.
+data ExtensionCommand = ExtensionCommand
+  { extensionCommandName        :: !Text
+  , extensionCommandAliases     :: ![Text]
+  , extensionCommandDescription :: !Text
+  , extensionCommandOutput      :: !Text
+  } deriving (Eq, Show)
 
 -- | Metadata for one slash command.
 data CommandSpec = CommandSpec
@@ -64,12 +87,23 @@ data CommandSpec = CommandSpec
   , cmdAvailableInTui :: !Bool
   } deriving (Eq, Show)
 
+-- | Result of resolving a parsed slash command for a specific front end.
+--
+-- The resolver keeps command lookup and availability checks pure and shared,
+-- while CLI/TUI layers remain responsible for running effects and rendering.
+data CommandResolution
+  = CommandResolved !CommandSpec
+  | CommandUnknown !Text
+  deriving (Eq, Show)
+
+type CommandRegistry = [CommandSpec]
+
 -- | Registered slash commands.
 --
 -- Keep this small and ordered by help display preference.  @/quit@ is
 -- represented as a separate command that shares the 'CmdExit' action
 -- with @/exit@ so alias behavior stays explicit and easy to test.
-commandRegistry :: [CommandSpec]
+commandRegistry :: CommandRegistry
 commandRegistry =
   [ CommandSpec "help"   "show this help"                    CmdHelp   True True
   , CommandSpec "new"    "start a fresh conversation"         CmdNew    True True
@@ -78,6 +112,50 @@ commandRegistry =
   , CommandSpec "exit"   "save session log and exit"          CmdExit   True True
   , CommandSpec "quit"   "same as /exit"                      CmdExit   True True
   ]
+
+-- | Merge pure text commands contributed by compiled extensions into a
+-- command registry.
+--
+-- Names and aliases share one namespace.  Extension commands cannot replace
+-- built-ins, and two extension commands cannot reuse the same name or alias.
+-- Aliases become ordinary registry entries so @/help@, CLI dispatch, and TUI
+-- dispatch all read the same final registry.
+mergeExtensionCommands :: CommandRegistry -> [ExtensionCommand] -> Either Text CommandRegistry
+mergeExtensionCommands base extensionCommands = do
+  mapM_ validateExtensionCommand extensionCommands
+  case duplicatesInOrder (map cmdName base ++ map cmdName contributedSpecs) of
+    [] -> Right (base ++ contributedSpecs)
+    duplicateNames ->
+      Left $
+        "duplicate compiled command name/alias: "
+        <> T.intercalate ", " duplicateNames
+        <> " (extension commands cannot reuse built-in or extension command names/aliases)"
+  where
+    contributedSpecs = concatMap extensionCommandRegistryEntries extensionCommands
+
+extensionCommandRegistryEntries :: ExtensionCommand -> [CommandSpec]
+extensionCommandRegistryEntries extCommand =
+  [ mkSpec (extensionCommandName extCommand) ] ++ map mkSpec (extensionCommandAliases extCommand)
+  where
+    action = CmdExtensionText (extensionCommandOutput extCommand)
+    mkSpec name =
+      CommandSpec name (extensionCommandDescription extCommand) action True True
+
+validateExtensionCommand :: ExtensionCommand -> Either Text ()
+validateExtensionCommand extCommand = do
+  validateCommandToken "command name" (extensionCommandName extCommand)
+  mapM_ (validateCommandToken "command alias") (extensionCommandAliases extCommand)
+
+validateCommandToken :: Text -> Text -> Either Text ()
+validateCommandToken label token
+  | T.null token =
+      Left ("invalid compiled " <> label <> ": empty")
+  | T.isPrefixOf "/" token =
+      Left ("invalid compiled " <> label <> ": " <> token <> " (omit the leading slash)")
+  | T.any isSpace token =
+      Left ("invalid compiled " <> label <> ": " <> token <> " (whitespace is not allowed)")
+  | otherwise =
+      Right ()
 
 -- ---------------------------------------------------------------------------
 -- Command parsing
@@ -101,19 +179,44 @@ parseSlashCommand input =
 -- | Look up a slash command by command name, without the leading slash.
 lookupCommand :: Text -> Maybe CommandSpec
 lookupCommand name =
-  find (\spec -> cmdName spec == name) commandRegistry
+  lookupCommandIn commandRegistry name
+
+-- | Look up a slash command in the supplied registry.
+lookupCommandIn :: CommandRegistry -> Text -> Maybe CommandSpec
+lookupCommandIn registry name =
+  find (\spec -> cmdName spec == name) registry
+
+-- | Resolve a command name for a front end.
+--
+-- Unregistered commands and commands unavailable to the caller both resolve
+-- as 'CommandUnknown' so visible behavior stays the same.
+resolveCommandFor :: CommandRegistry -> (CommandSpec -> Bool) -> Text -> CommandResolution
+resolveCommandFor registry isAvailable name =
+  case lookupCommandIn registry name of
+    Just spec | isAvailable spec -> CommandResolved spec
+    _                            -> CommandUnknown name
+
+-- | Resolve a command name directly to the action a front end should run.
+--
+-- This keeps lookup and availability checks shared while avoiding duplicated
+-- @CommandSpec@ plumbing in CLI/TUI command dispatch.
+resolveCommandActionFor :: CommandRegistry -> (CommandSpec -> Bool) -> Text -> Either Text CommandAction
+resolveCommandActionFor registry isAvailable name =
+  case resolveCommandFor registry isAvailable name of
+    CommandResolved spec     -> Right (cmdAction spec)
+    CommandUnknown unknown   -> Left unknown
 
 -- ---------------------------------------------------------------------------
 -- Help
 -- ---------------------------------------------------------------------------
 
 -- | Concise help text for interactive mode.
-formatHelpFor :: (CommandSpec -> Bool) -> Text
-formatHelpFor isAvailable =
+formatHelpFor :: CommandRegistry -> (CommandSpec -> Bool) -> Text
+formatHelpFor registry isAvailable =
   T.unlines $
     "Interactive commands:" : map formatCommand commands
   where
-    commands = filter isAvailable commandRegistry
+    commands = filter isAvailable registry
     maxNameWidth = maximum (0 : map (T.length . cmdName) commands)
     formatCommand spec =
       "  /"
@@ -123,7 +226,17 @@ formatHelpFor isAvailable =
       <> cmdDescription spec
 
 formatHelp :: Text
-formatHelp = formatHelpFor cmdAvailableInCli
+formatHelp = formatHelpFor commandRegistry cmdAvailableInCli
+
+duplicatesInOrder :: Ord a => [a] -> [a]
+duplicatesInOrder = go Set.empty Set.empty
+  where
+    go _seen _reported [] = []
+    go seen reported (x:xs)
+      | Set.member x seen && Set.notMember x reported =
+          x : go seen (Set.insert x reported) xs
+      | otherwise =
+          go (Set.insert x seen) reported xs
 
 -- ---------------------------------------------------------------------------
 -- Status

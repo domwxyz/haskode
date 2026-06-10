@@ -5,8 +5,8 @@
 --
 -- This is intentionally small: one transcript, one input line, and one
 -- status/tool area.  The CLI remains the reference path; this module consumes
--- the same command actions and agent display events without parsing terminal
--- rendering.
+-- the same final command registry, command actions, and agent display events
+-- without parsing terminal rendering.
 module Haskode.Tui
   ( runTui
     -- * Pure TUI conversion helpers
@@ -68,14 +68,15 @@ import Haskode.Agent
   )
 import Haskode.Commands
   ( CommandAction (..)
-  , CommandSpec (..)
+  , CommandRegistry
+  , CommandSpec (cmdAvailableInTui)
   , formatDoctor
   , formatHelpFor
   , formatNewConfirmation
   , formatStatus
   , formatUnknownCommand
-  , lookupCommand
   , parseSlashCommand
+  , resolveCommandActionFor
   , resetConversation
   )
 import Haskode.Config     (Config (..), ProviderConfig (..))
@@ -183,8 +184,8 @@ streamChunksToEntry chunks =
        then Nothing
        else Just (TuiEntry TuiAssistantEntry content)
 
-formatTuiHelp :: Text
-formatTuiHelp = formatHelpFor cmdAvailableInTui
+formatTuiHelp :: CommandRegistry -> Text
+formatTuiHelp commands = formatHelpFor commands cmdAvailableInTui
 
 formatTuiStatusLine :: AgentState -> Text
 formatTuiStatusLine st =
@@ -251,6 +252,7 @@ data TuiConfirmationState = TuiConfirmationState
 
 data TuiState = TuiState
   { tuiAgentState   :: !AgentState
+  , tuiCommandRegistry :: !CommandRegistry
   , tuiOutputRef    :: !(IORef [TuiOutput])
   , tuiTranscript   :: ![TuiEntry]
   , tuiInput        :: !Text
@@ -262,10 +264,11 @@ data TuiState = TuiState
 transcriptLimit :: Int
 transcriptLimit = 300
 
-initialTuiState :: IORef [TuiOutput] -> Maybe Text -> AgentState -> TuiState
-initialTuiState ref initialInput state =
+initialTuiState :: IORef [TuiOutput] -> CommandRegistry -> Maybe Text -> AgentState -> TuiState
+initialTuiState ref commands initialInput state =
   TuiState
     { tuiAgentState   = state
+    , tuiCommandRegistry = commands
     , tuiOutputRef    = ref
     , tuiTranscript   =
         [ TuiEntry TuiSystemEntry "Haskode TUI v0. Type /help for commands." ]
@@ -279,15 +282,15 @@ initialTuiState ref initialInput state =
 -- Public runner
 -- ---------------------------------------------------------------------------
 
-runTui :: Maybe Text -> AgentState -> IO AgentState
-runTui initialInput state = do
+runTui :: CommandRegistry -> Maybe Text -> AgentState -> IO AgentState
+runTui commands initialInput state = do
   outputRef <- newIORef []
   previewRef <- newIORef Nothing
   let tuiState = state
         { asDisplay = tuiAgentDisplay outputRef previewRef
         , asApproval = tuiApproval previewRef
         }
-  final <- defaultMain tuiApp (initialTuiState outputRef initialInput tuiState)
+  final <- defaultMain tuiApp (initialTuiState outputRef commands initialInput tuiState)
   pure (tuiAgentState final)
 
 tuiAgentDisplay :: IORef [TuiOutput] -> IORef (Maybe [Text]) -> AgentDisplay
@@ -601,13 +604,12 @@ submitInput st =
 
 submitCommand :: Text -> TuiState -> IO (TuiState, Bool)
 submitCommand cmd st =
-  case lookupCommand cmd of
-    Just spec
-      | cmdAvailableInTui spec ->
-          runTuiCommand (cmdAction spec) st
-    _ ->
+  case resolveCommandActionFor (tuiCommandRegistry st) cmdAvailableInTui cmd of
+    Right action ->
+      runTuiCommand action st
+    Left unknown ->
       pure
-        ( (appendEntry (TuiEntry TuiSystemEntry (formatUnknownCommand cmd)) st)
+        ( (appendEntry (TuiEntry TuiSystemEntry (formatUnknownCommand unknown)) st)
             { tuiStatus = "Unknown command." }
         , False
         )
@@ -617,7 +619,7 @@ runTuiCommand action st =
   case action of
     CmdHelp ->
       pure
-        ( (appendEntry (TuiEntry TuiSystemEntry formatTuiHelp) st)
+        ( (appendEntry (TuiEntry TuiSystemEntry (formatTuiHelp (tuiCommandRegistry st))) st)
             { tuiStatus = "Help displayed." }
         , False
         )
@@ -651,6 +653,12 @@ runTuiCommand action st =
         ( (appendEntry (TuiEntry TuiSystemEntry "Goodbye.") st)
             { tuiStatus = "Exiting." }
         , True
+        )
+    CmdExtensionText output ->
+      pure
+        ( (appendEntry (TuiEntry TuiSystemEntry output) st)
+            { tuiStatus = "Command displayed." }
+        , False
         )
 
 submitPrompt :: Text -> TuiState -> IO (TuiState, Bool)

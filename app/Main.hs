@@ -34,11 +34,11 @@ import System.Exit        (exitFailure, exitSuccess)
 import System.FilePath    ((</>))
 import System.IO          (hFlush, stdout, hSetBuffering, stdin, BufferMode (..))
 
-import Haskode.Commands        (CommandAction (..), CommandSpec (..), parseSlashCommand, lookupCommand,
-                                formatHelp, formatStatus, formatDoctor, formatUnknownCommand, formatNewConfirmation, resetConversation)
+import Haskode.Commands        (CommandAction (..), CommandRegistry, CommandSpec (cmdAvailableInCli), parseSlashCommand, resolveCommandActionFor,
+                                formatHelpFor, formatStatus, formatDoctor, formatUnknownCommand, formatNewConfirmation, resetConversation)
 import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig, loadConfigFrom)
 import Haskode.Display         (formatVerbose)
-import Haskode.Extension       (buildFinalRuntime)
+import Haskode.Extension       (buildFinalCommandRegistry, buildFinalRuntime)
 import Haskode.Extensions      (compiledExtensions)
 import Haskode.Provider        (Provider, stubProvider)
 import Haskode.Provider.Anthropic (anthropicProvider)
@@ -144,7 +144,7 @@ main = do
   opts' <- execParser opts
   cfg   <- maybe loadConfig loadConfigFrom (optConfig opts')
   let cfg' = applyOverrides cfg opts'
-  (registry, policy) <- resolveRuntime cfg'
+  (registry, policy, commands) <- resolveRuntime cfg'
 
   handleShowSession cfg' opts'
   unless (optTui opts') printBanner
@@ -153,7 +153,7 @@ main = do
   unless (optTui opts') (printVerboseInfo cfg' opts')
 
   state <- loadInitialState cfg' prov registry policy (optResume opts')
-  runSelectedMode opts' state
+  runSelectedMode commands opts' state
 
 -- ---------------------------------------------------------------------------
 -- Startup-phase helpers
@@ -193,14 +193,20 @@ printVerboseInfo cfg' opts' =
     putStrLn $ formatVerbose "base url" (pcBaseUrl pc)
     putStrLn ""
 
--- | Build the runtime tool registry and policy from config.
+-- | Build the runtime tool registry, policy, and command registry from config.
 --
 -- A misspelled disabled-tool name is a config error: failing clearly is
--- safer than silently leaving a tool enabled.
-resolveRuntime :: Config -> IO (ToolRegistry, Policy)
+-- safer than silently leaving a tool enabled.  Compiled extension command
+-- collisions fail in the same startup phase before any interactive mode runs.
+resolveRuntime :: Config -> IO (ToolRegistry, Policy, CommandRegistry)
 resolveRuntime cfg' =
   case buildFinalRuntime defaultPolicy compiledExtensions (cfgDisabledTools cfg') of
-    Right runtime -> pure runtime
+    Right (registry, policy) ->
+      case buildFinalCommandRegistry compiledExtensions of
+        Right commands -> pure (registry, policy, commands)
+        Left err -> do
+          TIO.putStrLn ("Error: " <> err)
+          exitFailure
     Left err -> do
       TIO.putStrLn ("Error: " <> err)
       exitFailure
@@ -238,11 +244,11 @@ loadInitialState cfg' prov registry policy resumed = do
 
 -- | Dispatch to single-shot or interactive mode.
 --   Flushes the session log on normal exit.
-runSelectedMode :: Options -> AgentState -> IO ()
-runSelectedMode opts' state =
+runSelectedMode :: CommandRegistry -> Options -> AgentState -> IO ()
+runSelectedMode commands opts' state =
   if optTui opts'
     then do
-      finalState <- runTui (optPrompt opts') state
+      finalState <- runTui commands (optPrompt opts') state
       stateEnd <- recordSessionEnd finalState
       flushSession stateEnd
     else case optPrompt opts' of
@@ -251,7 +257,7 @@ runSelectedMode opts' state =
         stateEnd <- recordSessionEnd state'
         flushSession stateEnd
       Nothing -> do
-        finalState <- interactiveLoop state
+        finalState <- interactiveLoop commands state
         stateEnd <- recordSessionEnd finalState
         flushSession stateEnd
 
@@ -353,8 +359,8 @@ applyOverrides cfg opts' = cfg
 --   The loop body is wrapped with 'flushLogOnException' so that an
 --   unexpected EOF (or other stdin IO failure) flushes the accumulated
 --   session events before the exception propagates.
-interactiveLoop :: AgentState -> IO AgentState
-interactiveLoop state = do
+interactiveLoop :: CommandRegistry -> AgentState -> IO AgentState
+interactiveLoop commands state = do
   hSetBuffering stdin LineBuffering
   putStr "You: "
   hFlush stdout
@@ -364,42 +370,41 @@ interactiveLoop state = do
     input <- TIO.getLine
     case parseSlashCommand input of
       Just cmd ->
-        case lookupCommand cmd of
-          Just spec
-            | cmdAvailableInCli spec ->
-                runCliCommand (cmdAction spec) state
-          Nothing -> do
-            TIO.putStrLn (formatUnknownCommand cmd)
-            interactiveLoop state
-          _ -> do
-            TIO.putStrLn (formatUnknownCommand cmd)
-            interactiveLoop state
+        case resolveCommandActionFor commands cmdAvailableInCli cmd of
+          Right commandAction ->
+            runCliCommand commands commandAction state
+          Left unknown -> do
+            TIO.putStrLn (formatUnknownCommand unknown)
+            interactiveLoop commands state
       Nothing -> do
         state' <- runAgentSafe state input
-        interactiveLoop state'
+        interactiveLoop commands state'
 
 -- | Execute a parsed slash-command action in the CLI loop.
-runCliCommand :: CommandAction -> AgentState -> IO AgentState
-runCliCommand commandAction state =
+runCliCommand :: CommandRegistry -> CommandAction -> AgentState -> IO AgentState
+runCliCommand commands commandAction state =
   case commandAction of
     CmdExit -> do
       putStrLn "Goodbye!"
       pure state
     CmdHelp -> do
-      TIO.putStr formatHelp
-      interactiveLoop state
+      TIO.putStr (formatHelpFor commands cmdAvailableInCli)
+      interactiveLoop commands state
     CmdStatus -> do
       TIO.putStr (formatStatus state)
-      interactiveLoop state
+      interactiveLoop commands state
     CmdDoctor -> do
       output <- formatDoctor state
       TIO.putStr output
-      interactiveLoop state
+      interactiveLoop commands state
     CmdNew -> do
       TIO.putStrLn formatNewConfirmation
       let state1 = resetConversation state
       state2 <- recordConversationReset state1
-      interactiveLoop state2
+      interactiveLoop commands state2
+    CmdExtensionText output -> do
+      TIO.putStrLn output
+      interactiveLoop commands state
 
 -- | Run the agent with exception-safe session flush.
 --   On exception the current session log is flushed before re-throwing.

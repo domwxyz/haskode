@@ -90,7 +90,7 @@ testFormatTuiHelpUsesRegistry =
       missing =
         [ "/" <> cmdName spec
         | spec <- tuiCommands
-        , not (T.isInfixOf ("/" <> cmdName spec) formatTuiHelp)
+        , not (T.isInfixOf ("/" <> cmdName spec) (formatTuiHelp commandRegistry))
         ]
   in if null missing
        then pure $ Right ()

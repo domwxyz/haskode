@@ -1,18 +1,22 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE OverloadedStrings  #-}
 
--- | Source-level extension seam.
+-- | Compiled extension support.
 --
 -- Extensions are ordinary Haskell values compiled into Haskode.  They can
--- contribute tools and policy rules to the same paths used by built-ins;
--- there is no dynamic loading, no separate extension runtime, and no
--- provider extension surface.
+-- contribute exactly three startup surfaces: tools, policy rules for those
+-- tools, and pure text slash commands.  There is no dynamic loading, no
+-- runtime plugin system, and no provider extension surface.
 --
 -- Register extensions in "Haskode.Extensions".
 module Haskode.Extension
-  ( Extension (..)
+  ( -- * Extension values
+    Extension (..)
+  , ExtensionCommand (..)
+    -- * Startup finalization
   , mergeExtensionTools
   , buildFinalToolRegistry
+  , buildFinalCommandRegistry
   , buildFinalPolicy
   , buildFinalRuntime
   ) where
@@ -23,6 +27,12 @@ import qualified Data.Set as Set
 import Data.Text        (Text)
 import qualified Data.Text as T
 
+import Haskode.Commands
+  ( CommandRegistry
+  , ExtensionCommand (..)
+  , commandRegistry
+  , mergeExtensionCommands
+  )
 import Haskode.Core
   ( ToolCall (..)
   )
@@ -40,14 +50,16 @@ import Haskode.Policy
 
 -- | A statically compiled Haskode extension.
 --
--- Each extension has a unique name, a human-readable description, and a
--- list of tools and policy rules it contributes.  Tool names are global:
--- they cannot collide with built-in tools or tools from other extensions.
+-- Each extension has a unique name, a human-readable description, and lists
+-- of tools, policy rules, and pure text slash commands it contributes.  Tool
+-- names and command names/aliases are global: they cannot collide with
+-- built-ins or contributions from other extensions.
 data Extension = Extension
   { extensionName        :: !Text   -- ^ Unique extension identifier (for error messages)
   , extensionDescription :: !Text   -- ^ Human-readable description
   , extensionTools       :: ![Tool] -- ^ Tools contributed by this extension
   , extensionPolicyRules :: ![Rule] -- ^ Policy rules for this extension's enabled tools
+  , extensionCommands    :: ![ExtensionCommand] -- ^ Pure text slash commands
   }
 
 instance Show Extension where
@@ -60,7 +72,9 @@ instance Show Extension where
     ++ show (extensionTools ext)
     ++ ", extensionPolicyRules = "
     ++ show (length (extensionPolicyRules ext))
-    ++ " rule(s) }"
+    ++ " rule(s), extensionCommands = "
+    ++ show (length (extensionCommands ext))
+    ++ " command(s) }"
 
 -- | Merge extension tools into a base registry.
 --
@@ -94,6 +108,17 @@ buildFinalToolRegistry :: [Extension] -> [Text] -> Either Text ToolRegistry
 buildFinalToolRegistry extensions disabledTools = do
   merged <- mergeExtensionTools defaultRegistry extensions
   disableTools disabledTools merged
+
+-- | Build the final command registry for startup.
+--
+-- Extension commands are pure text-only slash commands.  They are merged into
+-- the same registry used by built-ins, so CLI and TUI resolve the same command
+-- names to the same meaning.  Command aliases are materialized as normal
+-- registry entries so lookup and @/help@ visibility stay on one path.
+buildFinalCommandRegistry :: [Extension] -> Either Text CommandRegistry
+buildFinalCommandRegistry extensions = do
+  rejectDuplicateExtensionNames extensions
+  mergeExtensionCommands commandRegistry (concatMap extensionCommands extensions)
 
 -- | Build the final policy used by the agent.
 --

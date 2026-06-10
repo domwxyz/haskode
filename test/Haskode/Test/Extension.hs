@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Tests for the compiled extension seam.
+-- | Tests for compiled extension support.
 module Haskode.Test.Extension (tests) where
 
 import Data.Aeson (KeyValue ((.=)), Value (..), object)
@@ -15,6 +15,15 @@ import Haskode.Agent
   , initState
   , runAgent
   )
+import Haskode.Commands
+  ( CommandAction (..)
+  , CommandSpec (..)
+  , ExtensionCommand (..)
+  , commandRegistry
+  , formatHelp
+  , formatHelpFor
+  , resolveCommandActionFor
+  )
 import Haskode.Config (defaultConfig)
 import Haskode.Core
   ( ToolCall (..)
@@ -23,6 +32,7 @@ import Haskode.Core
   )
 import Haskode.Extension
   ( Extension (..)
+  , buildFinalCommandRegistry
   , buildFinalToolRegistry
   , buildFinalRuntime
   )
@@ -69,6 +79,24 @@ extensionWithRules extName contributedToolName rules = Extension
   , extensionDescription = "test extension"
   , extensionTools = [extensionTool contributedToolName]
   , extensionPolicyRules = rules
+  , extensionCommands = []
+  }
+
+extensionTextCommand :: T.Text -> [T.Text] -> T.Text -> T.Text -> ExtensionCommand
+extensionTextCommand name aliases description output = ExtensionCommand
+  { extensionCommandName = name
+  , extensionCommandAliases = aliases
+  , extensionCommandDescription = description
+  , extensionCommandOutput = output
+  }
+
+extensionWithCommand :: T.Text -> ExtensionCommand -> Extension
+extensionWithCommand extName command = Extension
+  { extensionName = extName
+  , extensionDescription = "test command extension"
+  , extensionTools = []
+  , extensionPolicyRules = []
+  , extensionCommands = [command]
   }
 
 testEmptyExtensionsPreserveBuiltins :: Test
@@ -92,6 +120,29 @@ testDefaultCompiledExtensionsPreserveStartupRegistry =
           ++ show (length compiledExtensions)
           ++ " tools="
           ++ show (toolNames reg)
+
+testEmptyExtensionsPreserveCommandRegistry :: Test
+testEmptyExtensionsPreserveCommandRegistry =
+  case buildFinalCommandRegistry [] of
+    Left err -> pure $ Left $ "empty command extension registry failed: " ++ T.unpack err
+    Right reg
+      | reg == commandRegistry
+        && formatHelpFor reg cmdAvailableInCli == formatHelp ->
+          pure $ Right ()
+      | otherwise -> pure $ Left "empty extensions changed command registry/help behavior"
+
+testDefaultCompiledExtensionsPreserveStartupCommands :: Test
+testDefaultCompiledExtensionsPreserveStartupCommands =
+  case buildFinalCommandRegistry compiledExtensions of
+    Left err -> pure $ Left $ "default compiled command registry failed: " ++ T.unpack err
+    Right reg
+      | null compiledExtensions && reg == commandRegistry ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $
+          "default startup command registry changed: extensions="
+          ++ show (length compiledExtensions)
+          ++ " commands="
+          ++ show (map cmdName reg)
 
 testEmptyExtensionsPreservePolicyBehavior :: Test
 testEmptyExtensionsPreservePolicyBehavior =
@@ -307,6 +358,122 @@ testBuiltInDisabledToolStillWorks =
         else pure $ Left $
           "built-in disabled-tool behavior changed: " ++ show (toolNames reg)
 
+testExtensionTextCommandResolves :: Test
+testExtensionTextCommandResolves =
+  let output = "hello from extension"
+      ext = extensionWithCommand "local"
+        (extensionTextCommand "hello_ext" [] "say hello" output)
+  in case buildFinalCommandRegistry [ext] of
+    Left err -> pure $ Left $ "extension command registry failed: " ++ T.unpack err
+    Right reg ->
+      case resolveCommandActionFor reg cmdAvailableInCli "hello_ext" of
+        Right (CmdExtensionText text)
+          | text == output -> pure $ Right ()
+        other -> pure $ Left $
+          "extension command should resolve to pure text, got: " ++ show other
+
+testExtensionTextCommandAppearsInHelp :: Test
+testExtensionTextCommandAppearsInHelp =
+  let ext = extensionWithCommand "local"
+        (extensionTextCommand "hello_ext" ["he"] "say hello" "hello")
+  in case buildFinalCommandRegistry [ext] of
+    Left err -> pure $ Left $ "extension command registry failed: " ++ T.unpack err
+    Right reg ->
+      let out = formatHelpFor reg cmdAvailableInCli
+      in if "/hello_ext" `T.isInfixOf` out
+            && "/he" `T.isInfixOf` out
+            && "say hello" `T.isInfixOf` out
+           then pure $ Right ()
+           else pure $ Left $ "extension command missing from help: " ++ T.unpack out
+
+testDuplicateCommandNameWithBuiltInFails :: Test
+testDuplicateCommandNameWithBuiltInFails =
+  let ext = extensionWithCommand "local"
+        (extensionTextCommand "help" [] "bad duplicate" "no")
+  in case buildFinalCommandRegistry [ext] of
+    Left err
+      | "duplicate compiled command name/alias: help" `T.isInfixOf` err ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "duplicate command name error unclear: " ++ T.unpack err
+    Right reg -> pure $ Left $
+      "extension command should not replace built-in, got: " ++ show (map cmdName reg)
+
+testDuplicateCommandAliasWithBuiltInFails :: Test
+testDuplicateCommandAliasWithBuiltInFails =
+  let ext = extensionWithCommand "local"
+        (extensionTextCommand "hello_ext" ["status"] "bad duplicate" "no")
+  in case buildFinalCommandRegistry [ext] of
+    Left err
+      | "duplicate compiled command name/alias: status" `T.isInfixOf` err ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "duplicate command alias error unclear: " ++ T.unpack err
+    Right reg -> pure $ Left $
+      "extension alias should not replace built-in, got: " ++ show (map cmdName reg)
+
+testDuplicateCommandNamesBetweenExtensionsFail :: Test
+testDuplicateCommandNamesBetweenExtensionsFail =
+  let ext1 = extensionWithCommand "one"
+        (extensionTextCommand "same_ext" [] "one" "one")
+      ext2 = extensionWithCommand "two"
+        (extensionTextCommand "same_ext" [] "two" "two")
+  in case buildFinalCommandRegistry [ext1, ext2] of
+    Left err
+      | "duplicate compiled command name/alias: same_ext" `T.isInfixOf` err ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "duplicate extension command error unclear: " ++ T.unpack err
+    Right reg -> pure $ Left $
+      "duplicate extension command names should fail, got: " ++ show (map cmdName reg)
+
+testDuplicateCommandAliasesBetweenExtensionsFail :: Test
+testDuplicateCommandAliasesBetweenExtensionsFail =
+  let ext1 = extensionWithCommand "one"
+        (extensionTextCommand "one_ext" ["shared_ext"] "one" "one")
+      ext2 = extensionWithCommand "two"
+        (extensionTextCommand "two_ext" ["shared_ext"] "two" "two")
+  in case buildFinalCommandRegistry [ext1, ext2] of
+    Left err
+      | "duplicate compiled command name/alias: shared_ext" `T.isInfixOf` err ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "duplicate extension alias error unclear: " ++ T.unpack err
+    Right reg -> pure $ Left $
+      "duplicate extension command aliases should fail, got: " ++ show (map cmdName reg)
+
+testCliAndTuiResolveExtensionCommandSameWay :: Test
+testCliAndTuiResolveExtensionCommandSameWay =
+  let ext = extensionWithCommand "local"
+        (extensionTextCommand "hello_ext" [] "say hello" "same output")
+  in case buildFinalCommandRegistry [ext] of
+    Left err -> pure $ Left $ "extension command registry failed: " ++ T.unpack err
+    Right reg ->
+      case ( resolveCommandActionFor reg cmdAvailableInCli "hello_ext"
+           , resolveCommandActionFor reg cmdAvailableInTui "hello_ext"
+           ) of
+        (Right (CmdExtensionText cliOut), Right (CmdExtensionText tuiOut))
+          | cliOut == tuiOut -> pure $ Right ()
+        resolved -> pure $ Left $
+          "CLI/TUI should resolve extension command identically, got: " ++ show resolved
+
+testBuiltInCommandActionsUnchangedInFinalRegistry :: Test
+testBuiltInCommandActionsUnchangedInFinalRegistry =
+  case buildFinalCommandRegistry [] of
+    Left err -> pure $ Left $ "empty command registry failed: " ++ T.unpack err
+    Right reg ->
+      let expected =
+            [ ("new", CmdNew)
+            , ("exit", CmdExit)
+            , ("quit", CmdExit)
+            , ("status", CmdStatus)
+            , ("doctor", CmdDoctor)
+            ]
+          mismatches =
+            [ (name, action, resolveCommandActionFor reg cmdAvailableInCli name)
+            | (name, action) <- expected
+            , resolveCommandActionFor reg cmdAvailableInCli name /= Right action
+            ]
+      in if null mismatches
+           then pure $ Right ()
+           else pure $ Left $ "built-in command actions changed: " ++ show mismatches
+
 openAIToolNames :: [Value] -> [T.Text]
 openAIToolNames toolValues =
   [ name
@@ -343,6 +510,8 @@ tests :: [Test]
 tests =
   [ testEmptyExtensionsPreserveBuiltins
   , testDefaultCompiledExtensionsPreserveStartupRegistry
+  , testEmptyExtensionsPreserveCommandRegistry
+  , testDefaultCompiledExtensionsPreserveStartupCommands
   , testEmptyExtensionsPreservePolicyBehavior
   , testExtensionWithNoPolicyRulesPreservesPolicyBehavior
   , testExtensionPolicyRuleCanAllowTool
@@ -359,4 +528,12 @@ tests =
   , testDisabledExtensionToolNotAdvertised
   , testDisabledExtensionToolCannotExecute
   , testBuiltInDisabledToolStillWorks
+  , testExtensionTextCommandResolves
+  , testExtensionTextCommandAppearsInHelp
+  , testDuplicateCommandNameWithBuiltInFails
+  , testDuplicateCommandAliasWithBuiltInFails
+  , testDuplicateCommandNamesBetweenExtensionsFail
+  , testDuplicateCommandAliasesBetweenExtensionsFail
+  , testCliAndTuiResolveExtensionCommandSameWay
+  , testBuiltInCommandActionsUnchangedInFinalRegistry
   ]

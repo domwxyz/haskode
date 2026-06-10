@@ -11,13 +11,17 @@ import Haskode.Agent
       initState )
 import Haskode.Commands
     ( CommandAction(..),
+      CommandResolution(..),
       CommandSpec(..),
       DoctorCheck(..),
       DoctorStatus(..),
       commandRegistry,
       parseSlashCommand,
       lookupCommand,
+      resolveCommandFor,
+      resolveCommandActionFor,
       formatHelp,
+      formatHelpFor,
       formatStatus,
       formatUnknownCommand,
       formatNewConfirmation,
@@ -82,6 +86,12 @@ testParseSlashCommandWhitespace =
     then pure $ Right ()
     else pure $ Left "parseSlashCommand \"  /help  \" should be Just \"help\""
 
+testParseSlashCommandMixedWhitespace :: Test
+testParseSlashCommandMixedWhitespace =
+  if parseSlashCommand "\t/status \n" == Just "status"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand should trim mixed leading/trailing whitespace"
+
 testParseSlashCommandEmpty :: Test
 testParseSlashCommandEmpty =
   if parseSlashCommand "" == Nothing
@@ -126,6 +136,36 @@ testLookupCommandUnknown =
     then pure $ Right ()
     else pure $ Left "lookupCommand should return Nothing for unknown commands"
 
+testResolveCommandForAvailable :: Test
+testResolveCommandForAvailable =
+  case resolveCommandFor commandRegistry cmdAvailableInCli "help" of
+    CommandResolved spec | cmdAction spec == CmdHelp -> pure $ Right ()
+    other -> pure $ Left $ "resolveCommandFor should resolve available /help, got: " ++ show other
+
+testResolveCommandForUnknown :: Test
+testResolveCommandForUnknown =
+  if resolveCommandFor commandRegistry cmdAvailableInCli "missing" == CommandUnknown "missing"
+    then pure $ Right ()
+    else pure $ Left "resolveCommandFor should return CommandUnknown for missing commands"
+
+testResolveCommandForUnavailable :: Test
+testResolveCommandForUnavailable =
+  if resolveCommandFor commandRegistry (const False) "help" == CommandUnknown "help"
+    then pure $ Right ()
+    else pure $ Left "resolveCommandFor should hide unavailable commands as unknown"
+
+testResolveCommandActionForQuitAlias :: Test
+testResolveCommandActionForQuitAlias =
+  if resolveCommandActionFor commandRegistry cmdAvailableInCli "quit" == Right CmdExit
+    then pure $ Right ()
+    else pure $ Left "resolveCommandActionFor should map /quit to CmdExit"
+
+testResolveCommandActionForUnknown :: Test
+testResolveCommandActionForUnknown =
+  if resolveCommandActionFor commandRegistry cmdAvailableInCli "missing" == Left "missing"
+    then pure $ Right ()
+    else pure $ Left "resolveCommandActionFor should preserve unknown command text"
+
 testQuitAliasesExitAction :: Test
 testQuitAliasesExitAction =
   case (lookupCommand "exit", lookupCommand "quit") of
@@ -161,6 +201,30 @@ testFormatHelpLineCountMatchesRegistry =
          ++ " help lines vs "
          ++ show (length cliCommands)
          ++ " registered CLI commands"
+
+testFormatHelpIncludesRegisteredDescriptions :: Test
+testFormatHelpIncludesRegisteredDescriptions =
+  let cliCommands = filter cmdAvailableInCli commandRegistry
+      missing =
+        [ "/" <> cmdName spec <> " description: " <> cmdDescription spec
+        | spec <- cliCommands
+        , not (T.isInfixOf (cmdDescription spec) formatHelp)
+        ]
+  in if null missing
+       then pure $ Right ()
+       else pure $ Left $
+         "formatHelp missing registered descriptions: "
+         ++ T.unpack (T.intercalate ", " missing)
+
+testFormatHelpForFiltersUnavailableCommands :: Test
+testFormatHelpForFiltersUnavailableCommands =
+  let out = formatHelpFor commandRegistry (const False)
+      commandLines = filter (T.isInfixOf "  /") (T.lines out)
+  in if null commandLines
+       then pure $ Right ()
+       else pure $ Left $
+         "formatHelpFor should not include unavailable commands: "
+         ++ T.unpack (T.intercalate "\n" commandLines)
 
 testFormatStatusContent :: Test
 testFormatStatusContent =
@@ -528,11 +592,17 @@ tests =
   , testParseSlashCommandUnknown
   , testParseSlashCommandNormalInput
   , testParseSlashCommandWhitespace
+  , testParseSlashCommandMixedWhitespace
   , testParseSlashCommandEmpty
   , testParseSlashCommandSpacesOnly
   , testParseSlashCommandNew
   , testLookupCommandKnownActions
   , testLookupCommandUnknown
+  , testResolveCommandForAvailable
+  , testResolveCommandForUnknown
+  , testResolveCommandForUnavailable
+  , testResolveCommandActionForQuitAlias
+  , testResolveCommandActionForUnknown
   , testLookupCommandDoctor
   , testQuitAliasesExitAction
   , testFormatHelpContent
@@ -540,6 +610,8 @@ tests =
   , testFormatHelpIncludesDoctor
   , testFormatHelpIncludesEveryRegisteredCliCommand
   , testFormatHelpLineCountMatchesRegistry
+  , testFormatHelpIncludesRegisteredDescriptions
+  , testFormatHelpForFiltersUnavailableCommands
   , testFormatStatusContent
   , testFormatStatusNoApiKey
   , testFormatStatusVerboseOff
