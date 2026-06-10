@@ -42,11 +42,13 @@
 --
 -- The API key is resolved in this order:
 --
---   1. The @OPENAI_API_KEY@ environment variable (if set and non-empty)
---   2. The @pcApiKey@ field from 'ProviderConfig'
+--   1. An explicit CLI override, when passed through by the caller
+--   2. The @OPENAI_API_KEY@ environment variable (if set and non-empty)
+--   3. The @pcApiKey@ field from 'ProviderConfig'
 --
--- If neither is available, 'openaiProvider' returns @Left@ with a
--- helpful error message.
+-- @ollama@ and @vllm@ do not require an API key by default.  Hosted
+-- and proxy providers fail fast with a helpful error when no key is
+-- available.
 --
 -- = Limitations (Phase 1)
 --
@@ -56,6 +58,9 @@
 module Haskode.Provider.OpenAI
   ( -- * Provider constructor
     openaiProvider
+  , openaiProviderWithApiKeyOverride
+  , resolveOpenAICompatibleApiKey
+  , openAICompatibleRequiresApiKey
     -- * Request building (exported for testing)
   , buildRequestBody
   , buildStreamingRequestBody
@@ -99,7 +104,7 @@ import Network.HTTP.Client      (BodyReader, Manager, RequestBody (..),
                                  responseStatus, withResponse,
                                  brRead)
 import Network.HTTP.Client.TLS  (tlsManagerSettings)
-import Network.HTTP.Types       (statusCode)
+import Network.HTTP.Types       (RequestHeaders, statusCode)
 import System.Environment       (lookupEnv)
 
 import Haskode.Config           (Config (..), ProviderConfig (..),
@@ -120,8 +125,8 @@ import Haskode.Tools            (Tool (..), ToolRegistry, toolNames, lookupTool)
 --   need to catch them can use @Control.Exception.try@.
 data OpenAIError
   = MissingApiKey
-    -- ^ Neither the @OPENAI_API_KEY@ env var nor the config's
-    --   @pcApiKey@ field contained a key.
+    -- ^ A provider that requires an API key had no CLI override,
+    --   @OPENAI_API_KEY@, or config @pcApiKey@ value.
   | HttpError Int LBS.ByteString
     -- ^ The API returned a non-2xx status code.  Fields are
     --   @(statusCode, responseBody)@.
@@ -157,32 +162,32 @@ instance Exception OpenAIError
 --     Right prov -> -- use prov with the agent loop
 -- @
 openaiProvider :: Config -> ToolRegistry -> IO (Either String Provider)
-openaiProvider cfg reg = do
-  -- Resolve the API key: env var takes precedence over config file.
-  -- This is resolved once at construction time so the provider fails
-  -- fast if the key is missing, rather than on the first request.
-  mEnvKey <- lookupEnv "OPENAI_API_KEY"
-  let configKey = pcApiKey (cfgProvider cfg)
-      mKey      = case mEnvKey of
-                    Just k  | not (null k) -> Just k
-                    _                      -> case configKey of
-                                               "" -> Nothing
-                                               k  -> Just k
+openaiProvider = openaiProviderWithApiKeyOverride Nothing
 
-  case mKey of
-    Nothing -> pure $ Left
-      "OpenAI API key not found. Set OPENAI_API_KEY or pcApiKey in config."
-    Just apiKey -> do
+-- | Create an OpenAI-compatible provider with an optional explicit API
+-- key override from the CLI.  The override is separate from @pcApiKey@
+-- so @--api-key@ can honestly outrank @OPENAI_API_KEY@.
+openaiProviderWithApiKeyOverride :: Maybe String -> Config -> ToolRegistry -> IO (Either String Provider)
+openaiProviderWithApiKeyOverride mCliKey cfg reg = do
+  mEnvKey <- lookupEnv "OPENAI_API_KEY"
+  let pc         = cfgProvider cfg
+      provider   = pcProvider pc
+      configKey  = pcApiKey pc
+      keyResult  = resolveOpenAICompatibleApiKey provider mCliKey mEnvKey configKey
+
+  case keyResult of
+    Left err -> pure $ Left err
+    Right apiKey -> do
       -- Create a TLS-capable HTTP manager.  This is reused across
       -- requests so TCP connections can be kept alive.
       mgr <- newManager tlsManagerSettings
 
       -- Build the base URL once.  The endpoint path is appended in
       -- each request.
-      let baseUrl    = pcBaseUrl (cfgProvider cfg) ++ "/v1/chat/completions"
-          model'     = T.pack (pcModel (cfgProvider cfg))
+      let baseUrl    = pcBaseUrl pc ++ "/v1/chat/completions"
+          model'     = T.pack (pcModel pc)
           maxTok     = cfgMaxTokens cfg
-          tokenField = tokenLimitFieldName (cfgProvider cfg)
+          tokenField = tokenLimitFieldName pc
 
       -- Use an IORef to hold the latest ToolRegistry so the provider
       -- can include tool definitions in each request.  It is
@@ -190,7 +195,7 @@ openaiProvider cfg reg = do
       regRef <- newIORef reg
 
       pure $ Right Provider
-        { providerName = "openai"
+        { providerName = T.pack provider
         , providerComplete = \req -> do
             reg' <- readIORef regRef
             let body = buildRequestBody tokenField (crMessages req) model' maxTok reg'
@@ -202,6 +207,40 @@ openaiProvider cfg reg = do
             sendRequestStreaming mgr baseUrl (T.pack apiKey) body handler
         }
 
+-- | Whether an OpenAI-compatible provider requires a key before startup.
+--
+-- Local development servers commonly run without auth; hosted services and
+-- proxies should fail clearly rather than sending anonymous requests.
+openAICompatibleRequiresApiKey :: String -> Bool
+openAICompatibleRequiresApiKey provider =
+  provider `notElem` ["ollama", "vllm"]
+
+-- | Resolve an OpenAI-compatible API key.
+--
+-- Precedence:
+--
+--   1. explicit CLI key
+--   2. @OPENAI_API_KEY@
+--   3. config @pcApiKey@
+--
+-- Providers that do not require auth return an empty key when no source is
+-- available; the HTTP transport then omits the Authorization header.
+resolveOpenAICompatibleApiKey :: String -> Maybe String -> Maybe String -> String
+                              -> Either String String
+resolveOpenAICompatibleApiKey provider mCliKey mEnvKey configKey =
+  case firstNonEmpty [mCliKey, mEnvKey, Just configKey] of
+    Just key -> Right key
+    Nothing
+      | openAICompatibleRequiresApiKey provider ->
+          Left $ provider ++ " API key not found. Set OPENAI_API_KEY, pcApiKey in config, or --api-key."
+      | otherwise -> Right ""
+  where
+    firstNonEmpty :: [Maybe String] -> Maybe String
+    firstNonEmpty [] = Nothing
+    firstNonEmpty (Nothing : rest) = firstNonEmpty rest
+    firstNonEmpty (Just "" : rest) = firstNonEmpty rest
+    firstNonEmpty (Just key : _) = Just key
+
 -- ---------------------------------------------------------------------------
 -- HTTP transport
 -- ---------------------------------------------------------------------------
@@ -211,7 +250,7 @@ openaiProvider cfg reg = do
 --   This is the only function that touches the network.  It:
 --
 --   1. Parses the URL (cached from 'openaiProvider')
---   2. Sets the @Authorization: Bearer …@ header
+--   2. Sets the @Authorization: Bearer …@ header when an API key exists
 --   3. POSTs the JSON body
 --   4. Checks for HTTP errors (non-2xx status codes)
 sendRequest :: Manager -> String -> Text -> LBS.ByteString -> IO LBS.ByteString
@@ -220,9 +259,7 @@ sendRequest mgr url apiKey body = do
   let req' = req
         { method = BS8.pack "POST"
         , requestHeaders =
-            [ ("Content-Type",  "application/json")
-            , ("Authorization", TE.encodeUtf8 ("Bearer " <> apiKey))
-            ]
+            authHeaders apiKey
         , requestBody = RequestBodyLBS body
         }
   resp <- httpLbs req' mgr
@@ -248,9 +285,7 @@ sendRequestStreaming mgr url apiKey body handler = do
   let req' = req
         { method = BS8.pack "POST"
         , requestHeaders =
-            [ ("Content-Type",  "application/json")
-            , ("Authorization", TE.encodeUtf8 ("Bearer " <> apiKey))
-            ]
+            authHeaders apiKey
         , requestBody = RequestBodyLBS body
         }
   withResponse req' mgr $ \resp -> do
@@ -260,6 +295,13 @@ sendRequestStreaming mgr url apiKey body handler = do
       errBody <- brRead (responseBody resp)
       throwIO $ HttpError status (LBS.fromStrict errBody)
     processSSEStream (responseBody resp) handler
+
+authHeaders :: Text -> RequestHeaders
+authHeaders apiKey =
+  [ ("Content-Type", "application/json") ]
+  ++ if T.null apiKey
+       then []
+       else [("Authorization", TE.encodeUtf8 ("Bearer " <> apiKey))]
 
 -- | Process an SSE stream from the response body.
 --

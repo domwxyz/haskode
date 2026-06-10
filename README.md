@@ -13,6 +13,8 @@ Haskode is a terminal coding agent where **Haskell owns the main loop**. Inspire
 - **Educational** — heavily commented, no clever tricks, learn-by-reading
 - **Native** — no Python, no Node, no wrapper scripts; just `cabal build` and go
 
+For the enforceable late-state design direction, see [docs/haskode-rulebook.md](docs/haskode-rulebook.md).
+
 The core loop: load config → build context → call LLM → manage typed tool
 calls → read/edit files → run shell commands → show diffs → record session
 events → repeat.
@@ -79,8 +81,11 @@ cabal test all
 ### Run
 
 ```sh
-# Interactive mode with stub provider (default config)
+# Interactive mode with stub provider (default config; no API key or model server needed)
 cabal run haskode
+
+# Experimental minimal Brick TUI mode
+cabal run haskode -- --tui
 
 # Single-shot mode
 cabal run haskode -- --prompt "What files are in the current directory?"
@@ -95,6 +100,9 @@ cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --pro
 
 # Override model and base URL from the command line
 cabal run haskode -- --provider openai --model gpt-4o --prompt "Hello"
+
+# Load one explicit config file
+cabal run haskode -- --config ./haskode.json --prompt "Hello"
 
 # Verbose mode (prints provider, model, base URL)
 cabal run haskode -- --provider openai -v --prompt "Hello"
@@ -120,11 +128,48 @@ In interactive mode, the following slash commands are available:
 |---------|-------------|
 | `/help` | Show available commands |
 | `/new` | Start a fresh conversation context |
-| `/status` | Show current provider, model, working dir, character-based context usage, and runtime info |
+| `/status` | Show current provider, model, working dir, disabled/available tools, character-based context usage, and runtime info |
+| `/doctor` | Local diagnostic checks (read-only, no provider contact, no shell, no file writes) |
 | `/exit` | Save session log and exit |
 | `/quit` | Same as `/exit` |
 
 Unknown slash commands print a short hint.  Anything without a leading `/` is sent to the agent as a normal prompt.
+
+### Experimental TUI mode
+
+`--tui` launches a minimal Brick-based interface. This is the first TUI
+slice, not a replacement for the CLI. The screen has a transcript panel, a
+single input line, and a small status/tool activity area. It uses the same
+agent state, command registry, provider path, session log, and display-event
+seam as the CLI.
+
+Supported in TUI mode:
+
+- Submit normal prompts, including the default local `stub` provider path.
+- `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit`.
+- Basic display of assistant replies, tool notices, policy notices, and
+  streaming chunks after the synchronous agent turn completes.
+- Transcript scrolling with PageUp/PageDown.
+- Input editing: Backspace to delete last character, Ctrl-W to delete the
+  previous word, Ctrl-U to clear the entire input line.
+- Long transcript entries and confirmation args are automatically truncated
+  with clear length markers.
+- Confirmation-required tool and policy actions show a focused Brick
+  confirmation panel. The panel includes the tool name, reason, JSON
+  arguments, and plain patch/write/batch preview text when available.
+  Press `y` to approve; press `n`, `Esc`, `Enter`, or `Ctrl-C` to reject.
+- `Esc` or `Ctrl-C` exits the TUI cleanly.
+
+Current TUI limitations:
+
+- Provider calls run synchronously, so the screen does not redraw while a turn
+  is in progress.
+- Confirmation prompts are synchronous. The TUI opens a small focused panel
+  during the agent turn rather than doing live background redraw.
+- The input line has no visual cursor; Ctrl-A/E (home/end) are not supported.
+- The CLI confirmation prompt and colored diff previews are unchanged.
+- The TUI does not include file trees, tabs, workspace browsing, plugin UI,
+  session browsing, a theme engine, or an async job dashboard.
 
 ### Configuration
 
@@ -141,11 +186,18 @@ Create a `haskode.json` in your project root:
   "cfgMaxTokens": 4096,
   "cfgVerbose": false,
   "cfgWorkingDir": ".",
-  "cfgMaxContextChars": 120000
+  "cfgMaxContextChars": 120000,
+  "cfgDisabledTools": []
 }
 ```
 
 Search order: `./haskode.json` → `./haskode.jsonc` → `~/.config/haskode/config.json` → defaults.
+Without a config file, the default provider is `stub` with model `stub`,
+empty base URL, and no API key. This path is local and deterministic.
+
+Pass `--config PATH` to load exactly one config file. When this flag is
+present, a missing or malformed file is an error; Haskode does not fall back
+to the normal search path or defaults.
 
 Anthropic config example:
 
@@ -160,7 +212,8 @@ Anthropic config example:
   "cfgMaxTokens": 4096,
   "cfgVerbose": false,
   "cfgWorkingDir": ".",
-  "cfgMaxContextChars": 120000
+  "cfgMaxContextChars": 120000,
+  "cfgDisabledTools": []
 }
 ```
 
@@ -170,6 +223,39 @@ Anthropic config example:
 |---|---|---|---|
 | `cfgMaxContextChars` | int | `120000` | Conservative context-window limit in characters (~30K tokens). When the estimated conversation size exceeds this, the provider call is blocked with a clear error. |
 | `cfgMaxSessionLogBytes` | int | `5242880` | Maximum session.jsonl file size in bytes (5 MB). When the existing log exceeds this, it is rotated to `session.jsonl.1` before new events are appended. Set to `0` to disable rotation. |
+| `cfgDisabledTools` | array of strings | `[]` | Built-in tool names to remove from the runtime tool registry. Unknown names are a startup error. |
+
+**Disabling built-in tools.**  `cfgDisabledTools` is a plain list of
+built-in tool names. The default is `[]`, which preserves the normal tool
+set. This is only an enable/disable switch for tools already compiled into
+Haskode; it is not a plugin system, executable-tool loader, or permission
+framework.
+
+Example: disable shell access and write-capable file tools:
+
+```json
+{
+  "cfgProvider": {
+    "pcProvider": "stub",
+    "pcModel": "stub",
+    "pcBaseUrl": "",
+    "pcApiKey": ""
+  },
+  "cfgMaxTokens": 4096,
+  "cfgVerbose": false,
+  "cfgWorkingDir": ".",
+  "cfgMaxContextChars": 120000,
+  "cfgDisabledTools": ["shell", "write_file", "apply_patch", "apply_patch_batch"]
+}
+```
+
+Disabled tools are removed from the registry before provider setup. They are
+not advertised in provider-native tool schemas or in the model-facing system
+prompt. If a provider somehow returns a call for a disabled tool anyway,
+Haskode cannot execute it because the tool is no longer in the registry; the
+execution path reports it as an unknown or disabled tool. Misspelled or
+unknown names in `cfgDisabledTools` fail startup clearly instead of being
+ignored.
 
 **Provider names:** `openai`, `ollama`, `vllm`, `litellm`, `openrouter` (all
 OpenAI-compatible HTTP endpoints), `anthropic` (Anthropic Messages API), or
@@ -196,6 +282,10 @@ If you set `pcBaseUrl` for Anthropic, Haskode appends `/v1/messages`.
 2. `OPENAI_API_KEY` environment variable
 3. `pcApiKey` field in config file
 
+`ollama` and `vllm` do not require an API key by default. If a key is
+provided for either, Haskode sends it as a bearer token. `openai`,
+`litellm`, and `openrouter` require a key.
+
 **API key resolution** (for Anthropic):
 
 1. `--api-key` CLI flag (highest priority)
@@ -217,8 +307,9 @@ Undefined variables expand to the empty string.
 }
 ```
 
-You may also leave `pcApiKey` empty and rely on `OPENAI_API_KEY` directly
-(the provider checks the environment variable when the config field is empty).
+For hosted OpenAI-compatible providers, you may leave `pcApiKey` empty and
+rely on `OPENAI_API_KEY` directly. For local `ollama` and `vllm`, you may
+leave `pcApiKey` empty when the server does not require auth.
 For Anthropic, leave `pcApiKey` empty and set `ANTHROPIC_API_KEY`.
 
 **CLI flags override config values:**
@@ -230,8 +321,10 @@ For Anthropic, leave `pcApiKey` empty and set `ANTHROPIC_API_KEY`.
 | `--api-key`        | `pcApiKey`   |
 | `--base-url`       | `pcBaseUrl`  |
 | `--verbose`, `-v`  | `cfgVerbose` |
+| `--config`, `-c`    | config search path |
 | `--show-session`   | *(n/a)*      |
 | `--resume`         | *(n/a)*      |
+| `--tui`            | launch experimental TUI mode |
 
 ## Smoke test with a real model
 
@@ -265,8 +358,8 @@ cabal run haskode -- --provider openai --model gpt-4o-mini
 # Type "y" to approve, anything else (or Enter) to reject.
 ```
 
-If the API key is missing, Haskode prints a clear error explaining the
-three ways to provide one (env var, config file, CLI flag).
+If a required API key is missing, Haskode prints a clear error explaining the
+three ways to provide one (CLI flag, env var, config file).
 
 ### What works today
 
@@ -315,6 +408,31 @@ canonicalization used by `read_file` and `search` — it cannot escape
 the working directory through symlinks or path tricks.  Files larger
 than 32 KB are silently skipped.  If the file is missing or
 unreadable, behavior is unchanged.
+
+### SYSTEM.md — project-local system instructions
+
+If a file named `SYSTEM.md` exists in the working directory root, its
+contents are included in the system prompt sent to the LLM on every
+turn.  Use it for project-local system instructions that shape how the
+agent behaves in this specific project.
+
+**How it differs from `AGENTS.md`:** `AGENTS.md` encodes repository
+instructions (coding style, workflow preferences, repo conventions).
+`SYSTEM.md` encodes project-local system instructions (behavioral
+guidance, tone, scope boundaries).  When both files are present, they
+appear in the system prompt in this order:
+
+1. Built-in Haskode system prompt
+2. Project `SYSTEM.md`
+3. Project `AGENTS.md`
+
+Both files are optional.  Either or both can be omitted without
+affecting normal behavior.
+
+The file uses the same symlink-safe canonicalization and 32 KB size
+limit as `AGENTS.md`.  If the file is missing, unreadable, resolves
+outside the working directory through symlinks, or exceeds the size
+limit, it is silently skipped.
 
 ### preview_patch — diff preview without modification
 
@@ -621,6 +739,12 @@ is not implemented.
   policy decisions, and lifecycle events are not reconstructed.  No
   tools or provider calls are re-executed.  Full replay (re-running
   tool calls or provider turns from the log) is not implemented.
+- **Experimental TUI** - `--tui` provides a minimal Brick wrapper with a
+  transcript, input line, status/tool area, and synchronous confirmation
+  panel for confirmation-required tool and policy actions. It is still
+  synchronous: provider calls do not redraw live, and streaming chunks appear
+  after the running turn returns to Brick. The CLI remains the reference
+  interface.
 - **No batch rollback** — the agent can preview and apply
   multiple file changes via `preview_patch_batch` (read-only) and
   `apply_patch_batch` (confirmed write).  Rollback of batch operations
@@ -670,7 +794,8 @@ is not implemented.
 - [x] Environment variable expansion in config
 
 ### Phase 3 — TUI & polish
-- [ ] Brick-based terminal UI
+- [x] Brick-based terminal UI (minimal experimental `--tui` skeleton)
+- [x] Minimal TUI confirmation dialog for tool/policy approvals
 - [ ] Conversation history browsing
 - [ ] Tool call inspector
 - [ ] Config TUI editor

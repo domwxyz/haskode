@@ -28,10 +28,12 @@ module Haskode.Agent
     AgentState (..)
   , runAgent
   , initState
+  , initStateWithDisplay
     -- * Single-turn processing
   , processTurn
     -- * System prompt
   , buildSystemPrompt
+  , loadSystemMd
   , loadAgentsMd
     -- * Context estimation
   , estimateContextChars
@@ -48,6 +50,11 @@ module Haskode.Agent
   , autoApprove
   , autoReject
   , terminalApproval
+    -- * Display
+  , DisplayFunc
+  , terminalDisplay
+  , AgentDisplay (..)
+  , terminalAgentDisplay
   ) where
 
 import Control.Exception  (IOException, try, SomeException, throwIO)
@@ -64,10 +71,7 @@ import System.IO          (hFlush, stdout)
 
 import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Patch      (colorizeUnifiedDiff)
-import Haskode.Display    (formatAssistantReply, formatToolExecuting,
-                           formatToolResult, formatToolUnknown,
-                           formatPolicyDenied, formatPolicyConfirmationNeeded,
-                           formatPolicyApproved, formatPolicyRejected,
+import Haskode.Display    (DisplayEvent (..), renderDisplayEvent,
                            formatConfirmTool, formatConfirmArgs,
                            formatConfirmReason, formatConfirmPrompt,
                            formatConfirmFile, formatConfirmDiffHeader,
@@ -133,6 +137,44 @@ terminalApproval tc reason = do
   pure (T.strip answer `elem` ["y", "Y"])
 
 -- ---------------------------------------------------------------------------
+-- Display
+-- ---------------------------------------------------------------------------
+
+-- | A function that consumes structured display events.
+--
+-- The CLI uses 'terminalDisplay', which renders each event as plain
+-- terminal text. A future TUI can inject its own sink and update widgets
+-- from the same structured events without parsing terminal strings.
+type DisplayFunc = DisplayEvent -> IO ()
+
+-- | Render display events to the current CLI terminal.
+terminalDisplay :: DisplayFunc
+terminalDisplay = TIO.putStrLn . renderDisplayEvent
+
+-- | Display callbacks used by the agent loop.
+--
+-- Plain display events and streaming assistant chunks are separate because
+-- streaming deliberately does not allocate a transcript event per token.
+-- Front ends can still consume both paths without parsing terminal text.
+data AgentDisplay = AgentDisplay
+  { agentDisplayEvent       :: !DisplayFunc
+  , agentDisplayStreamBegin :: !(IO ())
+  , agentDisplayStreamChunk :: !(Text -> IO ())
+  , agentDisplayStreamEnd   :: !(IO ())
+  , agentDisplayPreview     :: !(ToolCall -> IO ())
+  }
+
+-- | Default display callbacks for the CLI terminal.
+terminalAgentDisplay :: AgentDisplay
+terminalAgentDisplay = AgentDisplay
+  { agentDisplayEvent       = terminalDisplay
+  , agentDisplayStreamBegin = streamBegin
+  , agentDisplayStreamChunk = streamChunk
+  , agentDisplayStreamEnd   = streamEnd
+  , agentDisplayPreview     = showConfirmationPreview
+  }
+
+-- ---------------------------------------------------------------------------
 -- Agent state
 -- ---------------------------------------------------------------------------
 
@@ -145,11 +187,20 @@ data AgentState = AgentState
   , asPolicy       :: !Policy
   , asRegistry     :: !ToolRegistry
   , asApproval     :: !ApprovalFunc
+  , asDisplay      :: !AgentDisplay
   , asResumed      :: !Bool             -- ^ True when conversation was loaded from a prior session
   }
 
 initState :: Config -> Provider -> Policy -> ToolRegistry -> ApprovalFunc -> Bool -> AgentState
-initState cfg prov pol reg approve resumed = AgentState
+initState cfg prov pol reg approve resumed =
+  initStateWithDisplay cfg prov pol reg approve terminalAgentDisplay resumed
+
+-- | Initialize agent state with explicit display callbacks.
+--
+-- This keeps the default CLI path small while giving other front ends
+-- a seam for consuming 'DisplayEvent' values and stream chunks directly.
+initStateWithDisplay :: Config -> Provider -> Policy -> ToolRegistry -> ApprovalFunc -> AgentDisplay -> Bool -> AgentState
+initStateWithDisplay cfg prov pol reg approve display resumed = AgentState
   { asConversation = emptyConversation
   , asSession      = emptyLog
   , asConfig       = cfg
@@ -157,6 +208,7 @@ initState cfg prov pol reg approve resumed = AgentState
   , asPolicy       = pol
   , asRegistry     = reg
   , asApproval     = approve
+  , asDisplay      = display
   , asResumed      = resumed
   }
 
@@ -197,51 +249,57 @@ recordConversationReset st = do
 -- System prompt
 -- ---------------------------------------------------------------------------
 
--- | Maximum size of AGENTS.md (in bytes) that will be included in the
---   system prompt.  Files larger than this are silently skipped to
---   avoid blowing up the context window.
+-- | Maximum size of AGENTS.md or SYSTEM.md (in bytes) that will be
+--   included in the system prompt.  Files larger than this are silently
+--   skipped to avoid blowing up the context window.
 agentsMdMaxSize :: Integer
 agentsMdMaxSize = 32768  -- 32 KB
 
--- | Load the contents of @AGENTS.md@ from the working directory, if
---   present and readable.  Uses 'safeCanonicalize' and 'isUnderRoot'
---   to guard against symlink escape and path-traversal tricks.
+-- | Load the contents of a project-local markdown file (e.g.
+--   @SYSTEM.md@ or @AGENTS.md@) from the working directory.
 --
---   Returns 'Nothing' if the file is missing, unreadable, resolves
---   outside the working directory, or exceeds 'agentsMdMaxSize'.
-loadAgentsMd :: IO (Maybe Text)
-loadAgentsMd = do
-  -- Resolve the working directory as the containment root.
+--   Uses 'safeCanonicalize' and 'isUnderRoot' to guard against symlink
+--   escape and path-traversal tricks.  Returns 'Nothing' if the file is
+--   missing, unreadable, resolves outside the working directory, or
+--   exceeds 'agentsMdMaxSize'.
+loadProjectMd :: FilePath -> IO (Maybe Text)
+loadProjectMd filename = do
   rootResult <- safeCanonicalize "."
   case rootResult of
     Nothing -> pure Nothing
     Just rootCanon -> do
-      -- Check whether AGENTS.md exists before canonicalizing, so that
-      -- canonicalizePath does not throw on a missing file.
-      exists <- doesFileExist ("AGENTS.md" :: FilePath)
+      exists <- doesFileExist filename
       if not exists
         then pure Nothing
         else do
-          -- Canonicalize and verify containment.
-          pathResult <- safeCanonicalize ("AGENTS.md" :: FilePath)
+          pathResult <- safeCanonicalize filename
           case pathResult of
             Nothing -> pure Nothing
             Just canon
               | not (isUnderRoot rootCanon canon) -> pure Nothing
               | otherwise -> do
-                  -- Enforce size limit.
-                  sizeResult <- try (getFileSize "AGENTS.md") :: IO (Either IOException Integer)
+                  sizeResult <- try (getFileSize filename) :: IO (Either IOException Integer)
                   case sizeResult of
                     Left _  -> pure Nothing
                     Right size
                       | size > agentsMdMaxSize -> pure Nothing
                       | otherwise -> do
-                          readResult <- try (TIO.readFile "AGENTS.md") :: IO (Either IOException Text)
+                          readResult <- try (TIO.readFile filename) :: IO (Either IOException Text)
                           case readResult of
                             Left _  -> pure Nothing
                             Right txt
                               | T.null txt -> pure Nothing
                               | otherwise  -> pure (Just txt)
+
+-- | Load the contents of @SYSTEM.md@ from the working directory, if
+--   present and readable.
+loadSystemMd :: IO (Maybe Text)
+loadSystemMd = loadProjectMd "SYSTEM.md"
+
+-- | Load the contents of @AGENTS.md@ from the working directory, if
+--   present and readable.
+loadAgentsMd :: IO (Maybe Text)
+loadAgentsMd = loadProjectMd "AGENTS.md"
 
 -- | Build a system message that describes all available tools.
 --
@@ -254,10 +312,18 @@ loadAgentsMd = do
 --   provided tools — it must NOT print JSON tool-call objects as
 --   assistant text.
 --
+--   If a @SYSTEM.md@ file was loaded, its contents are included as
+--   project-local system instructions after the built-in prompt.
 --   If an @AGENTS.md@ file was loaded, its contents are appended as
 --   repository-specific instructions for the agent.
-buildSystemPrompt :: ToolRegistry -> Maybe Text -> Text
-buildSystemPrompt reg agentsMd =
+--
+--   Section order:
+--
+--     1. Built-in Haskode system prompt
+--     2. Project @SYSTEM.md@ (if present)
+--     3. Project @AGENTS.md@ (if present)
+buildSystemPrompt :: ToolRegistry -> Maybe Text -> Maybe Text -> Text
+buildSystemPrompt reg systemMd agentsMd =
   "You are a helpful coding assistant. You have access to tools that\n\
   \are provided to you by the system. Use them when needed to answer\n\
   \the user's questions or perform tasks. Do NOT print tool calls as\n\
@@ -266,12 +332,16 @@ buildSystemPrompt reg agentsMd =
   \\n\
   \Available tools:\n\n"
   <> T.concat (map describeTool (toolNames reg))
+  <> systemMdSection
   <> agentsMdSection
   where
     describeTool name = case lookupTool name reg of
       Nothing -> ""
       Just t  -> "- **" <> toolName t <> "**: " <> toolDescription t
               <> "\n  Schema: " <> T.pack (show (toolSchema t)) <> "\n\n"
+    systemMdSection = case systemMd of
+      Nothing -> ""
+      Just md -> "\n# Project instructions (SYSTEM.md)\n\n" <> md <> "\n"
     agentsMdSection = case agentsMd of
       Nothing -> ""
       Just md -> "\n# Repository instructions (AGENTS.md)\n\n" <> md <> "\n"
@@ -380,8 +450,9 @@ processTurn state = do
       reg  = asRegistry state
 
   -- Build context: system prompt + conversation
+  systemMd <- loadSystemMd
   agentsMd <- loadAgentsMd
-  let sysMsg    = mkSystemMessage (buildSystemPrompt reg agentsMd)
+  let sysMsg    = mkSystemMessage (buildSystemPrompt reg systemMd agentsMd)
       context   = sysMsg : asConversation state
 
   -- Context-window guard: estimate total size before calling provider.
@@ -391,7 +462,7 @@ processTurn state = do
   let stats = contextStats context (cfgMaxContextChars cfg)
   when (csCurrent stats > csMax stats) $ do
     let msg = formatContextLimitRefusal (csCurrent stats) (csMax stats)
-    TIO.putStrLn $ formatAssistantReply msg
+    emitDisplayEvent state $ DisplayContextLimitRefusal (csCurrent stats) (csMax stats)
     fail (T.unpack msg)
 
   -- Call the provider (prefer streaming when available)
@@ -404,24 +475,25 @@ processTurn state = do
   resp <- case mStream of
     Just stream -> do
       displayStarted <- newIORef False
+      let display = asDisplay state
       let onTokenLazy chunk
             | T.null chunk = pure ()
             | otherwise = do
                 started <- readIORef displayStarted
                 unless started $ do
                   writeIORef displayStarted True
-                  streamBegin
-                streamChunk chunk
+                  agentDisplayStreamBegin display
+                agentDisplayStreamChunk display chunk
       r <- do
         result <- try $ stream req StreamHandler { onToken = onTokenLazy }
         case result of
           Left (e :: SomeException) -> do
             started <- readIORef displayStarted
-            when started streamEnd
+            when started (agentDisplayStreamEnd display)
             throwIO e
           Right val -> pure val
       started <- readIORef displayStarted
-      when started streamEnd
+      when started (agentDisplayStreamEnd display)
       pure r
     Nothing ->
       providerComplete prov req
@@ -460,7 +532,7 @@ processTurn state = do
       -- streamBegin/streamChunk/streamEnd; non-streaming displays it now.
       case mStream of
         Just _  -> pure ()
-        Nothing -> TIO.putStrLn $ formatAssistantReply (msgContent reply)
+        Nothing -> emitDisplayEvent state1 $ DisplayAssistant (msgContent reply)
       pure state1
     Just calls -> do
       -- Process each tool call and loop
@@ -569,7 +641,7 @@ processSingleToolCall state tc = do
                   (tcId tc <> " denied: " <> reason))
                 (asSession state1)
             }
-      TIO.putStrLn $ formatPolicyDenied (tcName tc) reason
+      emitDisplayEvent state2 $ DisplayPolicyDenied (tcName tc) reason
       pure state2
 
     AskUser reason -> do
@@ -578,13 +650,13 @@ processSingleToolCall state tc = do
       -- In tests, autoApprove or autoReject is injected instead.
       let approve  = asApproval state
           enrichedReason = writeLikeDecisionReason tc reason
-      TIO.putStrLn $ formatPolicyConfirmationNeeded (tcName tc)
-      showConfirmationPreview tc
+      emitDisplayEvent state1 $ DisplayPolicyConfirmationNeeded (tcName tc)
+      agentDisplayPreview (asDisplay state1) tc
       approved <- approve tc enrichedReason
       if approved
         then do
           -- User approved — execute the tool (same path as Allow)
-          TIO.putStrLn formatPolicyApproved
+          emitDisplayEvent state1 DisplayPolicyApproved
           now2 <- getCurrentTime
           let approvalData = approvalAuditText tc
           let state2 = state1
@@ -595,7 +667,7 @@ processSingleToolCall state tc = do
           executeTool state2 tc
         else do
           -- User rejected — log and return a denial result
-          TIO.putStrLn formatPolicyRejected
+          emitDisplayEvent state1 DisplayPolicyRejected
           now2 <- getCurrentTime
           let denialReason = denialAuditText tc reason
           let resultMsg = Message
@@ -627,11 +699,11 @@ executeTool state tc = do
   let reg = asRegistry state
   case lookupTool (tcName tc) reg of
     Nothing -> do
-      -- Unknown tool
+      -- Unknown or disabled tool.
       now <- getCurrentTime
       let resultMsg = Message
             { msgRole      = User
-            , msgContent   = "Error: unknown tool '" <> tcName tc <> "'"
+            , msgContent   = "Error: unknown or disabled tool '" <> tcName tc <> "'"
             , msgCallId    = Just (tcId tc)
             , msgToolCalls = Nothing
             }
@@ -639,15 +711,15 @@ executeTool state tc = do
             { asConversation = appendMessage resultMsg (asConversation state)
             , asSession = logEvent
                 (Event now EToolResult
-                  (tcId tc <> " error: unknown tool " <> tcName tc))
+                  (tcId tc <> " error: unknown or disabled tool " <> tcName tc))
                 (asSession state)
             }
-      TIO.putStrLn $ formatToolUnknown (tcName tc)
+      emitDisplayEvent state' $ DisplayToolUnknown (tcName tc)
       pure state'
 
     Just tool -> do
       -- Execute
-      TIO.putStrLn $ formatToolExecuting (tcName tc)
+      emitDisplayEvent state $ DisplayToolExecuting (tcName tc)
       now <- getCurrentTime
       let state' = state
             { asSession = logEvent
@@ -680,8 +752,12 @@ executeTool state tc = do
                   (tcId tc <> " " <> sessionOutput))
                 (asSession state')
             }
-      TIO.putStrLn $ formatToolResult (truncateDisplay fullOutput)
+      emitDisplayEvent state'' $ DisplayToolResult (truncateDisplay fullOutput)
       pure state''
+
+-- | Emit a structured display event through the state's display sink.
+emitDisplayEvent :: AgentState -> DisplayEvent -> IO ()
+emitDisplayEvent state = agentDisplayEvent (asDisplay state)
 
 -- | Show a diff preview for an @apply_patch@ tool call.
 --   Prints the target path and a concise unified diff to the terminal

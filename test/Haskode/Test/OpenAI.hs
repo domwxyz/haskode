@@ -31,9 +31,11 @@ import Haskode.Provider.OpenAI
       parseDeltaToolCalls,
       StreamingToolCall(..),
       assembleStreamToolCalls,
+      resolveOpenAICompatibleApiKey,
+      openAICompatibleRequiresApiKey,
       OpenAIError(..) )
 import Haskode.Test.Util ( toolDescriptionFromRegistry, Test )
-import Haskode.Tools ( defaultRegistry, toolNames )
+import Haskode.Tools ( defaultRegistry, disableTools, toolNames )
 import qualified Data.IORef ( modifyIORef, newIORef, readIORef )
 import qualified Data.ByteString as BS ( empty )
 import qualified Data.ByteString.Char8 as BS8 ( pack )
@@ -44,7 +46,7 @@ import qualified Data.Map.Strict as Map
     ( insert, empty, lookup, fromList )
 import qualified Data.Text as T
     ( Text, intercalate, isInfixOf, pack, unpack )
-import qualified Data.Vector as V ( (!) )
+import qualified Data.Vector as V ( (!), toList )
 -- ---------------------------------------------------------------------------
 
 -- | Helper: wrap a message JSON into a full OpenAI API response.
@@ -156,6 +158,34 @@ testOpenAIRequestTools = do
         then pure $ Right ()
         else pure $ Left $ "tools=" ++ show hasTools ++ " tool_choice=" ++ show hasToolChoice
     Just other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
+-- | Disabled tools are omitted from OpenAI provider tool schemas.
+testOpenAIRequestOmitsDisabledTools :: Test
+testOpenAIRequestOmitsDisabledTools =
+  case disableTools ["shell"] defaultRegistry of
+    Left err -> pure $ Left $ "disableTools failed: " ++ T.unpack err
+    Right reg -> do
+      let msgs = [mkUserMessage "hello"]
+          body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 reg
+      case decode body of
+        Nothing -> pure $ Left "buildRequestBody with filtered tools produced invalid JSON"
+        Just (Object obj) ->
+          case KM.lookup (Key.fromText "tools") obj of
+            Just (Array arr) -> do
+              let toolVals = V.toList arr
+                  names =
+                    [ n
+                    | Object toolObj <- toolVals
+                    , Just (Object fn) <- [KM.lookup (Key.fromText "function") toolObj]
+                    , Just (String n) <- [KM.lookup (Key.fromText "name") fn]
+                    ]
+              if not ("shell" `elem` names)
+                 && length names == length (toolNames reg)
+                then pure $ Right ()
+                else pure $ Left $
+                  "disabled tool was advertised in OpenAI tools: " ++ show names
+            other -> pure $ Left $ "Expected tools array, got: " ++ show other
+        Just other -> pure $ Left $ "Request JSON is not an object: " ++ show other
 
 -- | parseResponseBody handles a plain text reply correctly.
 testOpenAIResponseText :: Test
@@ -354,7 +384,7 @@ testOpenAIResponseNullContentToolCall = do
 -- | buildSystemPrompt does NOT tell the model to print JSON tool calls.
 testBuildSystemPromptNoJsonInstruction :: Test
 testBuildSystemPromptNoJsonInstruction = do
-  let prompt = buildSystemPrompt defaultRegistry Nothing
+  let prompt = buildSystemPrompt defaultRegistry Nothing Nothing
   -- The old prompt contained these strings; the new one must not.
   if T.isInfixOf "{\"tool_call\"" prompt
     then pure $ Left "System prompt still contains JSON tool_call instruction"
@@ -363,7 +393,7 @@ testBuildSystemPromptNoJsonInstruction = do
 -- | buildSystemPrompt tells the model to use the native tool mechanism.
 testBuildSystemPromptNativeTools :: Test
 testBuildSystemPromptNativeTools = do
-  let prompt = buildSystemPrompt defaultRegistry Nothing
+  let prompt = buildSystemPrompt defaultRegistry Nothing Nothing
   if T.isInfixOf "tool-calling mechanism" prompt
      && T.isInfixOf "Available tools" prompt
     then pure $ Right ()
@@ -436,7 +466,7 @@ testShellDescriptionPhrases =
 --   key safety phrases for the five critical tools.
 testSystemPromptToolPhrases :: Test
 testSystemPromptToolPhrases = do
-  let prompt = buildSystemPrompt defaultRegistry Nothing
+  let prompt = buildSystemPrompt defaultRegistry Nothing Nothing
       checks :: [(T.Text, [T.Text])]
       checks =
         [ ("preview_patch",  ["without modifying", "NOT"])
@@ -492,6 +522,56 @@ testToolSchemaPhrasesInWireFormat = do
     then pure $ Right ()
     else pure $ Left $ "Tool schema descriptions missing phrases: "
                      ++ show [(t, p) | (t, p) <- missing]
+
+-- | OpenAI-compatible key resolution matches the documented precedence:
+--   CLI flag, then OPENAI_API_KEY, then pcApiKey.
+testOpenAICompatibleApiKeyPrecedence :: Test
+testOpenAICompatibleApiKeyPrecedence =
+  let cliWins = resolveOpenAICompatibleApiKey "openai"
+                  (Just "cli-key") (Just "env-key") "cfg-key"
+      envWins = resolveOpenAICompatibleApiKey "openai"
+                  Nothing (Just "env-key") "cfg-key"
+      cfgFallback = resolveOpenAICompatibleApiKey "openai"
+                  Nothing Nothing "cfg-key"
+  in if cliWins == Right "cli-key"
+        && envWins == Right "env-key"
+        && cfgFallback == Right "cfg-key"
+       then pure $ Right ()
+       else pure $ Left $ "Unexpected OpenAI key precedence: "
+                        ++ show (cliWins, envWins, cfgFallback)
+
+-- | Hosted OpenAI-compatible providers fail when no key source exists.
+testOpenAICompatibleHostedRequiresKey :: Test
+testOpenAICompatibleHostedRequiresKey =
+  let providers = ["openai", "litellm", "openrouter"]
+      results = [ (p, openAICompatibleRequiresApiKey p
+                    , resolveOpenAICompatibleApiKey p Nothing Nothing "")
+                | p <- providers
+                ]
+      ok = all (\(_p, requires, result) -> requires && isLeft result) results
+  in if ok
+       then pure $ Right ()
+       else pure $ Left $ "Expected hosted providers to require keys: " ++ show results
+  where
+    isLeft :: Either a b -> Bool
+    isLeft (Left _) = True
+    isLeft (Right _) = False
+
+-- | Local OpenAI-compatible providers do not require keys by default,
+--   but still use one when explicitly provided.
+testOpenAICompatibleLocalKeyBehavior :: Test
+testOpenAICompatibleLocalKeyBehavior =
+  let noKeyOllama = resolveOpenAICompatibleApiKey "ollama" Nothing Nothing ""
+      noKeyVllm   = resolveOpenAICompatibleApiKey "vllm" Nothing Nothing ""
+      keyedOllama = resolveOpenAICompatibleApiKey "ollama" Nothing (Just "env-key") ""
+      requirements = map openAICompatibleRequiresApiKey ["ollama", "vllm"]
+  in if noKeyOllama == Right ""
+        && noKeyVllm == Right ""
+        && keyedOllama == Right "env-key"
+        && requirements == [False, False]
+       then pure $ Right ()
+       else pure $ Left $ "Unexpected local provider key behavior: "
+                        ++ show (noKeyOllama, noKeyVllm, keyedOllama, requirements)
 
 -- | tokenLimitFieldName returns "max_completion_tokens" for openai.
 testTokenLimitFieldOpenAI :: Test
@@ -1086,6 +1166,7 @@ tests :: [Test]
 tests =
   [ testOpenAIRequestShape
   , testOpenAIRequestTools
+  , testOpenAIRequestOmitsDisabledTools
   , testOpenAIResponseText
   , testOpenAIResponseToolCall
   , testOpenAIResponseMultiToolCall
@@ -1107,6 +1188,9 @@ tests =
   , testShellDescriptionPhrases
   , testSystemPromptToolPhrases
   , testToolSchemaPhrasesInWireFormat
+  , testOpenAICompatibleApiKeyPrecedence
+  , testOpenAICompatibleHostedRequiresKey
+  , testOpenAICompatibleLocalKeyBehavior
   , testTokenLimitFieldOpenAI
   , testTokenLimitFieldOllama
   , testTokenLimitFieldOtherProviders

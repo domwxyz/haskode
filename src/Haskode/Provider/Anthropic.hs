@@ -126,7 +126,7 @@ anthropicProvider cfg reg = do
 
   case mKey of
     Nothing -> pure $ Left
-      "Anthropic API key not found. Set ANTHROPIC_API_KEY or pcApiKey in config."
+      "Anthropic API key not found. Set --api-key, pcApiKey in config, or ANTHROPIC_API_KEY."
     Just apiKey -> do
       mgr <- newManager tlsManagerSettings
       let baseRoot = case pcBaseUrl (cfgProvider cfg) of

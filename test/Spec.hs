@@ -16,6 +16,7 @@ import qualified Haskode.Test.Policy   as Policy
 import qualified Haskode.Test.Provider as Provider
 import qualified Haskode.Test.Session  as Session
 import qualified Haskode.Test.Tools    as Tools
+import qualified Haskode.Test.Tui      as Tui
 import Haskode.Test.Util (runTests)
 
 main :: IO ()
@@ -30,4 +31,5 @@ main = runTests $
   ++ Session.tests
   ++ Commands.tests
   ++ Display.tests
+  ++ Tui.tests
   ++ Provider.tests

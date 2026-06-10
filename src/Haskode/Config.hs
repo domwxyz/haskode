@@ -19,6 +19,7 @@ module Haskode.Config
   , defaultMaxContextChars
   , defaultMaxSessionLogBytes
   , loadConfig
+  , loadConfigFrom
   , tokenLimitFieldName
   , expandEnvVars
   , expandConfig
@@ -26,11 +27,11 @@ module Haskode.Config
 
 import Data.Aeson            (FromJSON, ToJSON, eitherDecode, parseJSON, withObject, (.:), (.:?))
 import Data.Aeson.Types      ((.!=))
-import Data.ByteString.Lazy  (readFile)
 import Data.Char             (isAlpha, isAlphaNum)
+import qualified Data.ByteString      as BS
+import qualified Data.ByteString.Lazy as LBS
 import Data.Text             (Text)
 import GHC.Generics          (Generic)
-import Prelude               hiding (readFile)
 import System.Directory      (doesFileExist, getHomeDirectory)
 import System.Environment    (lookupEnv)
 import System.FilePath       ((</>))
@@ -50,12 +51,12 @@ data ProviderConfig = ProviderConfig
 instance ToJSON ProviderConfig
 instance FromJSON ProviderConfig
 
--- | Sane defaults for local development with Ollama.
+-- | Safe defaults for out-of-the-box local use.
 defaultProviderConfig :: ProviderConfig
 defaultProviderConfig = ProviderConfig
-  { pcProvider = "ollama"
-  , pcModel    = "llama3.1"
-  , pcBaseUrl  = "http://localhost:11434"
+  { pcProvider = "stub"
+  , pcModel    = "stub"
+  , pcBaseUrl  = ""
   , pcApiKey   = ""
   }
 
@@ -70,12 +71,14 @@ data Config = Config
   , cfgWorkingDir         :: !FilePath  -- ^ Project root (default: cwd)
   , cfgMaxContextChars    :: !Int       -- ^ Conservative context-window limit in characters
   , cfgMaxSessionLogBytes :: !Int       -- ^ Max session.jsonl size before rotation (bytes)
+  , cfgDisabledTools      :: ![Text]    -- ^ Built-in tool names to remove from the runtime registry
   } deriving stock (Show, Eq, Generic)
 
 instance ToJSON Config
 
--- | Custom FromJSON instance that treats @cfgMaxContextChars@ and
---   @cfgMaxSessionLogBytes@ as optional fields with sensible defaults.
+-- | Custom FromJSON instance that treats @cfgMaxContextChars@,
+--   @cfgMaxSessionLogBytes@, and @cfgDisabledTools@ as optional fields
+--   with sensible defaults.
 --   This keeps old minimal config files (without these fields) working
 --   after the fields were added.
 instance FromJSON Config where
@@ -86,6 +89,7 @@ instance FromJSON Config where
     workDir   <- o .:  "cfgWorkingDir"
     maxCtx    <- o .:? "cfgMaxContextChars"    .!= defaultMaxContextChars
     maxLogB   <- o .:? "cfgMaxSessionLogBytes" .!= defaultMaxSessionLogBytes
+    disabled  <- o .:? "cfgDisabledTools"      .!= []
     pure Config
       { cfgProvider           = prov
       , cfgMaxTokens          = maxToks
@@ -93,6 +97,7 @@ instance FromJSON Config where
       , cfgWorkingDir         = workDir
       , cfgMaxContextChars    = maxCtx
       , cfgMaxSessionLogBytes = maxLogB
+      , cfgDisabledTools      = disabled
       }
 
 defaultConfig :: Config
@@ -103,6 +108,7 @@ defaultConfig = Config
   , cfgWorkingDir         = "."
   , cfgMaxContextChars    = defaultMaxContextChars
   , cfgMaxSessionLogBytes = defaultMaxSessionLogBytes
+  , cfgDisabledTools      = []
   }
 
 -- | Default context-window limit in characters.
@@ -204,14 +210,31 @@ loadConfig = do
       exists <- doesFileExist path
       if exists
         then do
-          bytes <- readFile path
-          case eitherDecode bytes of
+          bytes <- BS.readFile path
+          case eitherDecode (LBS.fromStrict bytes) of
             Right cfg -> expandConfig cfg
             Left  err -> do
               putStrLn $ "haskode: warning: failed to parse " ++ path
                        ++ " (" ++ err ++ "), using defaults"
               pure defaultConfig
         else go rest
+
+-- | Load one explicit config path.
+--
+-- Unlike 'loadConfig', this does not search fallback paths and does not
+-- silently fall back to defaults.  A missing or malformed explicit config
+-- is a user-visible error because the CLI was told exactly what to load.
+loadConfigFrom :: FilePath -> IO Config
+loadConfigFrom path = do
+  exists <- doesFileExist path
+  if not exists
+    then ioError $ userError $ "haskode: config file not found: " ++ path
+    else do
+      bytes <- BS.readFile path
+      case eitherDecode (LBS.fromStrict bytes) of
+        Right cfg -> expandConfig cfg
+        Left err  -> ioError $ userError $
+          "haskode: failed to parse config file " ++ path ++ ": " ++ err
 
 -- ---------------------------------------------------------------------------
 -- Token-limit field name

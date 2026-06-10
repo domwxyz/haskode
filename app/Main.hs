@@ -26,7 +26,7 @@
 
 module Main (main) where
 
-import Control.Monad      (when)
+import Control.Monad      (unless, when)
 import Data.Text          (Text)
 import qualified Data.Text.IO as TIO
 import Options.Applicative
@@ -34,15 +34,17 @@ import System.Exit        (exitFailure, exitSuccess)
 import System.FilePath    ((</>))
 import System.IO          (hFlush, stdout, hSetBuffering, stdin, BufferMode (..))
 
-import Haskode.Commands        (parseSlashCommand, formatHelp, formatStatus, formatUnknownCommand, formatNewConfirmation, resetConversation)
-import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig)
+import Haskode.Commands        (CommandAction (..), CommandSpec (..), parseSlashCommand, lookupCommand,
+                                formatHelp, formatStatus, formatDoctor, formatUnknownCommand, formatNewConfirmation, resetConversation)
+import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig, loadConfigFrom)
 import Haskode.Display         (formatVerbose)
 import Haskode.Provider        (Provider, stubProvider)
 import Haskode.Provider.Anthropic (anthropicProvider)
-import Haskode.Provider.OpenAI (openaiProvider)
+import Haskode.Provider.OpenAI (openaiProviderWithApiKeyOverride)
 import Haskode.Policy          (defaultPolicy)
 import Haskode.Session         (flushLog, flushLogOnException, summarizeSession, formatSessionSummary, isMeaningfulSession, loadResumeEvents, ResumeResult (..), formatResumeSummary)
-import Haskode.Tools           (defaultRegistry)
+import Haskode.Tools           (ToolRegistry, defaultRegistry, disableTools)
+import Haskode.Tui             (runTui)
 import Haskode.Agent           (AgentState (..), initState, runAgent, terminalApproval,
                                 recordSessionStart, recordSessionStartWithResume,
                                 recordSessionEnd, recordConversationReset)
@@ -63,6 +65,7 @@ data Options = Options
   , optVerbose :: !Bool              -- ^ Verbose output
   , optShowSession :: !Bool          -- ^ Show session log summary and exit
   , optResume  :: !Bool              -- ^ Resume conversation from session.jsonl
+  , optTui     :: !Bool              -- ^ Launch experimental Brick TUI mode
   } deriving stock (Show)
 
 optionsParser :: Parser Options
@@ -94,7 +97,7 @@ optionsParser = Options
   <*> optional (strOption
         ( long "api-key"
        <> metavar "KEY"
-       <> help "API key (overrides OPENAI_API_KEY env var)"
+       <> help "API key (overrides provider-specific env vars)"
         ))
   <*> optional (strOption
         ( long "base-url"
@@ -113,6 +116,10 @@ optionsParser = Options
   <*> switch
         ( long "resume"
        <> help "Resume conversation from session.jsonl in working directory"
+        )
+  <*> switch
+        ( long "tui"
+       <> help "Launch the experimental minimal Brick TUI"
         )
 
 -- ---------------------------------------------------------------------------
@@ -133,16 +140,17 @@ opts = info (optionsParser <**> helper)
 main :: IO ()
 main = do
   opts' <- execParser opts
-  cfg   <- loadConfig
+  cfg   <- maybe loadConfig loadConfigFrom (optConfig opts')
   let cfg' = applyOverrides cfg opts'
+  registry <- resolveToolRegistry cfg'
 
   handleShowSession cfg' opts'
-  printBanner
+  unless (optTui opts') printBanner
 
-  prov <- resolveProvider cfg'
-  printVerboseInfo cfg' opts'
+  prov <- resolveProvider cfg' opts' registry
+  unless (optTui opts') (printVerboseInfo cfg' opts')
 
-  state <- loadInitialState cfg' prov (optResume opts')
+  state <- loadInitialState cfg' prov registry (optResume opts')
   runSelectedMode opts' state
 
 -- ---------------------------------------------------------------------------
@@ -183,12 +191,24 @@ printVerboseInfo cfg' opts' =
     putStrLn $ formatVerbose "base url" (pcBaseUrl pc)
     putStrLn ""
 
+-- | Build the runtime tool registry from config.
+--
+-- A misspelled disabled-tool name is a config error: failing clearly is
+-- safer than silently leaving a tool enabled.
+resolveToolRegistry :: Config -> IO ToolRegistry
+resolveToolRegistry cfg' =
+  case disableTools (cfgDisabledTools cfg') defaultRegistry of
+    Right reg -> pure reg
+    Left err -> do
+      TIO.putStrLn ("Error: " <> err)
+      exitFailure
+
 -- | Build the initial 'AgentState' and, when @\-\-resume@ is set,
 --   reconstruct safe text context from @session.jsonl@.
 --   Resume does not replay provider calls or tools.
-loadInitialState :: Config -> Provider -> Bool -> IO AgentState
-loadInitialState cfg' prov resumed = do
-  let state0 = initState cfg' prov defaultPolicy defaultRegistry terminalApproval resumed
+loadInitialState :: Config -> Provider -> ToolRegistry -> Bool -> IO AgentState
+loadInitialState cfg' prov registry resumed = do
+  let state0 = initState cfg' prov defaultPolicy registry terminalApproval resumed
   (state1, resumeInfo) <- if resumed
     then do
       let dir = cfgWorkingDir cfg'
@@ -218,15 +238,20 @@ loadInitialState cfg' prov resumed = do
 --   Flushes the session log on normal exit.
 runSelectedMode :: Options -> AgentState -> IO ()
 runSelectedMode opts' state =
-  case optPrompt opts' of
-    Just prompt -> do
-      state' <- runAgentSafe state prompt
-      stateEnd <- recordSessionEnd state'
-      flushSession stateEnd
-    Nothing -> do
-      finalState <- interactiveLoop state
+  if optTui opts'
+    then do
+      finalState <- runTui (optPrompt opts') state
       stateEnd <- recordSessionEnd finalState
       flushSession stateEnd
+    else case optPrompt opts' of
+      Just prompt -> do
+        state' <- runAgentSafe state prompt
+        stateEnd <- recordSessionEnd state'
+        flushSession stateEnd
+      Nothing -> do
+        finalState <- interactiveLoop state
+        stateEnd <- recordSessionEnd finalState
+        flushSession stateEnd
 
 -- ---------------------------------------------------------------------------
 -- Provider resolution
@@ -248,20 +273,20 @@ openaiCompatibleProviders = ["openai", "ollama", "vllm", "litellm", "openrouter"
 --     * @stub@ — local echo provider (for development)
 --
 --   Any other name prints a clear error and exits.
-resolveProvider :: Config -> IO Provider
-resolveProvider cfg =
+resolveProvider :: Config -> Options -> ToolRegistry -> IO Provider
+resolveProvider cfg opts' registry =
   let name = pcProvider (cfgProvider cfg)
   in case () of
     _ | name `elem` openaiCompatibleProviders -> do
-          eitherProv <- openaiProvider cfg defaultRegistry
+          eitherProv <- openaiProviderWithApiKeyOverride (optApiKey opts') cfg registry
           case eitherProv of
             Left err -> do
               putStrLn $ "Error: " ++ err
               putStrLn ""
               putStrLn "To set an API key, either:"
-              putStrLn "  1. Set the OPENAI_API_KEY environment variable, or"
-              putStrLn "  2. Add \"pcApiKey\" to your haskode.json config file, or"
-              putStrLn "  3. Pass --api-key on the command line."
+              putStrLn "  1. Pass --api-key on the command line, or"
+              putStrLn "  2. Set the OPENAI_API_KEY environment variable, or"
+              putStrLn "  3. Add \"pcApiKey\" to your haskode.json config file."
               putStrLn ""
               putStrLn "Example:"
               putStrLn "  export OPENAI_API_KEY=\"sk-...\""
@@ -270,7 +295,7 @@ resolveProvider cfg =
             Right prov -> pure prov
       | name == "stub" -> pure stubProvider
       | name == "anthropic" -> do
-          eitherProv <- anthropicProvider cfg defaultRegistry
+          eitherProv <- anthropicProvider cfg registry
           case eitherProv of
             Left err -> do
               putStrLn $ "Error: " ++ err
@@ -336,27 +361,43 @@ interactiveLoop state = do
   flushLogOnException dir maxB (asSession state) $ do
     input <- TIO.getLine
     case parseSlashCommand input of
-      Just cmd
-        | cmd `elem` ["exit", "quit"] -> do
-            putStrLn "Goodbye!"
-            pure state
-        | cmd == "help" -> do
-            TIO.putStr formatHelp
+      Just cmd ->
+        case lookupCommand cmd of
+          Just spec
+            | cmdAvailableInCli spec ->
+                runCliCommand (cmdAction spec) state
+          Nothing -> do
+            TIO.putStrLn (formatUnknownCommand cmd)
             interactiveLoop state
-        | cmd == "status" -> do
-            TIO.putStr (formatStatus state)
-            interactiveLoop state
-        | cmd == "new" -> do
-            TIO.putStrLn formatNewConfirmation
-            let state1 = resetConversation state
-            state2 <- recordConversationReset state1
-            interactiveLoop state2
-        | otherwise -> do
+          _ -> do
             TIO.putStrLn (formatUnknownCommand cmd)
             interactiveLoop state
       Nothing -> do
         state' <- runAgentSafe state input
         interactiveLoop state'
+
+-- | Execute a parsed slash-command action in the CLI loop.
+runCliCommand :: CommandAction -> AgentState -> IO AgentState
+runCliCommand commandAction state =
+  case commandAction of
+    CmdExit -> do
+      putStrLn "Goodbye!"
+      pure state
+    CmdHelp -> do
+      TIO.putStr formatHelp
+      interactiveLoop state
+    CmdStatus -> do
+      TIO.putStr (formatStatus state)
+      interactiveLoop state
+    CmdDoctor -> do
+      output <- formatDoctor state
+      TIO.putStr output
+      interactiveLoop state
+    CmdNew -> do
+      TIO.putStrLn formatNewConfirmation
+      let state1 = resetConversation state
+      state2 <- recordConversationReset state1
+      interactiveLoop state2
 
 -- | Run the agent with exception-safe session flush.
 --   On exception the current session log is flushed before re-throwing.

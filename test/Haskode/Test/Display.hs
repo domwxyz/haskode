@@ -6,6 +6,8 @@ module Haskode.Test.Display (tests) where
 
 import Haskode.Display
     ( indentBlock,
+      DisplayEvent (..),
+      renderDisplayEvent,
       formatAssistantReply,
       formatToolExecuting,
       formatToolResult,
@@ -107,7 +109,7 @@ testDisplayFormatToolResult =
 testDisplayFormatToolUnknown :: Test
 testDisplayFormatToolUnknown =
   let result = formatToolUnknown "bad_tool"
-  in if result == "  [error] Unknown tool: bad_tool"
+  in if result == "  [error] Unknown or disabled tool: bad_tool"
        then pure $ Right ()
        else pure $ Left $ "formatToolUnknown: got " ++ show result
 
@@ -231,6 +233,94 @@ testDisplayFormatVerboseNoSecrets =
      if "sk-secret-12345" `T.isInfixOf` T.pack result
        then pure $ Right ()
        else pure $ Left $ "formatVerbose value not in output: " ++ result
+
+-- ---------------------------------------------------------------------------
+-- DisplayEvent rendering seam
+-- ---------------------------------------------------------------------------
+
+-- | Assistant events render through the existing assistant formatter.
+testDisplayEventAssistant :: Test
+testDisplayEventAssistant =
+  let result = renderDisplayEvent (DisplayAssistant "hello there")
+      expected = formatAssistantReply "hello there"
+  in if result == expected
+       then pure $ Right ()
+       else pure $ Left $ "DisplayAssistant: got " ++ show result
+
+-- | Tool events render through the existing tool formatters.
+testDisplayEventTools :: Test
+testDisplayEventTools =
+  let cases =
+        [ ( renderDisplayEvent (DisplayToolExecuting "read_file")
+          , formatToolExecuting "read_file"
+          )
+        , ( renderDisplayEvent (DisplayToolResult "file contents")
+          , formatToolResult "file contents"
+          )
+        , ( renderDisplayEvent (DisplayToolUnknown "bad_tool")
+          , formatToolUnknown "bad_tool"
+          )
+        ]
+      failures = [ (actual, expected) | (actual, expected) <- cases, actual /= expected ]
+  in if null failures
+       then pure $ Right ()
+       else pure $ Left $ "DisplayEvent tool rendering mismatch: " ++ show failures
+
+-- | Policy events render through the existing policy formatters.
+testDisplayEventPolicy :: Test
+testDisplayEventPolicy =
+  let cases =
+        [ ( renderDisplayEvent (DisplayPolicyDenied "shell" "dangerous command")
+          , formatPolicyDenied "shell" "dangerous command"
+          )
+        , ( renderDisplayEvent (DisplayPolicyConfirmationNeeded "apply_patch")
+          , formatPolicyConfirmationNeeded "apply_patch"
+          )
+        , ( renderDisplayEvent DisplayPolicyApproved
+          , formatPolicyApproved
+          )
+        , ( renderDisplayEvent DisplayPolicyRejected
+          , formatPolicyRejected
+          )
+        ]
+      failures = [ (actual, expected) | (actual, expected) <- cases, actual /= expected ]
+  in if null failures
+       then pure $ Right ()
+       else pure $ Left $ "DisplayEvent policy rendering mismatch: " ++ show failures
+
+-- | Error events render through the existing error formatter.
+testDisplayEventError :: Test
+testDisplayEventError =
+  let result = renderDisplayEvent (DisplayError "something went wrong")
+      expected = formatError "something went wrong"
+  in if result == expected
+       then pure $ Right ()
+       else pure $ Left $ "DisplayError: got " ++ show result
+
+-- | Context-limit events keep the existing assistant-visible refusal text.
+testDisplayEventContextLimit :: Test
+testDisplayEventContextLimit =
+  let result = renderDisplayEvent (DisplayContextLimitRefusal 130000 120000)
+      expected = formatAssistantReply (formatContextLimitRefusal 130000 120000)
+  in if result == expected
+       && "character-based estimate, not a token count" `T.isInfixOf` result
+       then pure $ Right ()
+       else pure $ Left $ "DisplayContextLimitRefusal: got " ++ T.unpack result
+
+-- | Non-color display events stay plain; ANSI belongs to terminal previews.
+testDisplayEventPlainOutput :: Test
+testDisplayEventPlainOutput =
+  let rendered =
+        [ renderDisplayEvent (DisplayAssistant "hello")
+        , renderDisplayEvent (DisplayToolResult "--- a\n+++ b\n+new")
+        , renderDisplayEvent (DisplayPolicyDenied "shell" "blocked")
+        , renderDisplayEvent (DisplayError "bad")
+        ]
+      hasAnsi t = "\ESC[" `T.isInfixOf` t
+  in if not (any hasAnsi rendered)
+       then pure $ Right ()
+       else pure $ Left $ "DisplayEvent output unexpectedly contained ANSI: "
+                       ++ show rendered
 
 -- | formatContextLimitRefusal includes estimated character count.
 testFormatContextLimitRefusalEstimate :: Test
@@ -371,6 +461,12 @@ tests =
   , testDisplayFormatVerbose
   , testDisplayMultilineDiffIndent
   , testDisplayFormatVerboseNoSecrets
+  , testDisplayEventAssistant
+  , testDisplayEventTools
+  , testDisplayEventPolicy
+  , testDisplayEventError
+  , testDisplayEventContextLimit
+  , testDisplayEventPlainOutput
   , testFormatContextLimitRefusalEstimate
   , testFormatContextLimitRefusalLimit
   , testFormatContextLimitRefusalDelta

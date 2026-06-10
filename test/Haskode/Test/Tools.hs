@@ -1,17 +1,18 @@
 {-# LANGUAGE OverloadedStrings    #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
 
--- | Tool registry, file-search, ignore, path-safety, and AGENTS.md tests.
+-- | Tool registry, file-search, ignore, path-safety, AGENTS.md, and SYSTEM.md tests.
 module Haskode.Test.Tools (tests) where
 
 import Control.Exception ( IOException, try )
 import Data.Aeson ( object, KeyValue((.=)) )
-import Haskode.Agent ( buildSystemPrompt, loadAgentsMd )
+import Haskode.Agent ( buildSystemPrompt, loadSystemMd, loadAgentsMd )
 import Haskode.Core ( ToolResult(trOutput) )
 import Haskode.Test.Util
     ( createTestTree, skipIfNoSymlinks, skipOnWindows, withTestDir, Test )
 import Haskode.Tools
     ( defaultRegistry,
+      disableTools,
       emptyStats,
       formatSearchMatch,
       formatStats,
@@ -28,6 +29,7 @@ import Haskode.Tools
       searchMaxFileSize,
       searchTool,
       shouldIgnorePath,
+      lookupTool,
       toolNames,
       truncateText,
       Tool(toolExecute),
@@ -411,6 +413,38 @@ testSearchInRegistry =
   if "search" `elem` toolNames defaultRegistry
     then pure $ Right ()
     else pure $ Left $ "search not in registry: " ++ show (toolNames defaultRegistry)
+
+-- | disableTools removes named tools from a registry.
+testDisableToolsRemovesNamedTools :: Test
+testDisableToolsRemovesNamedTools =
+  case disableTools ["shell", "write_file"] defaultRegistry of
+    Left err -> pure $ Left $ "disableTools unexpectedly failed: " ++ T.unpack err
+    Right reg ->
+      let missing name = case lookupTool name reg of
+            Nothing -> True
+            Just _  -> False
+          present name = case lookupTool name reg of
+            Nothing -> False
+            Just _  -> True
+      in if missing "shell"
+            && missing "write_file"
+            && present "read_file"
+        then
+          pure $ Right ()
+        else pure $ Left $
+          "disableTools did not remove expected names; remaining: " ++ show (toolNames reg)
+
+-- | Unknown disabled tool names fail clearly.
+testDisableToolsUnknownNameFails :: Test
+testDisableToolsUnknownNameFails =
+  case disableTools ["shell", "bogus_tool", "also_missing"] defaultRegistry of
+    Left err
+      | "unknown disabled tool(s): bogus_tool, also_missing" `T.isInfixOf` err
+        && "Known built-in tools:" `T.isInfixOf` err ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "disableTools error was unclear: " ++ T.unpack err
+    Right reg -> pure $ Left $
+      "disableTools should reject unknown names, got registry: " ++ show (toolNames reg)
 
 -- ---------------------------------------------------------------------------
 -- isUnderRoot tests (pure)
@@ -1413,7 +1447,7 @@ testShouldIgnorePathMultiComponent =
 -- | Without AGENTS.md, buildSystemPrompt produces the same prompt as before.
 testBuildSystemPromptNoAgentsMd :: Test
 testBuildSystemPromptNoAgentsMd = do
-  let prompt = buildSystemPrompt defaultRegistry Nothing
+  let prompt = buildSystemPrompt defaultRegistry Nothing Nothing
   if T.isInfixOf "helpful coding assistant" prompt
      && T.isInfixOf "Available tools" prompt
      && not (T.isInfixOf "AGENTS.md" prompt)
@@ -1425,13 +1459,27 @@ testBuildSystemPromptNoAgentsMd = do
 testBuildSystemPromptWithAgentsMd :: Test
 testBuildSystemPromptWithAgentsMd = do
   let agentsContent = "Always use tabs, not spaces.\nWrite tests first."
-      prompt = buildSystemPrompt defaultRegistry (Just agentsContent)
+      prompt = buildSystemPrompt defaultRegistry Nothing (Just agentsContent)
   if T.isInfixOf "Repository instructions" prompt
      && T.isInfixOf "AGENTS.md" prompt
      && T.isInfixOf "Always use tabs" prompt
      && T.isInfixOf "Write tests first" prompt
     then pure $ Right ()
     else pure $ Left $ "system prompt with AGENTS.md: " ++ T.unpack (T.take 300 prompt)
+
+-- | Disabled tools are omitted from the model-facing system prompt.
+testBuildSystemPromptOmitsDisabledTools :: Test
+testBuildSystemPromptOmitsDisabledTools =
+  case disableTools ["shell", "write_file"] defaultRegistry of
+    Left err -> pure $ Left $ "disableTools failed: " ++ T.unpack err
+    Right reg -> do
+      let prompt = buildSystemPrompt reg Nothing Nothing
+      if not ("- **shell**" `T.isInfixOf` prompt)
+         && not ("- **write_file**" `T.isInfixOf` prompt)
+         && "- **read_file**" `T.isInfixOf` prompt
+        then pure $ Right ()
+        else pure $ Left $ "system prompt still advertised disabled tools: "
+                         ++ T.unpack (T.take 500 prompt)
 
 -- | loadAgentsMd returns Nothing when no AGENTS.md exists.
 testLoadAgentsMdNoFile :: Test
@@ -1495,6 +1543,121 @@ testLoadAgentsMdOutsideRoot = do
     Nothing -> pure $ Right ()
     Just _  -> pure $ Left "loadAgentsMd should reject outside-root symlink"
 
+-- ---------------------------------------------------------------------------
+-- SYSTEM.md tests
+-- ---------------------------------------------------------------------------
+
+-- | Without SYSTEM.md, buildSystemPrompt produces the same prompt as before.
+testBuildSystemPromptNoSystemMd :: Test
+testBuildSystemPromptNoSystemMd = do
+  let prompt = buildSystemPrompt defaultRegistry Nothing Nothing
+  if T.isInfixOf "helpful coding assistant" prompt
+     && T.isInfixOf "Available tools" prompt
+     && not (T.isInfixOf "SYSTEM.md" prompt)
+     && not (T.isInfixOf "Project instructions" prompt)
+    then pure $ Right ()
+    else pure $ Left $ "system prompt without SYSTEM.md: " ++ T.unpack (T.take 200 prompt)
+
+-- | With SYSTEM.md content, the content appears in the system prompt.
+testBuildSystemPromptWithSystemMd :: Test
+testBuildSystemPromptWithSystemMd = do
+  let systemContent = "This project uses Haskell.\nDo not use Template Haskell."
+      prompt = buildSystemPrompt defaultRegistry (Just systemContent) Nothing
+  if T.isInfixOf "Project instructions" prompt
+     && T.isInfixOf "SYSTEM.md" prompt
+     && T.isInfixOf "This project uses Haskell" prompt
+     && T.isInfixOf "Do not use Template Haskell" prompt
+    then pure $ Right ()
+    else pure $ Left $ "system prompt with SYSTEM.md: " ++ T.unpack (T.take 300 prompt)
+
+-- | With both SYSTEM.md and AGENTS.md, both appear in the correct order.
+testBuildSystemPromptBothMd :: Test
+testBuildSystemPromptBothMd = do
+  let systemContent  = "System instructions here."
+      agentsContent  = "Agent instructions here."
+      prompt = buildSystemPrompt defaultRegistry (Just systemContent) (Just agentsContent)
+  if T.isInfixOf "Project instructions" prompt
+     && T.isInfixOf "Repository instructions" prompt
+     && T.isInfixOf "System instructions here" prompt
+     && T.isInfixOf "Agent instructions here" prompt
+    then pure $ Right ()
+    else pure $ Left $ "system prompt with both: " ++ T.unpack (T.take 300 prompt)
+
+-- | loadSystemMd returns Nothing when no SYSTEM.md exists.
+testLoadSystemMdNoFile :: Test
+testLoadSystemMdNoFile = withTestDir "haskode-systemmd-nofile" $ \root -> do
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  result <- loadSystemMd
+  setCurrentDirectory origDir
+  case result of
+    Nothing -> pure $ Right ()
+    Just _  -> pure $ Left "loadSystemMd should return Nothing when no file"
+
+-- | loadSystemMd reads content correctly from a valid SYSTEM.md.
+testLoadSystemMdContent :: Test
+testLoadSystemMdContent = withTestDir "haskode-systemmd-content" $ \root -> do
+  writeFile (root </> "SYSTEM.md") "# Project instructions\nUse Haskell.\n"
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  result <- loadSystemMd
+  setCurrentDirectory origDir
+  case result of
+    Just txt | T.isInfixOf "Use Haskell" txt -> pure $ Right ()
+    other -> pure $ Left $ "loadSystemMd content: " ++ show other
+
+-- | loadSystemMd returns Nothing for a file exceeding the size limit.
+testLoadSystemMdOversized :: Test
+testLoadSystemMdOversized = withTestDir "haskode-systemmd-oversized" $ \root -> do
+  let bigContent = T.replicate 40000 "x"  -- 40 KB > 32 KB limit
+  writeFile (root </> "SYSTEM.md") (T.unpack bigContent)
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  result <- loadSystemMd
+  setCurrentDirectory origDir
+  case result of
+    Nothing -> pure $ Right ()
+    Just _  -> pure $ Left "loadSystemMd should return Nothing for oversized file"
+
+-- | loadSystemMd returns Nothing for a broken symlink.
+testLoadSystemMdBrokenSymlink :: Test
+testLoadSystemMdBrokenSymlink = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-systemmd-broken"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  createDirectory root
+  createFileLink (root </> "nonexistent") (root </> "SYSTEM.md")
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  result <- loadSystemMd
+  setCurrentDirectory origDir
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure $ Right ()
+    Just _  -> pure $ Left "loadSystemMd should return Nothing for broken symlink"
+
+-- | loadSystemMd returns Nothing for a symlink pointing outside root.
+testLoadSystemMdOutsideRoot :: Test
+testLoadSystemMdOutsideRoot = do
+  tmpDir <- getTemporaryDirectory
+  let root   = tmpDir </> "haskode-systemmd-outside"
+      target = tmpDir </> "haskode-systemmd-target"
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  _ <- try (removeDirectoryRecursive target) :: IO (Either IOException ())
+  createDirectory root
+  createDirectory target
+  writeFile (target </> "SYSTEM.md") "secret instructions"
+  createFileLink (target </> "SYSTEM.md") (root </> "SYSTEM.md")
+  origDir <- getCurrentDirectory
+  setCurrentDirectory root
+  result <- loadSystemMd
+  setCurrentDirectory origDir
+  _ <- try (removeDirectoryRecursive root) :: IO (Either IOException ())
+  _ <- try (removeDirectoryRecursive target) :: IO (Either IOException ())
+  case result of
+    Nothing -> pure $ Right ()
+    Just _  -> pure $ Left "loadSystemMd should reject outside-root symlink"
+
 tests :: [Test]
 tests =
   [ testTruncateTextNoOp
@@ -1518,6 +1681,8 @@ tests =
   , testFormatSearchMatchTruncates
   , testGlobInRegistry
   , testSearchInRegistry
+  , testDisableToolsRemovesNamedTools
+  , testDisableToolsUnknownNameFails
   , testGlobToolSimple
   , testGlobToolRecursive
   , testGlobToolSkipsIgnored
@@ -1585,8 +1750,17 @@ tests =
   , testShouldIgnorePathMultiComponent
   , testBuildSystemPromptNoAgentsMd
   , testBuildSystemPromptWithAgentsMd
+  , testBuildSystemPromptOmitsDisabledTools
   , testLoadAgentsMdNoFile
   , testLoadAgentsMdContent
   , skipIfNoSymlinks testLoadAgentsMdBrokenSymlink
   , skipIfNoSymlinks testLoadAgentsMdOutsideRoot
+  , testBuildSystemPromptNoSystemMd
+  , testBuildSystemPromptWithSystemMd
+  , testBuildSystemPromptBothMd
+  , testLoadSystemMdNoFile
+  , testLoadSystemMdContent
+  , testLoadSystemMdOversized
+  , skipIfNoSymlinks testLoadSystemMdBrokenSymlink
+  , skipIfNoSymlinks testLoadSystemMdOutsideRoot
   ]

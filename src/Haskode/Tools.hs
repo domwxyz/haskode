@@ -24,6 +24,7 @@ module Haskode.Tools
   , registerTool
   , lookupTool
   , toolNames
+  , disableTools
     -- * Built-in tools
   , readFileTool
   , listFilesTool
@@ -122,6 +123,29 @@ lookupTool = Map.lookup
 
 toolNames :: ToolRegistry -> [Text]
 toolNames = Map.keys
+
+-- | Remove named built-in tools from a registry.
+--
+-- Unknown names are rejected up front so a misspelled config entry does
+-- not silently leave a tool enabled.
+disableTools :: [Text] -> ToolRegistry -> Either Text ToolRegistry
+disableTools disabled reg =
+  let unknown = uniqueInOrder [ name | name <- disabled, Map.notMember name reg ]
+  in if null unknown
+       then Right (foldr Map.delete reg disabled)
+       else Left $
+         "unknown disabled tool(s): "
+         <> T.intercalate ", " unknown
+         <> ". Known built-in tools: "
+         <> T.intercalate ", " (toolNames reg)
+
+uniqueInOrder :: Ord a => [a] -> [a]
+uniqueInOrder = go Set.empty
+  where
+    go _seen [] = []
+    go seen (x:xs)
+      | Set.member x seen = go seen xs
+      | otherwise         = x : go (Set.insert x seen) xs
 
 -- ---------------------------------------------------------------------------
 -- Helpers

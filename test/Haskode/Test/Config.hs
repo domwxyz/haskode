@@ -4,7 +4,8 @@
 -- | Config parsing, expansion, and context guard tests.
 module Haskode.Test.Config (tests) where
 
-import Control.Exception ( IOException, try )
+import Control.Exception ( IOException, finally, try )
+import Control.Monad ( when )
 import Data.Aeson ( eitherDecode )
 import Data.List ( isInfixOf )
 import Haskode.Agent
@@ -15,9 +16,11 @@ import Haskode.Config
       defaultMaxSessionLogBytes,
       expandConfig,
       expandEnvVars,
+      loadConfigFrom,
       Config(cfgProvider, cfgMaxTokens, cfgVerbose,
-             cfgMaxSessionLogBytes, cfgMaxContextChars, cfgWorkingDir),
-      ProviderConfig(pcModel, pcApiKey, pcBaseUrl) )
+             cfgMaxSessionLogBytes, cfgMaxContextChars, cfgWorkingDir,
+             cfgDisabledTools),
+      ProviderConfig(pcProvider, pcModel, pcApiKey, pcBaseUrl) )
 import Haskode.Core ( mkAssistantMessage )
 import Haskode.Policy ( defaultPolicy )
 import Haskode.Provider
@@ -27,7 +30,9 @@ import Haskode.Session
     ( events, Event(evType), EventType(EAssistantReply) )
 import Haskode.Test.Util ( Test )
 import Haskode.Tools ( defaultRegistry )
+import System.Directory ( doesFileExist, getTemporaryDirectory, removeFile )
 import System.Environment ( setEnv, unsetEnv )
+import System.FilePath ( (</>) )
 import qualified Data.ByteString.Lazy as LBS ( fromStrict )
 import qualified Data.Text as T ( Text )
 import qualified Data.Text.Encoding as TE ( encodeUtf8 )
@@ -56,6 +61,8 @@ testConfigBackcompatMinimal =
              pure $ Left $ "cfgMaxContextChars not defaulted: " ++ show (cfgMaxContextChars cfg)
          | cfgMaxSessionLogBytes cfg /= defaultMaxSessionLogBytes ->
              pure $ Left $ "cfgMaxSessionLogBytes not defaulted: " ++ show (cfgMaxSessionLogBytes cfg)
+         | cfgDisabledTools cfg /= [] ->
+             pure $ Left $ "cfgDisabledTools should default to []: " ++ show (cfgDisabledTools cfg)
          | otherwise -> pure $ Right ()
 
 -- | Config with explicit cfgMaxContextChars overrides the default.
@@ -143,11 +150,101 @@ testDefaultConfigOptionalFields =
         && cfgMaxTokens cfg == 4096
         && cfgVerbose cfg == False
         && cfgWorkingDir cfg == "."
+        && cfgDisabledTools cfg == []
      then pure $ Right ()
      else pure $ Left $ "defaultConfig values changed: "
                       ++ "ctx=" ++ show (cfgMaxContextChars cfg)
                       ++ " log=" ++ show (cfgMaxSessionLogBytes cfg)
                        ++ " toks=" ++ show (cfgMaxTokens cfg)
+                       ++ " disabled=" ++ show (cfgDisabledTools cfg)
+
+-- | defaultConfig uses the local stub provider so a fresh checkout can
+--   start without API keys or a local model server.
+testDefaultConfigProviderStub :: Test
+testDefaultConfigProviderStub =
+  let pc = cfgProvider defaultConfig
+  in if pcProvider pc == "stub"
+        && pcModel pc == "stub"
+        && pcBaseUrl pc == ""
+        && pcApiKey pc == ""
+       then pure $ Right ()
+       else pure $ Left $ "default provider should be stub, got: " ++ show pc
+
+-- | Config parses cfgDisabledTools when present.
+testConfigParsesDisabledTools :: Test
+testConfigParsesDisabledTools =
+  let json = "{" <> minimalProviderJson
+           <> ",\"cfgMaxTokens\":2048"
+           <> ",\"cfgVerbose\":false"
+           <> ",\"cfgWorkingDir\":\".\""
+           <> ",\"cfgDisabledTools\":[\"shell\",\"write_file\"]}"
+  in case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 json) :: Either String Config of
+       Left err -> pure $ Left $ "cfgDisabledTools config failed to parse: " ++ err
+       Right cfg
+         | cfgDisabledTools cfg == ["shell", "write_file"] -> pure $ Right ()
+         | otherwise -> pure $ Left $
+             "cfgDisabledTools parsed incorrectly: " ++ show (cfgDisabledTools cfg)
+
+-- | An explicit config path loads exactly that file and expands env vars.
+testLoadConfigFromExplicitPath :: Test
+testLoadConfigFromExplicitPath = do
+  tmp <- getTemporaryDirectory
+  let path = tmp </> "haskode-explicit-config-test.json"
+      json = "{"
+          <> "\"cfgProvider\":{\"pcProvider\":\"openai\",\"pcModel\":\"$HASKODE_TEST_MODEL\","
+          <> "\"pcBaseUrl\":\"https://api.openai.com\",\"pcApiKey\":\"\"},"
+          <> "\"cfgMaxTokens\":1234,"
+          <> "\"cfgVerbose\":true,"
+          <> "\"cfgWorkingDir\":\".\""
+          <> "}"
+      cleanup = do
+        exists <- doesFileExist path
+        when exists (removeFile path)
+        unsetEnv "HASKODE_TEST_MODEL"
+  setEnv "HASKODE_TEST_MODEL" "gpt-test"
+  writeFile path json
+  (do
+      cfg <- loadConfigFrom path
+      let pc = cfgProvider cfg
+      if pcProvider pc == "openai"
+         && pcModel pc == "gpt-test"
+         && cfgMaxTokens cfg == 1234
+         && cfgVerbose cfg == True
+        then pure $ Right ()
+        else pure $ Left $ "Explicit config mismatch: " ++ show cfg
+    ) `finally` cleanup
+
+-- | A missing explicit config path fails clearly instead of falling back.
+testLoadConfigFromMissingPath :: Test
+testLoadConfigFromMissingPath = do
+  tmp <- getTemporaryDirectory
+  let path = tmp </> "haskode-missing-config-test.json"
+  exists <- doesFileExist path
+  when exists (removeFile path)
+  result <- try (loadConfigFrom path) :: IO (Either IOException Config)
+  case result of
+    Left ex
+      | "config file not found" `isInfixOf` show ex -> pure $ Right ()
+      | otherwise -> pure $ Left $ "Missing config error unclear: " ++ show ex
+    Right cfg -> pure $ Left $ "Expected missing config failure, got: " ++ show cfg
+
+-- | A malformed explicit config path fails clearly instead of falling back.
+testLoadConfigFromMalformedPath :: Test
+testLoadConfigFromMalformedPath = do
+  tmp <- getTemporaryDirectory
+  let path = tmp </> "haskode-malformed-config-test.json"
+      cleanup = do
+        exists <- doesFileExist path
+        when exists (removeFile path)
+  writeFile path "{bad json"
+  (do
+      result <- try (loadConfigFrom path) :: IO (Either IOException Config)
+      case result of
+        Left ex
+          | "failed to parse config file" `isInfixOf` show ex -> pure $ Right ()
+          | otherwise -> pure $ Left $ "Malformed config error unclear: " ++ show ex
+        Right cfg -> pure $ Left $ "Expected malformed config failure, got: " ++ show cfg
+    ) `finally` cleanup
 
 -- ---------------------------------------------------------------------------
 -- Environment-variable expansion tests
@@ -256,6 +353,7 @@ testExpandConfigPreservesNonStrings = do
      && cfgVerbose cfg' == cfgVerbose cfg
      && cfgMaxContextChars cfg' == cfgMaxContextChars cfg
      && cfgMaxSessionLogBytes cfg' == cfgMaxSessionLogBytes cfg
+     && cfgDisabledTools cfg' == cfgDisabledTools cfg
     then pure $ Right ()
     else pure $ Left "expandConfig changed non-string fields"
 
@@ -338,6 +436,11 @@ tests =
   , testConfigBackcompatMalformedContextChars
   , testConfigBackcompatMalformedSessionLogBytes
   , testDefaultConfigOptionalFields
+  , testDefaultConfigProviderStub
+  , testConfigParsesDisabledTools
+  , testLoadConfigFromExplicitPath
+  , testLoadConfigFromMissingPath
+  , testLoadConfigFromMalformedPath
   , testExpandEnvVarBare
   , testExpandEnvVarBraced
   , testExpandEnvVarUndefined

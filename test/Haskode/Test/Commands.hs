@@ -10,24 +10,32 @@ import Haskode.Agent
       estimateContextChars,
       initState )
 import Haskode.Commands
-    ( parseSlashCommand,
+    ( CommandAction(..),
+      CommandSpec(..),
+      DoctorCheck(..),
+      DoctorStatus(..),
+      commandRegistry,
+      parseSlashCommand,
+      lookupCommand,
       formatHelp,
       formatStatus,
       formatUnknownCommand,
       formatNewConfirmation,
       resetConversation,
-      formatContextUsage )
+      formatContextUsage,
+      formatDoctorChecks,
+      doctorChecks )
 import Haskode.Config
     ( defaultConfig,
-      Config(cfgProvider, cfgVerbose),
+      Config(cfgProvider, cfgVerbose, cfgDisabledTools),
       ProviderConfig(pcApiKey, pcProvider, pcModel, pcBaseUrl) )
 import Haskode.Core ( mkUserMessage, Message(Message), Role(User) )
 import Haskode.Policy ( defaultPolicy )
 import Haskode.Provider ( stubProvider )
 import Haskode.Session ( events )
 import Haskode.Test.Util ( Test )
-import Haskode.Tools ( defaultRegistry )
-import qualified Data.Text as T ( isInfixOf, take, pack, unpack )
+import Haskode.Tools ( defaultRegistry, disableTools, toolNames )
+import qualified Data.Text as T ( isInfixOf, null, take, pack, unpack, lines, intercalate )
 -- ---------------------------------------------------------------------------
 -- Slash-command tests (pure)
 -- ---------------------------------------------------------------------------
@@ -94,6 +102,65 @@ testFormatHelpContent =
      && T.isInfixOf "/quit" formatHelp
     then pure $ Right ()
     else pure $ Left $ "formatHelp missing expected commands: " ++ T.unpack (T.take 200 formatHelp)
+
+testLookupCommandKnownActions :: Test
+testLookupCommandKnownActions =
+  let expected =
+        [ ("help", CmdHelp)
+        , ("status", CmdStatus)
+        , ("new", CmdNew)
+        , ("exit", CmdExit)
+        ]
+      mismatches =
+        [ name
+        | (name, action) <- expected
+        , fmap cmdAction (lookupCommand name) /= Just action
+        ]
+  in if null mismatches
+       then pure $ Right ()
+       else pure $ Left $ "lookupCommand returned wrong actions for: " ++ show mismatches
+
+testLookupCommandUnknown :: Test
+testLookupCommandUnknown =
+  if lookupCommand "missing" == Nothing
+    then pure $ Right ()
+    else pure $ Left "lookupCommand should return Nothing for unknown commands"
+
+testQuitAliasesExitAction :: Test
+testQuitAliasesExitAction =
+  case (lookupCommand "exit", lookupCommand "quit") of
+    (Just exitSpec, Just quitSpec)
+      | cmdAction exitSpec == CmdExit
+        && cmdAction quitSpec == cmdAction exitSpec ->
+          pure $ Right ()
+    _ -> pure $ Left "/quit should resolve to the same action as /exit"
+
+testFormatHelpIncludesEveryRegisteredCliCommand :: Test
+testFormatHelpIncludesEveryRegisteredCliCommand =
+  let cliCommands = filter cmdAvailableInCli commandRegistry
+      missing =
+        [ "/" <> cmdName spec
+        | spec <- cliCommands
+        , not (T.isInfixOf ("/" <> cmdName spec) formatHelp)
+        ]
+  in if null missing
+       then pure $ Right ()
+       else pure $ Left $
+         "formatHelp missing registered commands: "
+         ++ T.unpack (T.intercalate ", " missing)
+
+testFormatHelpLineCountMatchesRegistry :: Test
+testFormatHelpLineCountMatchesRegistry =
+  let cliCommands = filter cmdAvailableInCli commandRegistry
+      commandLines = filter (T.isInfixOf "  /") (T.lines formatHelp)
+  in if length commandLines == length cliCommands
+       then pure $ Right ()
+       else pure $ Left $
+         "formatHelp command count drifted from registry: "
+         ++ show (length commandLines)
+         ++ " help lines vs "
+         ++ show (length cliCommands)
+         ++ " registered CLI commands"
 
 testFormatStatusContent :: Test
 testFormatStatusContent =
@@ -163,6 +230,30 @@ testFormatStatusToolCount =
   in if T.isInfixOf "Tools:           " out
      then pure $ Right ()
      else pure $ Left $ "formatStatus missing tool count: " ++ T.unpack (T.take 300 out)
+
+testFormatStatusDisabledToolsDefaultNone :: Test
+testFormatStatusDisabledToolsDefaultNone =
+  let state = initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False
+      out   = formatStatus state
+  in if T.isInfixOf "Disabled tools: none" out
+     then pure $ Right ()
+     else pure $ Left $ "formatStatus should show no disabled tools: " ++ T.unpack (T.take 300 out)
+
+testFormatStatusDisabledToolsConfigured :: Test
+testFormatStatusDisabledToolsConfigured =
+  case disableTools ["shell", "write_file"] defaultRegistry of
+    Left err -> pure $ Left $ "disableTools failed: " ++ T.unpack err
+    Right reg -> do
+      let cfg = defaultConfig { cfgDisabledTools = ["shell", "write_file"] }
+          state = initState cfg stubProvider defaultPolicy reg autoApprove False
+          out = formatStatus state
+          toolsLines = filter (T.isInfixOf "Tools:") (T.lines out)
+          toolsLine = T.intercalate "\n" toolsLines
+      if T.isInfixOf "Disabled tools: shell, write_file" out
+         && not (T.isInfixOf "shell" toolsLine)
+         && not (T.isInfixOf "write_file" toolsLine)
+        then pure $ Right ()
+        else pure $ Left $ "formatStatus disabled-tool info mismatch: " ++ T.unpack out
 
 testFormatUnknownCommandContent :: Test
 testFormatUnknownCommandContent =
@@ -268,6 +359,166 @@ testFormatStatusResumedYes =
      else pure $ Left $ "formatStatus should show Resumed: yes: " ++ T.unpack (T.take 300 out)
 
 
+-- ---------------------------------------------------------------------------
+-- Doctor tests (pure)
+-- ---------------------------------------------------------------------------
+
+testLookupCommandDoctor :: Test
+testLookupCommandDoctor =
+  case lookupCommand "doctor" of
+    Just spec | cmdAction spec == CmdDoctor -> pure $ Right ()
+    _ -> pure $ Left "lookupCommand \"doctor\" should return CmdDoctor"
+
+testFormatHelpIncludesDoctor :: Test
+testFormatHelpIncludesDoctor =
+  if T.isInfixOf "/doctor" formatHelp
+    then pure $ Right ()
+    else pure $ Left $ "formatHelp missing /doctor: " ++ T.unpack (T.take 300 formatHelp)
+
+testFormatDoctorChecksEmpty :: Test
+testFormatDoctorChecksEmpty =
+  let out = formatDoctorChecks []
+  in if T.null out
+       then pure $ Right ()
+       else pure $ Left "formatDoctorChecks [] should be empty"
+
+testFormatDoctorChecksTags :: Test
+testFormatDoctorChecksTags =
+  let checks = [ DoctorCheck "provider" Ok "openai (hosted)"
+               , DoctorCheck "API key" Warn "missing"
+               , DoctorCheck "model" Info "not set"
+               ]
+      out = formatDoctorChecks checks
+  in if T.isInfixOf "[ok] provider: openai (hosted)" out
+        && T.isInfixOf "[warn] API key: missing" out
+        && T.isInfixOf "[info] model: not set" out
+       then pure $ Right ()
+       else pure $ Left $ "formatDoctorChecks tags mismatch: " ++ T.unpack out
+
+testDoctorStubProviderChecks :: Test
+testDoctorStubProviderChecks =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "stub"
+                            , pcModel    = "stub"
+                            , pcBaseUrl  = ""
+                            , pcApiKey   = ""
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let statuses = [(dcLabel c, dcStatus c) | c <- checks]
+        providerOk = any (\c -> dcLabel c == "provider" && dcStatus c == Ok) checks
+        keyOk = any (\c -> dcLabel c == "API key" && dcStatus c == Ok
+                           && "not required" `T.isInfixOf` dcDetail c) checks
+        modelOk = any (\c -> dcLabel c == "model" && dcStatus c == Ok) checks
+    if providerOk && keyOk && modelOk
+      then pure $ Right ()
+      else pure $ Left $ "stub doctor checks mismatch: " ++ show statuses
+
+testDoctorHostedProviderMissingKey :: Test
+testDoctorHostedProviderMissingKey =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "openai"
+                            , pcModel    = "gpt-4o"
+                            , pcBaseUrl  = ""
+                            , pcApiKey   = ""
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let keyCheck = filter (\c -> dcLabel c == "API key") checks
+    case keyCheck of
+      [c] | dcStatus c == Warn && "missing" `T.isInfixOf` dcDetail c ->
+        pure $ Right ()
+      _ -> pure $ Left $ "openai missing key should produce warn: " ++ show keyCheck
+
+testDoctorHostedProviderHasKey :: Test
+testDoctorHostedProviderHasKey =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "openai"
+                            , pcModel    = "gpt-4o"
+                            , pcBaseUrl  = ""
+                            , pcApiKey   = "sk-fake-key"
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let keyCheck = filter (\c -> dcLabel c == "API key") checks
+        out = formatDoctorChecks checks
+    case keyCheck of
+      [c] | dcStatus c == Ok && "present" `T.isInfixOf` dcDetail c ->
+        if T.isInfixOf "sk-fake-key" out
+          then pure $ Left "doctor output should not expose API key value"
+          else pure $ Right ()
+      _ -> pure $ Left $ "openai with key should produce ok: " ++ show keyCheck
+
+testDoctorLocalProviderNoKey :: Test
+testDoctorLocalProviderNoKey =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "ollama"
+                            , pcModel    = "llama3.1"
+                            , pcBaseUrl  = ""
+                            , pcApiKey   = ""
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let keyCheck = filter (\c -> dcLabel c == "API key") checks
+    case keyCheck of
+      [c] | dcStatus c == Ok && "not required" `T.isInfixOf` dcDetail c ->
+        pure $ Right ()
+      _ -> pure $ Left $ "ollama no key should be ok: " ++ show keyCheck
+
+testDoctorDisabledToolsInOutput :: Test
+testDoctorDisabledToolsInOutput =
+  case disableTools ["shell"] defaultRegistry of
+    Left err -> pure $ Left $ "disableTools failed: " ++ T.unpack err
+    Right reg -> do
+      let cfg = defaultConfig { cfgDisabledTools = ["shell"] }
+          state = initState cfg stubProvider defaultPolicy reg autoApprove False
+      checks <- doctorChecks state
+      let disabledCheck = filter (\c -> dcLabel c == "disabled tools") checks
+          out = formatDoctorChecks checks
+      case disabledCheck of
+        [c] | "shell" `T.isInfixOf` dcDetail c ->
+          if T.isInfixOf "shell" out
+            then pure $ Right ()
+            else pure $ Left "disabled tools should appear in formatted output"
+        _ -> pure $ Left $ "disabled tools check mismatch: " ++ show disabledCheck
+
+testDoctorAvailableToolsCount :: Test
+testDoctorAvailableToolsCount =
+  let state = initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let toolsCheck = filter (\c -> dcLabel c == "available tools") checks
+    case toolsCheck of
+      [c] | dcStatus c == Ok ->
+        if T.isInfixOf (T.pack (show (length (toolNames defaultRegistry)))) (dcDetail c)
+          then pure $ Right ()
+          else pure $ Left $ "tools count mismatch: " ++ T.unpack (dcDetail c)
+      _ -> pure $ Left $ "available tools check missing: " ++ show toolsCheck
+
+testDoctorNoApiKeyValueLeak :: Test
+testDoctorNoApiKeyValueLeak =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "openai"
+                            , pcModel    = "gpt-4o"
+                            , pcApiKey   = "sk-super-secret-DO-NOT-PRINT"
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let out = formatDoctorChecks checks
+    if T.isInfixOf "sk-super-secret-DO-NOT-PRINT" out
+      then pure $ Left "doctor output must not expose API key"
+      else pure $ Right ()
+
 tests :: [Test]
 tests =
   [ testParseSlashCommandHelp
@@ -280,14 +531,23 @@ tests =
   , testParseSlashCommandEmpty
   , testParseSlashCommandSpacesOnly
   , testParseSlashCommandNew
+  , testLookupCommandKnownActions
+  , testLookupCommandUnknown
+  , testLookupCommandDoctor
+  , testQuitAliasesExitAction
   , testFormatHelpContent
   , testFormatHelpContentIncludesNew
+  , testFormatHelpIncludesDoctor
+  , testFormatHelpIncludesEveryRegisteredCliCommand
+  , testFormatHelpLineCountMatchesRegistry
   , testFormatStatusContent
   , testFormatStatusNoApiKey
   , testFormatStatusVerboseOff
   , testFormatStatusVerboseOn
   , testFormatStatusStreamingNo
   , testFormatStatusToolCount
+  , testFormatStatusDisabledToolsDefaultNone
+  , testFormatStatusDisabledToolsConfigured
   , testFormatContextUsageUnderLimit
   , testFormatContextUsageExactLimit
   , testFormatContextUsageOverLimit
@@ -297,4 +557,13 @@ tests =
   , testResetConversationPreservesSession
   , testFormatStatusResumedNo
   , testFormatStatusResumedYes
+  , testFormatDoctorChecksEmpty
+  , testFormatDoctorChecksTags
+  , testDoctorStubProviderChecks
+  , testDoctorHostedProviderMissingKey
+  , testDoctorHostedProviderHasKey
+  , testDoctorLocalProviderNoKey
+  , testDoctorDisabledToolsInOutput
+  , testDoctorAvailableToolsCount
+  , testDoctorNoApiKeyValueLeak
   ]

@@ -8,12 +8,14 @@ import Data.Aeson ( object, encode, decode, KeyValue((.=)) )
 import Data.Time.Clock ( getCurrentTime )
 import Haskode.Agent
     ( AgentState(asSession, asConversation),
+      AgentDisplay(..),
       ContextStats (..),
       autoApprove,
       buildSystemPrompt,
       contextStats,
       estimateContextChars,
       initState,
+      initStateWithDisplay,
       runAgent )
 import Haskode.Config
     ( defaultConfig,
@@ -26,6 +28,7 @@ import Haskode.Core
       Message(Message, msgRole, msgToolCalls, msgCallId, msgContent),
       Role(User, Assistant),
       ToolCall(ToolCall, tcId, tcName) )
+import Haskode.Display ( DisplayEvent(..) )
 import Haskode.Patch ( makePatch, showDiff )
 import Haskode.Policy ( checkPolicy, defaultPolicy, Decision(..) )
 import Haskode.Provider
@@ -45,6 +48,7 @@ import Haskode.Session
 import Haskode.Test.Util ( createTestTree, Test )
 import Haskode.Tools
     ( defaultRegistry,
+      disableTools,
       extractTextField,
       listFilesTool,
       readFileTool,
@@ -57,6 +61,7 @@ import System.IO ( hClose, openTempFile )
 import System.Info ( os )
 import qualified Data.Text as T ( Text, isInfixOf, pack, unpack )
 import qualified Data.Text.IO as TIO ( hPutStrLn )
+import qualified Data.IORef as IORef
 
 -- ---------------------------------------------------------------------------
 -- Basic data and registry tests
@@ -122,6 +127,41 @@ testToolRegistry = do
   if "read_file" `elem` names && "shell" `elem` names
     then pure $ Right ()
     else pure $ Left $ "Default registry missing tools: " ++ show names
+
+-- | A tool removed from the registry cannot execute even if a provider
+--   calls it anyway.
+testDisabledToolCallUsesUnknownPath :: Test
+testDisabledToolCallUsesUnknownPath = do
+  case disableTools ["shell"] defaultRegistry of
+    Left err -> pure $ Left $ "disableTools failed: " ++ T.unpack err
+    Right reg -> do
+      prov <- scriptedProvider
+        [ CompletionResponse
+            { crReply     = mkAssistantMessage "Let me run that."
+            , crToolCalls = Just
+                [ ToolCall "tc-disabled-shell" "shell"
+                    (object ["command" .= ("echo should-not-run" :: T.Text)])
+                ]
+            }
+        , CompletionResponse
+            { crReply     = mkAssistantMessage "I could not run it."
+            , crToolCalls = Nothing
+            }
+        ]
+      let state = initState defaultConfig prov defaultPolicy reg autoApprove False
+      state' <- runAgent state "try a shell command"
+      let evts = events (asSession state')
+          toolResults = filter (\e -> evType e == EToolResult) evts
+          toolCalls = filter (\e -> evType e == EToolCall) evts
+          disabledResult =
+            any (T.isInfixOf "unknown or disabled tool shell" . evData) toolResults
+      if disabledResult && null toolCalls
+        then pure $ Right ()
+        else pure $ Left $
+          "disabled tool should not execute; toolResults="
+          ++ show toolResults
+          ++ " toolCalls="
+          ++ show toolCalls
 
 testSessionLog :: Test
 testSessionLog = do
@@ -360,6 +400,32 @@ testAgentLoopEvents = do
     then pure $ Right ()
     else pure $ Left $ "Agent session events missing, got: " ++ show types
 
+-- | Agent display events can be consumed without rendering terminal text.
+testAgentCustomDisplaySink :: Test
+testAgentCustomDisplaySink = do
+  displayRef <- IORef.newIORef []
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "display reply"
+        , crToolCalls = Nothing
+        }
+    ]
+  let cfg = defaultConfig
+      capture event = IORef.modifyIORef displayRef (<> [event])
+      display = AgentDisplay
+        { agentDisplayEvent = capture
+        , agentDisplayStreamBegin = pure ()
+        , agentDisplayStreamChunk = \_chunk -> pure ()
+        , agentDisplayStreamEnd = pure ()
+        , agentDisplayPreview = \_toolCall -> pure ()
+        }
+      state = initStateWithDisplay cfg prov defaultPolicy defaultRegistry autoApprove display False
+  _ <- runAgent state "hello agent"
+  displayEvents <- IORef.readIORef displayRef
+  if DisplayAssistant "display reply" `elem` displayEvents
+    then pure $ Right ()
+    else pure $ Left $ "Custom display sink missed assistant event: " ++ show displayEvents
+
 -- | Agent loop executes a tool call and continues to final reply.
 testAgentLoopToolExecution :: Test
 testAgentLoopToolExecution = do
@@ -395,7 +461,7 @@ testAgentLoopToolExecution = do
 -- | buildSystemPrompt includes tool names.
 testBuildSystemPrompt :: Test
 testBuildSystemPrompt = do
-  let prompt = buildSystemPrompt defaultRegistry Nothing
+  let prompt = buildSystemPrompt defaultRegistry Nothing Nothing
   if T.isInfixOf "read_file" prompt
      && T.isInfixOf "list_files" prompt
      && T.isInfixOf "shell" prompt
@@ -546,6 +612,7 @@ tests =
   , testPolicyDeny
   , testPolicyAsk
   , testToolRegistry
+  , testDisabledToolCallUsesUnknownPath
   , testSessionLog
   , testPatchDiff
   , testToolCallJSONParse
@@ -559,6 +626,7 @@ tests =
   , testPolicyStructuredArgs
   , testExtractTextField
   , testAgentLoopEvents
+  , testAgentCustomDisplaySink
   , testAgentLoopToolExecution
   , testMultiToolConversationHistory
   , testBuildSystemPrompt

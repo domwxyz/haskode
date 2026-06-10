@@ -7,7 +7,12 @@ module Haskode.Test.Provider (tests) where
 import Data.Aeson ( object, KeyValue((.=)) )
 import Data.Maybe ( isNothing )
 import Haskode.Agent
-    ( AgentState(asSession), autoApprove, initState, runAgent )
+    ( AgentDisplay(..),
+      AgentState(asSession),
+      autoApprove,
+      initState,
+      initStateWithDisplay,
+      runAgent )
 import Haskode.Config ( defaultConfig )
 import Haskode.Core
     ( mkAssistantMessage, Message(msgContent), ToolCall(ToolCall) )
@@ -124,6 +129,32 @@ testAgentStreamingTextReply = do
         []    -> pure $ Left "No EAssistantReply event found"
     else pure $ Left $ "Missing session events, got: " ++ show types
 
+-- | Streaming display callbacks can be consumed without writing to stdout.
+testAgentStreamingDisplaySink :: Test
+testAgentStreamingDisplaySink = do
+  streamRef <- Data.IORef.newIORef []
+  prov <- fakeStreamingProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "streamed hello"
+        , crToolCalls = Nothing
+        }
+    ]
+  let push value = Data.IORef.modifyIORef streamRef (<> [value])
+      display = AgentDisplay
+        { agentDisplayEvent = \_event -> pure ()
+        , agentDisplayStreamBegin = push "begin"
+        , agentDisplayStreamChunk = \chunk -> push ("chunk:" <> chunk)
+        , agentDisplayStreamEnd = push "end"
+        , agentDisplayPreview = \_toolCall -> pure ()
+        }
+      state = initStateWithDisplay defaultConfig prov defaultPolicy defaultRegistry autoApprove display False
+  _ <- runAgent state "hello agent"
+  streamEvents <- Data.IORef.readIORef streamRef
+  let expected = ["begin", "chunk:streamed hello", "end"]
+  if streamEvents == expected
+    then pure $ Right ()
+    else pure $ Left $ "Streaming display sink mismatch: " ++ show streamEvents
+
 -- | Streaming provider handles tool calls correctly.
 --   Tool calls from the final CompletionResponse are processed
 --   after the stream completes.
@@ -238,6 +269,7 @@ tests =
   , testScriptedProviderNoStream
   , testStreamHandlerConstruction
   , testAgentStreamingTextReply
+  , testAgentStreamingDisplaySink
   , testAgentStreamingToolCalls
   , testAgentNonStreamingFallback
   , testAgentStreamingToolCallOnlyLazyDisplay

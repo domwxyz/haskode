@@ -23,6 +23,9 @@
 module Haskode.Display
   ( -- * Indentation
     indentBlock
+    -- * Structured display seam
+  , DisplayEvent (..)
+  , renderDisplayEvent
     -- * Assistant output
   , formatAssistantReply
     -- * Streaming assistant output
@@ -67,6 +70,56 @@ import Data.Text          (Text)
 import qualified Data.Text    as T
 import qualified Data.Text.IO as TIO
 import System.IO             (hFlush, hSetBuffering, stdout, BufferMode (..))
+
+-- ---------------------------------------------------------------------------
+-- Structured display seam
+-- ---------------------------------------------------------------------------
+
+-- | Small structured boundary for terminal-visible agent output.
+--
+-- This is the CLI/TUI seam, not a general event bus.  The CLI renders these
+-- events back to the existing terminal strings; a future TUI can consume the
+-- same values without parsing formatted text.  Streaming and confirmation
+-- previews intentionally stay on their existing terminal-specific paths for
+-- now.
+data DisplayEvent
+  = DisplayAssistant Text
+  | DisplayToolExecuting Text
+  | DisplayToolResult Text
+  | DisplayToolUnknown Text
+  | DisplayPolicyDenied Text Text
+  | DisplayPolicyConfirmationNeeded Text
+  | DisplayPolicyApproved
+  | DisplayPolicyRejected
+  | DisplayError Text
+  | DisplayContextLimitRefusal Int Int
+  deriving (Eq, Show)
+
+-- | Render one display event to the same plain terminal text used by the
+-- existing CLI.  ANSI color remains outside this boundary.
+renderDisplayEvent :: DisplayEvent -> Text
+renderDisplayEvent event =
+  case event of
+    DisplayAssistant content ->
+      formatAssistantReply content
+    DisplayToolExecuting name ->
+      formatToolExecuting name
+    DisplayToolResult output ->
+      formatToolResult output
+    DisplayToolUnknown name ->
+      formatToolUnknown name
+    DisplayPolicyDenied name reason ->
+      formatPolicyDenied name reason
+    DisplayPolicyConfirmationNeeded name ->
+      formatPolicyConfirmationNeeded name
+    DisplayPolicyApproved ->
+      formatPolicyApproved
+    DisplayPolicyRejected ->
+      formatPolicyRejected
+    DisplayError msg ->
+      formatError msg
+    DisplayContextLimitRefusal estimated maxChars ->
+      formatAssistantReply (formatContextLimitRefusal estimated maxChars)
 
 -- ---------------------------------------------------------------------------
 -- Indentation
@@ -172,11 +225,11 @@ formatToolExecuting name = "  [tool] Executing: " <> name
 formatToolResult :: Text -> Text
 formatToolResult output = "  [tool] Result: " <> output
 
--- | Format an unknown-tool error.
+-- | Format an unknown-or-disabled-tool error.
 --
--- Produces: @  [error] Unknown tool: <name>@
+-- Produces: @  [error] Unknown or disabled tool: <name>@
 formatToolUnknown :: Text -> Text
-formatToolUnknown name = "  [error] Unknown tool: " <> name
+formatToolUnknown name = "  [error] Unknown or disabled tool: " <> name
 
 -- ---------------------------------------------------------------------------
 -- Policy output

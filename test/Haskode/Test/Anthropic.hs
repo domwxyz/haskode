@@ -461,14 +461,20 @@ testAnthropicUnsupportedBlock =
        Right _ -> pure $ Left "Expected unsupported block error"
 
 -- | anthropicProvider fails clearly when no Anthropic key is available.
+--   The error message mentions all three key sources in precedence order.
 testAnthropicProviderMissingKey :: Test
 testAnthropicProviderMissingKey =
   withAnthropicApiKey Nothing $ do
     result <- anthropicProvider (anthropicConfig "") mempty
     case result of
       Left msg
-        | "ANTHROPIC_API_KEY" `T.isInfixOf` T.pack msg -> pure $ Right ()
-        | otherwise -> pure $ Left $ "Missing-key message should mention ANTHROPIC_API_KEY: " ++ msg
+        | not ("--api-key" `T.isInfixOf` T.pack msg) ->
+            pure $ Left $ "Missing-key message should mention --api-key: " ++ msg
+        | not ("ANTHROPIC_API_KEY" `T.isInfixOf` T.pack msg) ->
+            pure $ Left $ "Missing-key message should mention ANTHROPIC_API_KEY: " ++ msg
+        | not ("pcApiKey" `T.isInfixOf` T.pack msg) ->
+            pure $ Left $ "Missing-key message should mention pcApiKey: " ++ msg
+        | otherwise -> pure $ Right ()
       Right _ -> pure $ Left "Expected missing-key error, got provider"
 
 -- | A config pcApiKey is enough to construct the provider, and the
