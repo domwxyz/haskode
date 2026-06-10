@@ -19,7 +19,7 @@ module Haskode.Commands
 import Data.Text          (Text)
 import qualified Data.Text as T
 
-import Haskode.Agent      (AgentState (..), estimateContextChars)
+import Haskode.Agent      (AgentState (..), ContextStats (..), contextStats)
 import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Core       (Conversation, emptyConversation)
 import Haskode.Provider   (Provider (..))
@@ -109,14 +109,15 @@ formatStatus st =
 -- (or overage).  This is an estimate, not exact token count.
 formatContextUsage :: Conversation -> Int -> Text
 formatContextUsage conv maxChars =
-  let est     = estimateContextChars conv
-      overBy  = est - maxChars
-      pct     = if maxChars > 0 then est * 100 `div` maxChars else 0
+  let stats    = contextStats conv maxChars
       overLine
-        | overBy > 0 = "Over limit:     " <> T.pack (show overBy) <> " chars"
-        | otherwise  = "Remaining:      " <> T.pack (show (maxChars - est)) <> " chars"
+        | csRemaining stats < 0 =
+            "Over limit:     " <> T.pack (show (negate (csRemaining stats))) <> " chars"
+        | otherwise =
+            "Remaining:      " <> T.pack (show (csRemaining stats)) <> " chars"
   in T.unlines
-       [ "Context est:    " <> T.pack (show est) <> " chars (" <> T.pack (show pct) <> "% used)"
+       [ "Context est:    " <> T.pack (show (csCurrent stats)) <> " chars ("
+                            <> T.pack (show (csPercent stats)) <> "% used)"
        , overLine
        ]
 

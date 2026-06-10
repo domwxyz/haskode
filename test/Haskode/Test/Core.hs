@@ -8,8 +8,10 @@ import Data.Aeson ( object, encode, decode, KeyValue((.=)) )
 import Data.Time.Clock ( getCurrentTime )
 import Haskode.Agent
     ( AgentState(asSession, asConversation),
+      ContextStats (..),
       autoApprove,
       buildSystemPrompt,
+      contextStats,
       estimateContextChars,
       initState,
       runAgent )
@@ -453,6 +455,87 @@ testDefaultConfigMaxContextChars =
     else pure $ Left $ "defaultConfig cfgMaxContextChars: "
                      ++ show (cfgMaxContextChars defaultConfig)
 
+-- ---------------------------------------------------------------------------
+-- ContextStats tests
+-- ---------------------------------------------------------------------------
+
+-- | contextStats returns correct values for a normal (well under limit) case.
+testContextStatsNormal :: Test
+testContextStatsNormal = do
+  let conv   = [mkUserMessage "hello"]  -- 5 + 20 = 25 chars
+      maxC   = 120000
+      stats  = contextStats conv maxC
+      expect = ContextStats
+        { csCurrent   = estimateContextChars conv
+        , csMax       = maxC
+        , csRemaining = maxC - estimateContextChars conv
+        , csPercent   = 0
+        }
+  if stats == expect
+    then pure $ Right ()
+    else pure $ Left $ "contextStats normal: " ++ show stats
+
+-- | contextStats shows correct percentage near the limit.
+testContextStatsNearLimit :: Test
+testContextStatsNearLimit = do
+  let conv  = [mkUserMessage "hello"]  -- 25 chars
+      maxC  = 100
+      stats = contextStats conv maxC
+  if csCurrent stats == 25
+     && csMax stats == 100
+     && csRemaining stats == 75
+     && csPercent stats == 25
+    then pure $ Right ()
+    else pure $ Left $ "contextStats near-limit: " ++ show stats
+
+-- | contextStats at exactly the limit shows 100% and 0 remaining.
+testContextStatsExactLimit :: Test
+testContextStatsExactLimit = do
+  let conv  = [mkUserMessage "hello"]  -- 25 chars
+      maxC  = 25
+      stats = contextStats conv maxC
+  if csCurrent stats == 25
+     && csMax stats == 25
+     && csRemaining stats == 0
+     && csPercent stats == 100
+    then pure $ Right ()
+    else pure $ Left $ "contextStats exact-limit: " ++ show stats
+
+-- | contextStats over limit shows negative remaining and >100%.
+testContextStatsOverLimit :: Test
+testContextStatsOverLimit = do
+  let conv  = [mkUserMessage "this is a longer message for testing"]
+      maxC  = 10
+      stats = contextStats conv maxC
+  if csCurrent stats > maxC
+     && csMax stats == 10
+     && csRemaining stats < 0
+     && csPercent stats > 100
+    then pure $ Right ()
+    else pure $ Left $ "contextStats over-limit: " ++ show stats
+
+-- | contextStats on empty conversation returns zero current and 0%.
+testContextStatsEmpty :: Test
+testContextStatsEmpty = do
+  let stats = contextStats [] 120000
+  if csCurrent stats == 0
+     && csRemaining stats == 120000
+     && csPercent stats == 0
+    then pure $ Right ()
+    else pure $ Left $ "contextStats empty: " ++ show stats
+
+-- | contextStats with zero max avoids division by zero.
+testContextStatsZeroMax :: Test
+testContextStatsZeroMax = do
+  let conv  = [mkUserMessage "hello"]
+      stats = contextStats conv 0
+  if csCurrent stats > 0
+     && csMax stats == 0
+     && csRemaining stats < 0
+     && csPercent stats == 0  -- no division by zero
+    then pure $ Right ()
+    else pure $ Left $ "contextStats zero-max: " ++ show stats
+
 tests :: [Test]
 tests =
   [ testMessageRoundtrip
@@ -485,4 +568,10 @@ tests =
   , testEstimateContextCharsEmpty
   , testDefaultConfigMaxContextChars
   , testShellApprovalFlow
+  , testContextStatsNormal
+  , testContextStatsNearLimit
+  , testContextStatsExactLimit
+  , testContextStatsOverLimit
+  , testContextStatsEmpty
+  , testContextStatsZeroMax
   ]

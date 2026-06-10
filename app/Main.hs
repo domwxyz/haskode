@@ -19,6 +19,7 @@
 --
 --     * @openai@, @ollama@, @vllm@, @litellm@, @openrouter@ — any
 --       OpenAI-compatible @\/v1\/chat\/completions@ endpoint
+--     * @anthropic@ — Anthropic Messages API
 --     * @stub@ — local echo provider (for development and testing)
 --
 -- All other values produce a clear error message.
@@ -37,6 +38,7 @@ import Haskode.Commands        (parseSlashCommand, formatHelp, formatStatus, for
 import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig)
 import Haskode.Display         (formatVerbose)
 import Haskode.Provider        (Provider, stubProvider)
+import Haskode.Provider.Anthropic (anthropicProvider)
 import Haskode.Provider.OpenAI (openaiProvider)
 import Haskode.Policy          (defaultPolicy)
 import Haskode.Session         (flushLog, flushLogOnException, summarizeSession, formatSessionSummary, isMeaningfulSession, loadResumeEvents, ResumeResult (..), formatResumeSummary)
@@ -81,7 +83,7 @@ optionsParser = Options
         ( long "provider"
        <> short 'P'
        <> metavar "NAME"
-       <> help "Provider: openai, ollama, vllm, litellm, openrouter, stub"
+       <> help "Provider: openai, anthropic, ollama, vllm, litellm, openrouter, stub"
         ))
   <*> optional (strOption
         ( long "model"
@@ -242,6 +244,7 @@ openaiCompatibleProviders = ["openai", "ollama", "vllm", "litellm", "openrouter"
 --
 --     * @openai@, @ollama@, @vllm@, @litellm@, @openrouter@ —
 --       any OpenAI-compatible endpoint, handled by 'openaiProvider'
+--     * @anthropic@ — Anthropic Messages API
 --     * @stub@ — local echo provider (for development)
 --
 --   Any other name prints a clear error and exits.
@@ -266,11 +269,28 @@ resolveProvider cfg =
               exitFailure
             Right prov -> pure prov
       | name == "stub" -> pure stubProvider
+      | name == "anthropic" -> do
+          eitherProv <- anthropicProvider cfg defaultRegistry
+          case eitherProv of
+            Left err -> do
+              putStrLn $ "Error: " ++ err
+              putStrLn ""
+              putStrLn "To set an Anthropic API key, either:"
+              putStrLn "  1. Pass --api-key on the command line, or"
+              putStrLn "  2. Add \"pcApiKey\" to your haskode.json config file, or"
+              putStrLn "  3. Set the ANTHROPIC_API_KEY environment variable."
+              putStrLn ""
+              putStrLn "Example:"
+              putStrLn "  export ANTHROPIC_API_KEY=\"sk-ant-...\""
+              putStrLn "  cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --prompt \"Hello\""
+              exitFailure
+            Right prov -> pure prov
       | otherwise -> do
           putStrLn $ "Error: unknown provider \"" ++ name ++ "\"."
           putStrLn ""
           putStrLn "Supported providers:"
           putStrLn $ "  " ++ unwords openaiCompatibleProviders ++ "  (OpenAI-compatible HTTP)"
+          putStrLn "  anthropic                                  (Anthropic Messages API)"
           putStrLn "  stub                                        (local echo, for development)"
           putStrLn ""
           putStrLn "Example:"

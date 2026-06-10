@@ -50,6 +50,7 @@ library
     Haskode.Core
     Haskode.Config
     Haskode.Provider
+    Haskode.Provider.Anthropic
     Haskode.Provider.OpenAI
     Haskode.Tools
     Haskode.Policy
@@ -82,6 +83,7 @@ test-suite haskode-test
   main-is:          Spec.hs
   other-modules:
     Haskode.Test.Commands
+    Haskode.Test.Anthropic
     Haskode.Test.Config
     Haskode.Test.Core
     Haskode.Test.Display

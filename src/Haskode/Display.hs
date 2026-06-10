@@ -271,7 +271,7 @@ formatError msg = "  [error] " <> msg
 -- | Format a refusal message when the conversation exceeds the context limit.
 --
 -- Includes estimated size, configured limit, percentage used, over-limit
--- delta, and a note that Haskode does not auto-truncate or summarize.
+-- delta, and a note that this is a character-based estimate (not token-based).
 -- The layout mirrors 'Haskode.Commands.formatContextUsage' used by /status.
 --
 -- >>> formatContextLimitRefusal 130000 120000
@@ -285,11 +285,12 @@ formatContextLimitRefusal estimated maxChars =
                             <> T.pack (show pct) <> "% used)\n"
      <> "  Limit:          " <> T.pack (show maxChars) <> " chars\n"
      <> "  Over limit by:  " <> T.pack (show overBy) <> " chars\n"
-     <> "  Note: Haskode does not auto-truncate or summarize conversations.\n"
+     <> "  Note: This is a character-based estimate, not a token count.\n"
+     <> "  Haskode does not auto-truncate or summarize conversations.\n"
      <> "  Suggested next steps:\n"
-     <> "    - Start a fresh session (/new or restart)\n"
+     <> "    - Use /new to start a fresh session\n"
      <> "    - Reduce the size of your prompt or context\n"
-     <> "    - Raise cfgMaxContextChars in your config"
+     <> "    - Start a new session or raise cfgMaxContextChars"
 
 -- ---------------------------------------------------------------------------
 -- Verbose diagnostics

@@ -272,6 +272,14 @@ testFormatContextLimitRefusalNoAutoTruncate =
        then pure $ Right ()
        else pure $ Left $ "Missing no-auto-truncate note in: " ++ T.unpack msg
 
+-- | formatContextLimitRefusal states this is character-based, not token-based.
+testFormatContextLimitRefusalCharBased :: Test
+testFormatContextLimitRefusalCharBased =
+  let msg = formatContextLimitRefusal 130000 120000
+  in if "character-based estimate, not a token count" `T.isInfixOf` msg
+       then pure $ Right ()
+       else pure $ Left $ "Missing character-based note in: " ++ T.unpack msg
+
 -- | formatContextLimitRefusal includes suggested next steps.
 testFormatContextLimitRefusalNextSteps :: Test
 testFormatContextLimitRefusalNextSteps =
@@ -368,6 +376,7 @@ tests =
   , testFormatContextLimitRefusalDelta
   , testFormatContextLimitRefusalPercent
   , testFormatContextLimitRefusalNoAutoTruncate
+  , testFormatContextLimitRefusalCharBased
   , testFormatContextLimitRefusalNextSteps
   , testFormatContextLimitRefusalExactOver
   , testFormatStreamBegin

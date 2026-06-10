@@ -42,7 +42,7 @@ import Haskode.Patch
       countAddedLines, countRemovedLines, BatchOp(..),
       ValidatedBatchOp(..), applyValidatedBatchOps,
       formatBatchApplySummary, formatNewFilePreview,
-      formatDiffCountSummary )
+      formatDiffCountSummary, colorizeUnifiedDiff )
 import Haskode.Tools
     ( defaultRegistry,
       applyPatchTool,
@@ -2014,6 +2014,92 @@ testFormatNewFilePreviewPure =
        then pure $ Right ()
        else pure $ Left $ "formatNewFilePreview: " ++ T.unpack (T.take 300 out)
 
+-- ---------------------------------------------------------------------------
+-- Colored diff rendering tests
+-- ---------------------------------------------------------------------------
+
+-- | colorizeUnifiedDiff adds ANSI codes to added lines.
+testColorizeAddedLine :: Test
+testColorizeAddedLine =
+  let colored = colorizeUnifiedDiff "+new line\n"
+  in if T.isInfixOf "\ESC[32m" colored && T.isInfixOf "+new line" colored
+        && T.isInfixOf "\ESC[0m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize added: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff adds ANSI codes to removed lines.
+testColorizeRemovedLine :: Test
+testColorizeRemovedLine =
+  let colored = colorizeUnifiedDiff "-old line\n"
+  in if T.isInfixOf "\ESC[31m" colored && T.isInfixOf "-old line" colored
+        && T.isInfixOf "\ESC[0m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize removed: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff adds ANSI codes to hunk headers.
+testColorizeHunkHeader :: Test
+testColorizeHunkHeader =
+  let colored = colorizeUnifiedDiff "@@ -1 +1 @@\n"
+  in if T.isInfixOf "\ESC[1;36m" colored && T.isInfixOf "@@ -1 +1 @@" colored
+        && T.isInfixOf "\ESC[0m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize hunk: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff colors --- file header as bold red, not plain red.
+testColorizeFileHeaderDash :: Test
+testColorizeFileHeaderDash =
+  let colored = colorizeUnifiedDiff "--- Foo.hs\n"
+  in if T.isInfixOf "\ESC[1;31m" colored && T.isInfixOf "--- Foo.hs" colored
+        && T.isInfixOf "\ESC[0m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize --- header: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff colors +++ file header as bold green, not plain green.
+testColorizeFileHeaderPlus :: Test
+testColorizeFileHeaderPlus =
+  let colored = colorizeUnifiedDiff "+++ Foo.hs\n"
+  in if T.isInfixOf "\ESC[1;32m" colored && T.isInfixOf "+++ Foo.hs" colored
+        && T.isInfixOf "\ESC[0m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize +++ header: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff leaves context lines uncolored.
+testColorizeContextLine :: Test
+testColorizeContextLine =
+  let colored = colorizeUnifiedDiff "  context line\n"
+  in if colored == "  context line\n"
+       then pure $ Right ()
+       else pure $ Left $ "colorize context: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff does not confuse --- file header with a removed line.
+testColorizeDashDashDashNotRemoved :: Test
+testColorizeDashDashDashNotRemoved =
+  let colored = colorizeUnifiedDiff "--- Foo.hs\n"
+  in if T.isInfixOf "\ESC[1;31m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize --- treated as removed: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff does not confuse +++ file header with an added line.
+testColorizePlusPlusPlusNotAdded :: Test
+testColorizePlusPlusPlusNotAdded =
+  let colored = colorizeUnifiedDiff "+++ Foo.hs\n"
+  in if T.isInfixOf "\ESC[1;32m" colored
+       then pure $ Right ()
+       else pure $ Left $ "colorize +++ treated as added: " ++ T.unpack colored
+
+-- | colorizeUnifiedDiff on a full diff adds codes to all expected lines.
+testColorizeFullDiff :: Test
+testColorizeFullDiff =
+  let diff = showDiff (makePatch "Foo.hs" "a\nb\n" "a\nc\n")
+      colored = colorizeUnifiedDiff diff
+  in if T.isInfixOf "\ESC[1;31m" colored   -- --- header
+        && T.isInfixOf "\ESC[1;32m" colored  -- +++ header
+        && T.isInfixOf "\ESC[1;36m" colored  -- @@ hunk
+        && T.isInfixOf "\ESC[31m" colored    -- -b
+        && T.isInfixOf "\ESC[32m" colored    -- +c
+       then pure $ Right ()
+       else pure $ Left $ "colorize full diff: " ++ T.unpack (T.take 300 colored)
+
 tests :: [Test]
 tests =
   [ testComputePatchPreviewNormal
@@ -2107,4 +2193,13 @@ tests =
   , testFormatDiffCountSummaryBoth
   , testFormatDiffCountSummaryAddedOnly
   , testFormatNewFilePreviewPure
+  , testColorizeAddedLine
+  , testColorizeRemovedLine
+  , testColorizeHunkHeader
+  , testColorizeFileHeaderDash
+  , testColorizeFileHeaderPlus
+  , testColorizeContextLine
+  , testColorizeDashDashDashNotRemoved
+  , testColorizePlusPlusPlusNotAdded
+  , testColorizeFullDiff
   ]

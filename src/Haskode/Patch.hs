@@ -27,6 +27,7 @@ module Haskode.Patch
   , rollbackPatch
     -- * Diff helpers
   , showDiff
+  , colorizeUnifiedDiff
   , countDiffLines
   , countAddedLines
   , countRemovedLines
@@ -130,6 +131,35 @@ showDiff p = T.unlines $
     newLines     = T.lines (patchNew p)
     removedCount = countDiffLines (patchOld p)
     addedCount   = countDiffLines (patchNew p)
+
+-- ---------------------------------------------------------------------------
+-- Colored diff rendering
+-- ---------------------------------------------------------------------------
+
+-- | Add ANSI color codes to a unified diff for terminal display.
+--   Preserves the plain diff structure; only wraps lines with color:
+--
+--   * @---@ file headers (bold red)
+--   * @+++@ file headers (bold green)
+--   * @\@\@@ hunk headers (bold cyan)
+--   * @-@ removed content (red)
+--   * @+@ added content (green)
+colorizeUnifiedDiff :: Text -> Text
+colorizeUnifiedDiff = T.unlines . map colorLine . T.lines
+  where
+    colorLine l
+      | T.isPrefixOf "--- " l = boldRed  <> l <> reset
+      | T.isPrefixOf "+++ " l = boldGreen <> l <> reset
+      | T.isPrefixOf "@@ "  l = boldCyan <> l <> reset
+      | T.isPrefixOf "-" l    = red      <> l <> reset
+      | T.isPrefixOf "+" l    = green    <> l <> reset
+      | otherwise              = l
+    boldRed   = "\ESC[1;31m"
+    boldGreen = "\ESC[1;32m"
+    boldCyan  = "\ESC[1;36m"
+    red       = "\ESC[31m"
+    green     = "\ESC[32m"
+    reset     = "\ESC[0m"
 
 -- ---------------------------------------------------------------------------
 -- Path safety helpers (internal)

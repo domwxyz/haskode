@@ -13,10 +13,11 @@
 --   * 'stubProvider' — echoes the last user message (for development)
 --   * 'scriptedProvider' — replays a fixed sequence of responses (for testing)
 --
--- The real OpenAI-compatible provider lives in "Haskode.Provider.OpenAI".
--- Import it directly:
+-- The real HTTP providers live in "Haskode.Provider.OpenAI" and
+-- "Haskode.Provider.Anthropic". Import them directly:
 --
 -- > import Haskode.Provider.OpenAI (openaiProvider)
+-- > import Haskode.Provider.Anthropic (anthropicProvider)
 --
 -- That module also exports the pure request\/response conversion
 -- functions so they can be tested without network I\/O.

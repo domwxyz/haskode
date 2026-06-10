@@ -89,6 +89,10 @@ cabal run haskode -- --prompt "What files are in the current directory?"
 export OPENAI_API_KEY="sk-..."
 cabal run haskode -- --provider openai --prompt "Say hello in one sentence."
 
+# With Anthropic (Messages API, including streaming)
+export ANTHROPIC_API_KEY="sk-ant-..."
+cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --prompt "Say hello in one sentence."
+
 # Override model and base URL from the command line
 cabal run haskode -- --provider openai --model gpt-4o --prompt "Hello"
 
@@ -116,7 +120,7 @@ In interactive mode, the following slash commands are available:
 |---------|-------------|
 | `/help` | Show available commands |
 | `/new` | Start a fresh conversation context |
-| `/status` | Show current provider, model, working dir, and runtime info |
+| `/status` | Show current provider, model, working dir, character-based context usage, and runtime info |
 | `/exit` | Save session log and exit |
 | `/quit` | Same as `/exit` |
 
@@ -143,6 +147,23 @@ Create a `haskode.json` in your project root:
 
 Search order: `./haskode.json` → `./haskode.jsonc` → `~/.config/haskode/config.json` → defaults.
 
+Anthropic config example:
+
+```json
+{
+  "cfgProvider": {
+    "pcProvider": "anthropic",
+    "pcModel": "claude-3-5-sonnet-latest",
+    "pcBaseUrl": "",
+    "pcApiKey": "$ANTHROPIC_API_KEY"
+  },
+  "cfgMaxTokens": 4096,
+  "cfgVerbose": false,
+  "cfgWorkingDir": ".",
+  "cfgMaxContextChars": 120000
+}
+```
+
 **Additional config fields** (config file only, no CLI override):
 
 | Field | Type | Default | Description |
@@ -151,11 +172,12 @@ Search order: `./haskode.json` → `./haskode.jsonc` → `~/.config/haskode/conf
 | `cfgMaxSessionLogBytes` | int | `5242880` | Maximum session.jsonl file size in bytes (5 MB). When the existing log exceeds this, it is rotated to `session.jsonl.1` before new events are appended. Set to `0` to disable rotation. |
 
 **Provider names:** `openai`, `ollama`, `vllm`, `litellm`, `openrouter` (all
-OpenAI-compatible HTTP endpoints), or `stub` (local echo for development).
-Any other name produces a clear error.
+OpenAI-compatible HTTP endpoints), `anthropic` (Anthropic Messages API), or
+`stub` (local echo for development). Any other name produces a clear error.
 
 **Base URL convention:** The provider appends `/v1/chat/completions` to
-`pcBaseUrl`, so set it to the API root without `/v1`:
+`pcBaseUrl` for OpenAI-compatible providers, so set it to the API root
+without `/v1`:
 
 | Provider   | Example `pcBaseUrl`                    |
 |------------|----------------------------------------|
@@ -165,11 +187,20 @@ Any other name produces a clear error.
 | LiteLLM    | `http://localhost:4000`                |
 | OpenRouter | `https://openrouter.ai/api`            |
 
+Anthropic defaults to `https://api.anthropic.com` when `pcBaseUrl` is empty.
+If you set `pcBaseUrl` for Anthropic, Haskode appends `/v1/messages`.
+
 **API key resolution** (for OpenAI-compatible providers):
 
 1. `--api-key` CLI flag (highest priority)
 2. `OPENAI_API_KEY` environment variable
 3. `pcApiKey` field in config file
+
+**API key resolution** (for Anthropic):
+
+1. `--api-key` CLI flag (highest priority)
+2. `pcApiKey` field in config file
+3. `ANTHROPIC_API_KEY` environment variable
 
 **Environment variable expansion:** String fields in the config file
 (`pcApiKey`, `pcBaseUrl`, `pcModel`, `pcProvider`, `cfgWorkingDir`) support
@@ -188,6 +219,7 @@ Undefined variables expand to the empty string.
 
 You may also leave `pcApiKey` empty and rely on `OPENAI_API_KEY` directly
 (the provider checks the environment variable when the config field is empty).
+For Anthropic, leave `pcApiKey` empty and set `ANTHROPIC_API_KEY`.
 
 **CLI flags override config values:**
 
@@ -203,7 +235,7 @@ You may also leave `pcApiKey` empty and rely on `OPENAI_API_KEY` directly
 
 ## Smoke test with a real model
 
-Verify that the OpenAI-compatible provider works end-to-end:
+Verify that real providers work end-to-end:
 
 ```sh
 # 1. Set your API key
@@ -215,12 +247,16 @@ cabal run haskode -- --provider openai --prompt "Say hello in one sentence."
 # 3. With Ollama (no API key needed)
 cabal run haskode -- --provider ollama --model llama3.1 --prompt "Say hello."
 
-# 4. Interactive session with tools
+# 4. With Anthropic (Messages API, including streaming)
+export ANTHROPIC_API_KEY="sk-ant-..."
+cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --prompt "Say hello."
+
+# 5. Interactive session with tools
 cabal run haskode -- --provider openai --model gpt-4o-mini
 # Then type: "List the files in the current directory"
 # The agent should call list_files and report the results.
 
-# 5. Interactive shell approval
+# 6. Interactive shell approval
 # When the model calls the shell tool, the terminal prompts:
 #   [confirm] Tool:     shell
 #   [confirm] Args:     {"command":"ls -la"}
@@ -235,7 +271,7 @@ three ways to provide one (env var, config file, CLI flag).
 ### What works today
 
 Haskode performs a real multi-step tool loop with OpenAI-compatible
-providers.  A typical session looks like:
+providers and Anthropic.  A typical session looks like:
 
 1. User asks: *"List the files in this repo, read the Cabal file, and
    run the tests."*
@@ -442,8 +478,9 @@ and diff previews before the y/N prompt:
   [confirm] Approve? (y/N)
 ```
 
-All of this uses OpenAI's native `tool_calls` / `tool` message format
-— no JSON-in-text hacks.
+OpenAI-compatible providers use OpenAI's native `tool_calls` / `tool`
+message format. Anthropic uses native `tool_use` / `tool_result` content
+blocks. Neither path relies on JSON-in-text hacks.
 
 ### Session log / audit trail
 
@@ -562,15 +599,21 @@ is not implemented.
 
 ### Known limitations (Phase 1)
 
-- **Streaming for OpenAI-compatible providers** — text deltas stream
-  token-by-token to the terminal.  Tool-call deltas are assembled
-  from fragments before execution.  Providers without streaming
-  support fall back to the non-streaming `providerComplete` path.
+- **Streaming providers** — OpenAI-compatible and Anthropic text deltas
+  stream token-by-token to the terminal.  Tool-call deltas are assembled
+  from fragments before execution.  Providers without streaming support
+  fall back to the non-streaming `providerComplete` path.
+- **Anthropic Messages API** — native Anthropic tool calls are supported
+  through `tool_use` / `tool_result` blocks in both non-streaming and
+  streaming responses.  Streamed `tool_use` input JSON fragments are
+  assembled before tool execution.
 - **No context window management** — long conversations may exceed the
   model's context limit.  A conservative character-count guard
   (`cfgMaxContextChars`, default 120K chars / ~30K tokens) prevents
   oversized requests from reaching the provider and returns a clear
-  error.  No truncation, summarization, or automatic message deletion
+  error.  `/status` shows character-based context usage (current,
+  max, remaining, percentage) so the user can monitor consumption.
+  No truncation, summarization, or automatic message deletion
   is performed — the user must start a new session to continue.
 - **Limited session resume; no full replay** — `--resume` loads safe
   text resume context from `session.jsonl` (user messages and assistant
@@ -607,19 +650,19 @@ is not implemented.
 - [x] Provider selection from config / CLI
 - [x] Helpful errors for missing API key / unknown provider
 - [x] Tool execution in the agent loop (multi-step)
-- [x] Native OpenAI tool_calls / tool message format
+- [x] Native OpenAI tool_calls / tool message format and Anthropic tool_use / tool_result blocks
 - [x] System prompt construction with tool schemas
 - [x] Interactive policy confirmation (y/n prompts for shell)
 - [x] Shell output with section markers and truncation metadata
 - [x] `max_completion_tokens` for OpenAI, `max_tokens` for local providers
-- [ ] Anthropic provider
+- [x] Anthropic provider (Messages API)
 - [x] `write_file` tool with patch integration
 - [x] `search` / `glob` tools
 - [ ] Token counting and context window management
 
 ### Phase 2 — Usable daily driver
 - [x] Streaming token output
-- [ ] Rich diff display (colored, side-by-side)
+- [ ] Rich diff display: colored unified diffs (done), side-by-side (not yet)
 - [x] Session save/resume (phase zero: conservative, non-replaying)
 - [x] `.agentignore` file support (root-level, shared by `glob` and `search`)
 - [x] Read-only batch preview (`preview_patch_batch`)

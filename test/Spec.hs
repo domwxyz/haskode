@@ -6,6 +6,7 @@
 module Main (main) where
 
 import qualified Haskode.Test.Commands as Commands
+import qualified Haskode.Test.Anthropic as Anthropic
 import qualified Haskode.Test.Config   as Config
 import qualified Haskode.Test.Core     as Core
 import qualified Haskode.Test.Display  as Display
@@ -23,6 +24,7 @@ main = runTests $
   ++ Config.tests
   ++ Policy.tests
   ++ Patch.tests
+  ++ Anthropic.tests
   ++ OpenAI.tests
   ++ Tools.tests
   ++ Session.tests

@@ -35,6 +35,9 @@ module Haskode.Agent
   , loadAgentsMd
     -- * Context estimation
   , estimateContextChars
+    -- * Context statistics
+  , ContextStats (..)
+  , contextStats
     -- * Session lifecycle helpers
   , recordSessionStart
   , recordSessionStartWithResume
@@ -60,6 +63,7 @@ import System.Directory   (doesFileExist, getFileSize)
 import System.IO          (hFlush, stdout)
 
 import Haskode.Config     (Config (..), ProviderConfig (..))
+import Haskode.Patch      (colorizeUnifiedDiff)
 import Haskode.Display    (formatAssistantReply, formatToolExecuting,
                            formatToolResult, formatToolUnknown,
                            formatPolicyDenied, formatPolicyConfirmationNeeded,
@@ -305,6 +309,40 @@ estimateContextChars = sum . map messageChars
                      + T.length (encodeText (tcArgs tc))
 
 -- ---------------------------------------------------------------------------
+-- Context statistics
+-- ---------------------------------------------------------------------------
+
+-- | Snapshot of character-based context usage.
+--
+--   This is an estimate based on character count, not real token
+--   counting.  Use 'contextStats' to compute from a conversation.
+data ContextStats = ContextStats
+  { csCurrent   :: !Int  -- ^ Estimated current conversation characters
+  , csMax       :: !Int  -- ^ Configured maximum context characters
+  , csRemaining :: !Int  -- ^ Remaining characters (negative when over budget)
+  , csPercent   :: !Int  -- ^ Percentage of max used (may exceed 100)
+  } deriving (Show, Eq)
+
+-- | Compute context usage statistics from a conversation and limit.
+--
+--   Uses the same character-count estimate as 'estimateContextChars'.
+--   This is an estimate, not a real token count.
+--
+--   >>> contextStats [mkUserMessage "hello"] 120000
+--   ContextStats {csCurrent = 25, csMax = 120000, csRemaining = 119975, csPercent = 0}
+contextStats :: Conversation -> Int -> ContextStats
+contextStats conv maxChars =
+  let est    = estimateContextChars conv
+      remain = maxChars - est
+      pct    = if maxChars > 0 then est * 100 `div` maxChars else 0
+  in ContextStats
+       { csCurrent   = est
+       , csMax       = maxChars
+       , csRemaining = remain
+       , csPercent   = pct
+       }
+
+-- ---------------------------------------------------------------------------
 -- Agent loop
 -- ---------------------------------------------------------------------------
 
@@ -350,10 +388,9 @@ processTurn state = do
   -- This is a cheap character-count check that prevents oversized
   -- requests from reaching the provider.  No truncation or summarization
   -- is performed — the conversation must be shortened manually.
-  let maxChars   = cfgMaxContextChars cfg
-      charEst    = estimateContextChars context
-  when (charEst > maxChars) $ do
-    let msg = formatContextLimitRefusal charEst maxChars
+  let stats = contextStats context (cfgMaxContextChars cfg)
+  when (csCurrent stats > csMax stats) $ do
+    let msg = formatContextLimitRefusal (csCurrent stats) (csMax stats)
     TIO.putStrLn $ formatAssistantReply msg
     fail (T.unpack msg)
 
@@ -661,7 +698,7 @@ showPatchPreview tc = do
     Right (path, diff) -> do
       TIO.putStrLn $ formatConfirmFile (T.pack path)
       TIO.putStrLn   formatConfirmDiffHeader
-      TIO.putStrLn $ indentBlock 4 diff
+      TIO.putStrLn $ indentBlock 4 (colorizeUnifiedDiff diff)
 
 -- | Show a preview for a @write_file@ tool call.
 --   Prints the target path and a concise diff-like preview to the
@@ -678,7 +715,7 @@ showWriteFilePreview tc = do
     Right (path, preview) -> do
       TIO.putStrLn $ formatConfirmFile (T.pack path)
       TIO.putStrLn   formatConfirmPreviewHeader
-      TIO.putStrLn $ indentBlock 4 preview
+      TIO.putStrLn $ indentBlock 4 (colorizeUnifiedDiff preview)
 
 -- | Show a preview for an @apply_patch_batch@ tool call.
 --   Prints a concise per-file summary and bounded diff previews
@@ -694,7 +731,7 @@ showBatchApplyPreview tc = do
       pure ()
     Right (summary, parts) -> do
       TIO.putStrLn $ indentBlock 2 summary
-      mapM_ (\p -> TIO.putStrLn $ indentBlock 4 p) parts
+      mapM_ (\p -> TIO.putStrLn $ indentBlock 4 (colorizeUnifiedDiff p)) parts
 
 -- | Encode a JSON Value to Text (for logging).
 --   Produces clean JSON without Haskell string escaping.
