@@ -851,33 +851,7 @@ is not implemented.
   `[truncated: returned 4096 of 5000 chars, 904 dropped]`.
 - **Single model per session** — model cannot be changed mid-session.
 
-## Roadmap
-
-### 1.0 candidate scope
-
-- [x] CLI-first coding loop
-- [x] OpenAI-compatible provider
-- [x] Anthropic provider
-- [x] Native provider tool calls
-- [x] Streaming text output
-- [x] Read/search/glob/list tools
-- [x] Shell tool with confirmation
-- [x] Patch/write tools with confirmation
-- [x] Session log, summary, and conservative resume
-- [x] Manual `/compact`
-- [x] Minimal experimental TUI
-- [x] Compiled extension seam
-- [ ] Basic inspectability polish
-- [ ] Release docs: changelog, example config, security notes
-
-### Post-1.0 candidates
-
-- [ ] Conversation/session browsing
-- [ ] Tool-call inspector
-- [ ] Side-by-side diffs
-- [ ] Packaging polish
-
-### Intentionally out of core
+## Intentionally out of core
 
 - Runtime plugin marketplace
 - Autonomous agent swarm

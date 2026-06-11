@@ -11,7 +11,6 @@
 --   1. A full audit trail for debugging.
 --   2. Read-only inspection via @--show-session@ (event counts, timestamps).
 --   3. Conservative session resume via @--resume@ (non-replaying).
---   4. Potential training data for fine-tuning (export only; no replay).
 --
 -- Events are stored in-memory during a session and flushed to a
 -- JSON-lines file on exit.  Resume reconstructs safe text context
