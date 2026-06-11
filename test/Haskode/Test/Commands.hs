@@ -524,6 +524,44 @@ testDoctorHostedProviderMissingKey =
         pure $ Right ()
       _ -> pure $ Left $ "openai missing key should produce warn: " ++ show keyCheck
 
+testDoctorOpenAICompatibleEmptyBaseUrlWarns :: Test
+testDoctorOpenAICompatibleEmptyBaseUrlWarns =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "openai"
+                            , pcModel    = "gpt-4o"
+                            , pcBaseUrl  = ""
+                            , pcApiKey   = "sk-fake-key"
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let baseUrlCheck = filter (\c -> dcLabel c == "base URL") checks
+    case baseUrlCheck of
+      [c] | dcStatus c == Warn
+            && "--base-url https://api.openai.com" `T.isInfixOf` dcDetail c ->
+        pure $ Right ()
+      _ -> pure $ Left $ "openai empty base URL should warn: " ++ show baseUrlCheck
+
+testDoctorAnthropicEmptyBaseUrlUsesDefault :: Test
+testDoctorAnthropicEmptyBaseUrlUsesDefault =
+  let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
+                            { pcProvider = "anthropic"
+                            , pcModel    = "claude-3-5-sonnet-latest"
+                            , pcBaseUrl  = ""
+                            , pcApiKey   = "sk-ant-fake"
+                            }
+                          }
+      state = initState cfg stubProvider defaultPolicy defaultRegistry autoApprove False
+  in do
+    checks <- doctorChecks state
+    let baseUrlCheck = filter (\c -> dcLabel c == "base URL") checks
+    case baseUrlCheck of
+      [c] | dcStatus c == Info
+            && "provider default (https://api.anthropic.com)" `T.isInfixOf` dcDetail c ->
+        pure $ Right ()
+      _ -> pure $ Left $ "anthropic empty base URL should report default: " ++ show baseUrlCheck
+
 testDoctorHostedProviderHasKey :: Test
 testDoctorHostedProviderHasKey =
   let cfg = defaultConfig { cfgProvider = (cfgProvider defaultConfig)
@@ -663,6 +701,8 @@ tests =
   , testFormatDoctorChecksTags
   , testDoctorStubProviderChecks
   , testDoctorHostedProviderMissingKey
+  , testDoctorOpenAICompatibleEmptyBaseUrlWarns
+  , testDoctorAnthropicEmptyBaseUrlUsesDefault
   , testDoctorHostedProviderHasKey
   , testDoctorLocalProviderNoKey
   , testDoctorDisabledToolsInOutput

@@ -70,17 +70,17 @@ providerRequiresApiKey name =
     ProviderAnthropic -> True
     ProviderUnknown -> True
 
--- | Hint text for the default base URL of a known provider.
+-- | Hint text shown by diagnostics when @pcBaseUrl@ is empty.
 providerDefaultBaseUrlHint :: String -> Text
 providerDefaultBaseUrlHint name = case name of
-  "openai"     -> "provider default (https://api.openai.com)"
+  "openai"     -> "empty; set --base-url https://api.openai.com or pcBaseUrl"
   "anthropic"  -> "provider default (https://api.anthropic.com)"
-  "ollama"     -> "provider default (http://localhost:11434)"
-  "vllm"       -> "provider default (http://localhost:8000)"
-  "litellm"    -> "provider default (http://localhost:4000)"
-  "openrouter" -> "provider default (https://openrouter.ai/api)"
+  "ollama"     -> "empty; set --base-url http://localhost:11434 or pcBaseUrl"
+  "vllm"       -> "empty; set --base-url http://localhost:8000 or pcBaseUrl"
+  "litellm"    -> "empty; set --base-url http://localhost:4000 or pcBaseUrl"
+  "openrouter" -> "empty; set --base-url https://openrouter.ai/api or pcBaseUrl"
   "stub"       -> "not needed"
-  _            -> "provider default"
+  _            -> "empty; no provider default known"
 
 -- | The environment variable name for a provider's API key.
 providerApiKeyEnvVar :: String -> String
@@ -98,7 +98,7 @@ formatOpenAICompatibleApiKeyError err =
   , ""
   , "Example:"
   , "  export OPENAI_API_KEY=\"sk-...\""
-  , "  cabal run haskode -- --provider openai --prompt \"Hello\""
+  , "  cabal run haskode -- --provider openai --base-url https://api.openai.com --prompt \"Hello\""
   ]
 
 formatAnthropicApiKeyError :: String -> [String]
@@ -125,5 +125,5 @@ formatUnknownProviderError name =
   , "  stub                                        (local echo, for development)"
   , ""
   , "Example:"
-  , "  cabal run haskode -- --provider openai --prompt \"Hello\""
+  , "  cabal run haskode -- --provider openai --base-url https://api.openai.com --prompt \"Hello\""
   ]

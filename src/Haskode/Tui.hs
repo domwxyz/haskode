@@ -257,7 +257,6 @@ data TuiOutput
   | TuiOutputStreamBegin
   | TuiOutputStreamChunk !Text
   | TuiOutputStreamEnd
-  | TuiOutputNotice !Text
 
 data TuiName = TranscriptViewport
   | ConfirmationViewport
@@ -814,9 +813,6 @@ applyTuiOutput st output =
             { tuiStreamBuffer = ""
             , tuiStatus = "Assistant replied."
             }
-    TuiOutputNotice msg ->
-      (appendEntry (TuiEntry TuiSystemEntry msg) st)
-        { tuiStatus = oneLine msg }
 
 applyTuiUpdate :: TuiUpdate -> TuiState -> TuiState
 applyTuiUpdate update st =

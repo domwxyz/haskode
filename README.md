@@ -53,8 +53,8 @@ haskode/
 | Module | Purpose |
 |---|---|
 | `Haskode.Core` | Shared vocabulary: `Role`, `Message`, `ToolCall`, `ToolResult`, `Conversation` |
-| `Haskode.Config` | Load `haskode.json` / `haskode.jsonc` / `~/.config/haskode/config.json`; parse optional context, session-log, and disabled-tool fields; expand environment variables |
-| `Haskode.Commands` | Pure slash-command registry, extension command contribution shape, and formatters for `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit` |
+| `Haskode.Config` | Load `haskode.json` / `haskode.jsonc` / `~/.config/haskode/config.json`; parse plain JSON config, optional context/session-log/disabled-tool fields, and environment variables |
+| `Haskode.Commands` | Pure slash-command registry, extension command contribution shape, and formatters for `/help`, `/new`, `/compact`, `/status`, `/doctor`, `/exit`, and `/quit` |
 | `Haskode.Display` | Terminal display formatting plus the small `DisplayEvent` seam consumed by CLI and TUI paths |
 | `Haskode.Extension` | Tiny compiled extension record plus finalization helpers for extension tools, policy rules, and pure text slash commands |
 | `Haskode.Extensions` | Empty-by-default local registration point for statically compiled extensions in a fork |
@@ -111,20 +111,20 @@ cabal run haskode -- --prompt "What files are in the current directory?"
 
 # With a real OpenAI-compatible provider
 export OPENAI_API_KEY="sk-..."
-cabal run haskode -- --provider openai --prompt "Say hello in one sentence."
+cabal run haskode -- --provider openai --base-url https://api.openai.com --prompt "Say hello in one sentence."
 
 # With Anthropic (Messages API, including streaming)
 export ANTHROPIC_API_KEY="sk-ant-..."
 cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --prompt "Say hello in one sentence."
 
 # Override model and base URL from the command line
-cabal run haskode -- --provider openai --model gpt-4o --prompt "Hello"
+cabal run haskode -- --provider openai --model gpt-4o --base-url https://api.openai.com --prompt "Hello"
 
 # Load one explicit config file
 cabal run haskode -- --config ./haskode.json --prompt "Hello"
 
 # Verbose mode (prints provider, model, base URL)
-cabal run haskode -- --provider openai -v --prompt "Hello"
+cabal run haskode -- --provider openai --base-url https://api.openai.com -v --prompt "Hello"
 
 # Inspect session log (read-only, no replay)
 cabal run haskode -- --show-session
@@ -133,7 +133,7 @@ cabal run haskode -- --show-session
 cabal run haskode -- --resume
 
 # Resume with a real provider
-cabal run haskode -- --provider openai --resume
+cabal run haskode -- --provider openai --base-url https://api.openai.com --resume
 
 # Show help
 cabal run haskode -- --help
@@ -145,17 +145,24 @@ In interactive mode, the following slash commands are available:
 
 | Command | Description |
 |---------|-------------|
-| `/help` | Show available commands |
-| `/new` | Start a fresh conversation context |
-| `/compact` | Manually summarize the current conversation and replace live context after confirmation |
-| `/status` | Show current provider, model, working dir, disabled/available tools, character-based context usage, and runtime info |
-| `/doctor` | Local diagnostic checks for provider/config, API-key presence, `SYSTEM.md`, `AGENTS.md`, disabled/available tools, and session-log settings. Read-only: no provider contact, no shell, no file writes |
-| `/exit` | Save session log and exit |
-| `/quit` | Same as `/exit` |
+| `/help` | show this help |
+| `/new` | start a fresh conversation |
+| `/compact` | summarize and replace conversation context |
+| `/status` | show current runtime/config status |
+| `/doctor` | local diagnostic checks |
+| `/exit` | save session log and exit |
+| `/quit` | same as `/exit` |
 
 Unknown slash commands print a short hint.  Anything without a leading `/` is sent to the agent as a normal prompt.
 Forks may compile in additional pure text slash commands through
 `compiledExtensions`; those commands appear in `/help` only when registered.
+
+`/status` includes provider, model, working directory, streaming, resume
+state, context usage, session-log limit, disabled tools, and available tools.
+`/doctor` is local and read-only: it checks provider/config, API-key
+presence, `SYSTEM.md`, `AGENTS.md`, disabled/available tools, and session-log
+settings without contacting providers, running shell commands, or writing
+files.
 
 `/compact` is manual, provider-assisted context management.  It asks the
 current provider for a compact working-memory summary with tools disabled,
@@ -218,11 +225,14 @@ Create a `haskode.json` in your project root:
   "cfgVerbose": false,
   "cfgWorkingDir": ".",
   "cfgMaxContextChars": 120000,
+  "cfgMaxSessionLogBytes": 5242880,
   "cfgDisabledTools": []
 }
 ```
 
-Search order: `./haskode.json` → `./haskode.jsonc` → `~/.config/haskode/config.json` → defaults.
+Search order: `./haskode.json` -> `./haskode.jsonc` -> `~/.config/haskode/config.json` -> defaults.
+The `.jsonc` filename is accepted for discovery, but config contents are
+parsed as ordinary JSON; comments are not stripped.
 Without a config file, the default provider is `stub` with model `stub`,
 empty base URL, and no API key. This path is local and deterministic.
 
@@ -244,6 +254,7 @@ Anthropic config example:
   "cfgVerbose": false,
   "cfgWorkingDir": ".",
   "cfgMaxContextChars": 120000,
+  "cfgMaxSessionLogBytes": 5242880,
   "cfgDisabledTools": []
 }
 ```
@@ -277,6 +288,7 @@ Example: disable shell access and write-capable file tools:
   "cfgVerbose": false,
   "cfgWorkingDir": ".",
   "cfgMaxContextChars": 120000,
+  "cfgMaxSessionLogBytes": 5242880,
   "cfgDisabledTools": ["shell", "write_file", "apply_patch", "apply_patch_batch"]
 }
 ```
@@ -332,9 +344,9 @@ into `compiledExtensions`.
 OpenAI-compatible HTTP endpoints), `anthropic` (Anthropic Messages API), or
 `stub` (local echo for development). Any other name produces a clear error.
 
-**Base URL convention:** The provider appends `/v1/chat/completions` to
-`pcBaseUrl` for OpenAI-compatible providers, so set it to the API root
-without `/v1`:
+**Base URL convention:** OpenAI-compatible providers require `pcBaseUrl`
+or `--base-url`. Haskode appends `/v1/chat/completions`, so set the value
+to the API root without `/v1`:
 
 | Provider   | Example `pcBaseUrl`                    |
 |------------|----------------------------------------|
@@ -344,7 +356,8 @@ without `/v1`:
 | LiteLLM    | `http://localhost:4000`                |
 | OpenRouter | `https://openrouter.ai/api`            |
 
-Anthropic defaults to `https://api.anthropic.com` when `pcBaseUrl` is empty.
+OpenAI-compatible providers do not infer these roots when `pcBaseUrl` is
+empty. Anthropic defaults to `https://api.anthropic.com` when `pcBaseUrl` is empty.
 If you set `pcBaseUrl` for Anthropic, Haskode appends `/v1/messages`.
 
 **API key resolution** (for OpenAI-compatible providers):
@@ -406,17 +419,17 @@ Verify that real providers work end-to-end:
 export OPENAI_API_KEY="sk-..."
 
 # 2. Single-shot prompt (should print a real response)
-cabal run haskode -- --provider openai --prompt "Say hello in one sentence."
+cabal run haskode -- --provider openai --base-url https://api.openai.com --prompt "Say hello in one sentence."
 
 # 3. With Ollama (no API key needed)
-cabal run haskode -- --provider ollama --model llama3.1 --prompt "Say hello."
+cabal run haskode -- --provider ollama --model llama3.1 --base-url http://localhost:11434 --prompt "Say hello."
 
 # 4. With Anthropic (Messages API, including streaming)
 export ANTHROPIC_API_KEY="sk-ant-..."
 cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --prompt "Say hello."
 
 # 5. Interactive session with tools
-cabal run haskode -- --provider openai --model gpt-4o-mini
+cabal run haskode -- --provider openai --model gpt-4o-mini --base-url https://api.openai.com
 # Then type: "List the files in the current directory"
 # The agent should call list_files and report the results.
 
@@ -439,7 +452,7 @@ providers and Anthropic.  A typical session looks like:
 
 1. User asks: *"List the files in this repo, read the Cabal file, and
    run the tests."*
-2. The model calls `list_files` and `read_file` (possibly in parallel).
+2. The model calls `list_files` and `read_file` in one response.
 3. Haskode executes the tools, appends results to the conversation.
 4. The model sees the results, then calls `shell` with `cabal test all`.
 5. Haskode's policy flags `shell` as `AskUser`; the terminal prompts
@@ -458,12 +471,12 @@ and other build/cache directories automatically.  `search` also skips
 files larger than 1 MB and reports how many were skipped.
 
 Both `glob` and `search` also respect a `.agentignore` file in the
-working directory root.  The syntax is the same as `.gitignore` in
-spirit: blank lines and `#` comments are ignored, and every other line
-is a pattern.  A pattern without `/` (e.g. `build`, `*.log`) matches
-the entry name at any depth; a pattern with `/` (e.g. `vendor/*`) is
-matched against the full relative path.  Skipped entries are reported
-in the traversal stats (e.g. `[skipped 2 by .agentignore]`).
+working directory root.  The syntax is deliberately small: blank lines
+and `#` comments are ignored, and every other line is a pattern.  A
+pattern without `/` (e.g. `build`, `*.log`) matches the entry name at
+any depth; a pattern with `/` (e.g. `vendor/*`) is matched against the
+full relative path using Haskode's `*` and `**` matcher.  Skipped entries
+are reported in the traversal stats (e.g. `[skipped 2 by .agentignore]`).
 
 ### AGENTS.md — repo-level agent instructions
 
@@ -675,7 +688,7 @@ blocks. Neither path relies on JSON-in-text hacks.
 
 Every agent run records a sequence of session events in memory.  The
 log can be flushed to `session.jsonl` (one JSON object per line) for
-debugging, inspection, or fine-tuning data export.
+debugging or inspection.
 
 **What gets recorded:**
 
@@ -685,6 +698,7 @@ debugging, inspection, or fine-tuning data export.
 | `session_end` | Run exits normally (before log flush) | `"session ended"` |
 | `conversation_reset` | `/new` resets the in-memory conversation | `"conversation reset by /new"` |
 | `conversation_compacted` | Accepted `/compact` replaces live context with compact memory | Compact memory text |
+| `run_limit_reached` | A configured run-control limit stops a turn | Local limit message |
 | `user_message` | User sends input | Raw user text |
 | `assistant_reply` | Model replies | Reply text; when tool calls are present, a summary of call IDs and tool names is appended (e.g. `\| tool_calls: call_1=read_file, call_2=list_files`) |
 | `tool_call` | Tool begins execution | Call ID, tool name, JSON arguments |
@@ -693,10 +707,11 @@ debugging, inspection, or fine-tuning data export.
 
 **What is NOT recorded:**
 
-- API keys — they stay in the HTTP transport layer, never in event data
-- System prompts — the system message is rebuilt each turn but not logged
-- Raw provider request/response bodies — only the parsed summary is logged
-- File contents on disk — `session.jsonl` is written once on CLI exit, not during the run
+- API keys: they stay in the HTTP transport layer, never in event data
+- System prompts: the system message is rebuilt each turn but not logged
+- Raw provider request/response bodies: only the parsed summary is logged
+- Standalone filesystem snapshots. Tool results are logged as returned, so a
+  tool result can include file text that was read or generated during the run
 
 **Example event (pretty-printed):**
 
@@ -721,7 +736,7 @@ lifecycle events are never used for executable replay.
 **Empty and command-only sessions.**  A session is flushed only when
 it contains at least one *content* event (`user_message`,
 `assistant_reply`, `tool_call`, `tool_result`, `policy_decision`, or
-`conversation_compacted`).
+`conversation_compacted`, or `run_limit_reached`).
 Sessions that contain only lifecycle events — such as an immediate
 `/exit`, `/help` then `/exit`, `/status` then `/exit`, or `/new` then
 `/exit` — are silently discarded and do not create `session.jsonl`.
@@ -742,7 +757,7 @@ no replay):
 $ haskode --show-session
 Session summary:
   Log:           /home/user/project/session.jsonl
-  Total events:  12
+  Total events:  13
   First event:   2025-06-06T10:30:00Z
   Last event:    2025-06-06T10:35:00Z
   user_message: 3
@@ -754,6 +769,7 @@ Session summary:
   session_end: 0
   conversation_reset: 0
   conversation_compacted: 0
+  run_limit_reached: 0
   Malformed:     0
   Backup:        (none)
 ```
@@ -791,7 +807,7 @@ printed and the session continues normally.  `/status` shows
 `Resumed: yes/no`.  Full replay (re-running tools or provider calls)
 is not implemented.
 
-### Known limitations (Phase 1)
+### Known limitations
 
 - **Streaming providers** — OpenAI-compatible and Anthropic text deltas
   stream token-by-token to the terminal.  Tool-call deltas are assembled
@@ -865,7 +881,6 @@ is not implemented.
 
 - Runtime plugin marketplace
 - Autonomous agent swarm
-- Sub-agent handoff commands
 - Background job dashboard
 - Hidden vector memory
 - Full executable replay

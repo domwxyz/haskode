@@ -84,14 +84,14 @@ testProviderEnvVars =
 testProviderDefaultBaseUrlHints :: Test
 testProviderDefaultBaseUrlHints =
   let cases =
-        [ ("openai", "provider default (https://api.openai.com)")
+        [ ("openai", "empty; set --base-url https://api.openai.com or pcBaseUrl")
         , ("anthropic", "provider default (https://api.anthropic.com)")
-        , ("ollama", "provider default (http://localhost:11434)")
-        , ("vllm", "provider default (http://localhost:8000)")
-        , ("litellm", "provider default (http://localhost:4000)")
-        , ("openrouter", "provider default (https://openrouter.ai/api)")
+        , ("ollama", "empty; set --base-url http://localhost:11434 or pcBaseUrl")
+        , ("vllm", "empty; set --base-url http://localhost:8000 or pcBaseUrl")
+        , ("litellm", "empty; set --base-url http://localhost:4000 or pcBaseUrl")
+        , ("openrouter", "empty; set --base-url https://openrouter.ai/api or pcBaseUrl")
         , ("stub", "not needed")
-        , ("missing", "provider default")
+        , ("missing", "empty; no provider default known")
         ]
       bad =
         [ (name, providerDefaultBaseUrlHint name)
@@ -115,7 +115,7 @@ testOpenAICompatibleApiKeyErrorText =
         , ""
         , "Example:"
         , "  export OPENAI_API_KEY=\"sk-...\""
-        , "  cabal run haskode -- --provider openai --prompt \"Hello\""
+        , "  cabal run haskode -- --provider openai --base-url https://api.openai.com --prompt \"Hello\""
         ]
   in if lines' == expected
        then pure $ Right ()
@@ -150,7 +150,7 @@ testUnknownProviderErrorText =
       hasAnthropic = "anthropic" `isInfixOf` out
       hasStub = "stub" `isInfixOf` out
       hasExample =
-        "cabal run haskode -- --provider openai --prompt \"Hello\""
+        "cabal run haskode -- --provider openai --base-url https://api.openai.com --prompt \"Hello\""
           `isInfixOf` out
   in if hasUnknown && hasOpenAIList && hasAnthropic && hasStub && hasExample
        then pure $ Right ()

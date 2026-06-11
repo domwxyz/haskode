@@ -8,7 +8,8 @@
 -- @
 --   haskode                                    Start an interactive session (stub provider)
 --   haskode --prompt "..."                     Send a single prompt and exit
---   haskode --provider openai --prompt "..."   Use a real OpenAI-compatible provider
+--   haskode --provider openai --base-url https://api.openai.com --prompt "..."
+--                                                Use a real OpenAI-compatible provider
 --   haskode --help                             Show help
 -- @
 --

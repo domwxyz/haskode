@@ -47,7 +47,9 @@ import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Core       (Conversation, emptyConversation)
 import Haskode.Provider   (Provider (..))
 import Haskode.Provider.Resolve
-  ( providerApiKeyEnvVar
+  ( ProviderKind (..)
+  , classifyProviderName
+  , providerApiKeyEnvVar
   , providerDefaultBaseUrlHint
   , providerKindLabel
   , providerRequiresApiKey
@@ -379,7 +381,7 @@ formatDoctor st = fmap formatDoctorChecks (doctorChecks st)
 --   * Provider name recognized
 --   * Provider kind (local vs hosted)
 --   * Model value present
---   * Base URL value or provider default
+--   * Base URL value or empty-value diagnostic
 --   * API key presence\/absence (never the value)
 --   * Working directory
 --   * @SYSTEM.md@ presence
@@ -431,11 +433,18 @@ checkModel model
 
 -- | Check the base URL configuration.
 --
--- Reports the configured URL or notes that the provider default will be used.
+-- Reports the configured URL or explains what an empty value means for the
+-- selected provider.
 checkBaseUrl :: String -> String -> [DoctorCheck]
 checkBaseUrl provName url
-  | null url  = [DoctorCheck "base URL" Info (providerDefaultBaseUrlHint provName)]
-  | otherwise = [DoctorCheck "base URL" Ok (T.pack url)]
+  | not (null url) = [DoctorCheck "base URL" Ok (T.pack url)]
+  | otherwise =
+      let status = case classifyProviderName provName of
+            ProviderOpenAICompatible -> Warn
+            ProviderUnknown          -> Warn
+            ProviderAnthropic        -> Info
+            ProviderStub             -> Info
+      in [DoctorCheck "base URL" status (providerDefaultBaseUrlHint provName)]
 
 -- | Check API key presence without printing the key value.
 --

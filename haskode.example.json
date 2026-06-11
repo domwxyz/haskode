@@ -9,6 +9,7 @@
   "cfgVerbose": false,
   "cfgWorkingDir": ".",
   "cfgMaxContextChars": 120000,
-  "cfgMaxSessionLogBytes": 5242880
+  "cfgMaxSessionLogBytes": 5242880,
+  "cfgDisabledTools": []
 }
 

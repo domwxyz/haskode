@@ -1728,7 +1728,7 @@ testResumeEndToEnd = do
                            ++ " count=" ++ show (rrMessageEventCount rr)))
 
 -- ---------------------------------------------------------------------------
--- Resume accounting tests (phase zero polish)
+-- Resume accounting tests
 -- ---------------------------------------------------------------------------
 
 -- | ResumeResult counts parsed valid events (all event types).
@@ -2095,7 +2095,7 @@ tests =
   , testResumeRespectsConversationCompaction
   , testResumeLoadConversationCompactionBoundary
   , testResumeEndToEnd
-  -- Resume accounting tests (phase zero polish)
+  -- Resume accounting tests
   , testResumeParsedValidCount
   , testResumeSkippedEventCount
   , testResumeResetBoundaryDetected

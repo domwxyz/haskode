@@ -36,7 +36,7 @@ module Haskode.Session
   , SessionSummary (..)
   , summarizeSession
   , formatSessionSummary
-    -- * Resume (phase zero)
+    -- * Resume
   , ResumeResult (..)
   , loadResumeEvents
   , resumeContextEventsToConversation
@@ -320,7 +320,7 @@ formatSessionSummary ss =
   <> backupLine
 
 -- ---------------------------------------------------------------------------
--- Resume (phase zero)
+-- Resume
 -- ---------------------------------------------------------------------------
 
 -- | The result of loading a session log for resume context.
@@ -393,10 +393,11 @@ loadResumeEvents dir = do
             , rrMessageCount      = length conv
             }
   where
-    -- | Phase zero: user messages, assistant replies, conversation reset
-    --   boundaries, and accepted compaction memories contribute to resume
-    --   context. Tool calls, tool results, policy decisions, and lifecycle
-    --   events are intentionally skipped rather than replayed or restored.
+    -- | Conservative resume: user messages, assistant replies, conversation
+    --   reset boundaries, and accepted compaction memories contribute to
+    --   resume context. Tool calls, tool results, policy decisions, and
+    --   lifecycle events are intentionally skipped rather than replayed or
+    --   restored.
     isResumeContextEvent :: Event -> Bool
     isResumeContextEvent ev =
       evType ev `elem`

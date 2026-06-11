@@ -6,11 +6,9 @@
 --
 -- Haskode looks for a @haskode.json@ (or @haskode.jsonc@) in the current
 -- working directory, falling back to @~\/.config\/haskode\/config.json@.
--- The config file is optional; sensible defaults apply when it is absent.
---
--- Future work:
---   * JSONC / YAML support
---   * Per-project overrides
+-- The @.jsonc@ filename is accepted for discovery, but contents are parsed
+-- as ordinary JSON; comments are not stripped.  The config file is optional;
+-- sensible defaults apply when it is absent.
 
 module Haskode.Config
   ( Config (..)
@@ -44,7 +42,7 @@ import System.FilePath       ((</>))
 data ProviderConfig = ProviderConfig
   { pcProvider :: !String   -- ^ e.g. "openai", "anthropic", "ollama"
   , pcModel    :: !String   -- ^ Model identifier
-  , pcBaseUrl  :: !String   -- ^ API base URL (empty = provider default)
+  , pcBaseUrl  :: !String   -- ^ API base URL/root (empty is provider-specific)
   , pcApiKey   :: !String   -- ^ API key (may come from env var instead)
   } deriving stock (Show, Eq, Generic)
 
@@ -188,7 +186,7 @@ expandConfig cfg = do
 -- | Attempt to load a config file.  Search order:
 --
 --   1. @.\/haskode.json@
---   2. @.\/haskode.jsonc@
+--   2. @.\/haskode.jsonc@ (plain JSON syntax; comments are not stripped)
 --   3. @~\/.config\/haskode\/config.json@
 --
 --   Returns 'defaultConfig' when no file is found or parsing fails.
