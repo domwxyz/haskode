@@ -851,13 +851,11 @@ is not implemented.
 - [x] Manual `/compact`
 - [x] Minimal experimental TUI
 - [x] Compiled extension seam
-- [ ] Minimal `/delegate` or explicitly defer it
 - [ ] Basic inspectability polish
 - [ ] Release docs: changelog, example config, security notes
 
 ### Post-1.0 candidates
 
-- [ ] Read-only delegate mode
 - [ ] Conversation/session browsing
 - [ ] Tool-call inspector
 - [ ] Side-by-side diffs
@@ -867,6 +865,7 @@ is not implemented.
 
 - Runtime plugin marketplace
 - Autonomous agent swarm
+- Sub-agent handoff commands
 - Background job dashboard
 - Hidden vector memory
 - Full executable replay
