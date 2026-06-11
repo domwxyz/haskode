@@ -16,7 +16,8 @@ import Haskode.Core
       ToolCall(tcName, ToolCall, tcArgs, tcId) )
 import Haskode.Provider
     ( CompletionResponse(crToolCalls, CompletionResponse, crReply),
-      StreamHandler(onToken, StreamHandler) )
+      StreamHandler(onToken, StreamHandler),
+      ToolMode(..) )
 import Haskode.Provider.OpenAI
     ( buildRequestBody,
       buildStreamingRequestBody,
@@ -128,7 +129,7 @@ sampleMultiToolCallResponse = encode $ object
 testOpenAIRequestShape :: Test
 testOpenAIRequestShape = do
   let msgs = [mkUserMessage "hello"]
-      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 mempty
+      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 mempty AdvertiseTools
   case decode body of
     Nothing -> pure $ Left "buildRequestBody produced invalid JSON"
     Just (Object obj) -> do
@@ -146,7 +147,7 @@ testOpenAIRequestShape = do
 testOpenAIRequestTools :: Test
 testOpenAIRequestTools = do
   let msgs = [mkUserMessage "hello"]
-      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 defaultRegistry
+      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 defaultRegistry AdvertiseTools
   case decode body of
     Nothing -> pure $ Left "buildRequestBody with tools produced invalid JSON"
     Just (Object obj) -> do
@@ -166,7 +167,7 @@ testOpenAIRequestOmitsDisabledTools =
     Left err -> pure $ Left $ "disableTools failed: " ++ T.unpack err
     Right reg -> do
       let msgs = [mkUserMessage "hello"]
-          body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 reg
+          body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 reg AdvertiseTools
       case decode body of
         Nothing -> pure $ Left "buildRequestBody with filtered tools produced invalid JSON"
         Just (Object obj) ->
@@ -300,7 +301,7 @@ testOpenAIToolResultToJSON = do
 testOpenAIRequestNoTools :: Test
 testOpenAIRequestNoTools = do
   let msgs = [mkUserMessage "hello"]
-      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 mempty
+      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 mempty AdvertiseTools
   case decode body of
     Nothing -> pure $ Left "buildRequestBody (empty reg) produced invalid JSON"
     Just (Object obj) -> do
@@ -604,7 +605,7 @@ testTokenLimitFieldOtherProviders =
 testOpenAIRequestMaxCompletionTokens :: Test
 testOpenAIRequestMaxCompletionTokens = do
   let msgs = [mkUserMessage "hello"]
-      body = buildRequestBody "max_completion_tokens" msgs "gpt-4o-mini" 2048 mempty
+      body = buildRequestBody "max_completion_tokens" msgs "gpt-4o-mini" 2048 mempty AdvertiseTools
   case decode body of
     Nothing -> pure $ Left "buildRequestBody (max_completion_tokens) invalid JSON"
     Just (Object obj) -> do
@@ -620,7 +621,7 @@ testOpenAIRequestMaxCompletionTokens = do
 testOpenAIRequestMaxTokensOllama :: Test
 testOpenAIRequestMaxTokensOllama = do
   let msgs = [mkUserMessage "hello"]
-      body = buildRequestBody "max_tokens" msgs "llama3.1" 4096 mempty
+      body = buildRequestBody "max_tokens" msgs "llama3.1" 4096 mempty AdvertiseTools
   case decode body of
     Nothing -> pure $ Left "buildRequestBody (max_tokens ollama) invalid JSON"
     Just (Object obj) -> do
@@ -873,7 +874,7 @@ testParseSSELineExtraSpaces =
 testBuildStreamingRequestBodyIncludesStream :: Test
 testBuildStreamingRequestBodyIncludesStream = do
   let reg = defaultRegistry
-      body = buildStreamingRequestBody "max_tokens" [] "gpt-4o" 1024 reg
+      body = buildStreamingRequestBody "max_tokens" [] "gpt-4o" 1024 reg AdvertiseTools
       decoded = eitherDecode body :: Either String Value
   case decoded of
     Left err -> pure $ Left $ "Failed to decode streaming body: " ++ err
@@ -1162,6 +1163,61 @@ testStreamToolCallCompletionResponse =
            Nothing -> pure $ Left "Expected Just tool calls in response, got Nothing"
 
 
+-- ---------------------------------------------------------------------------
+-- ToolMode tests
+-- ---------------------------------------------------------------------------
+
+-- | buildRequestBody with NoTools omits tools even when registry is non-empty.
+testOpenAIRequestNoToolsMode :: Test
+testOpenAIRequestNoToolsMode = do
+  let msgs = [mkUserMessage "hello"]
+      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 defaultRegistry NoTools
+  case decode body of
+    Nothing -> pure $ Left "buildRequestBody (NoTools) produced invalid JSON"
+    Just (Object obj) -> do
+      let noTools      = KM.lookup (Key.fromText "tools") obj == Nothing
+          noToolChoice = KM.lookup (Key.fromText "tool_choice") obj == Nothing
+      if noTools && noToolChoice
+        then pure $ Right ()
+        else pure $ Left $ "NoTools: expected no tools/tool_choice, got: " ++ show obj
+    Just other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
+-- | buildStreamingRequestBody with NoTools omits tools even when registry is non-empty.
+testOpenAIStreamingRequestNoToolsMode :: Test
+testOpenAIStreamingRequestNoToolsMode = do
+  let msgs = [mkUserMessage "hello"]
+      body = buildStreamingRequestBody "max_tokens" msgs "gpt-4o" 1024 defaultRegistry NoTools
+  case decode body of
+    Nothing -> pure $ Left "buildStreamingRequestBody (NoTools) produced invalid JSON"
+    Just (Object obj) -> do
+      let noTools      = KM.lookup (Key.fromText "tools") obj == Nothing
+          noToolChoice = KM.lookup (Key.fromText "tool_choice") obj == Nothing
+          hasStream    = KM.lookup (Key.fromText "stream") obj == Just (Bool True)
+      if noTools && noToolChoice && hasStream
+        then pure $ Right ()
+        else pure $ Left $ "NoTools streaming: tools=" ++ show (not noTools)
+                        ++ " stream=" ++ show hasStream
+    Just other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
+-- | AdvertiseTools with non-empty registry still includes tools (regression guard).
+testOpenAIRequestAdvertiseToolsIncludesTools :: Test
+testOpenAIRequestAdvertiseToolsIncludesTools = do
+  let msgs = [mkUserMessage "hello"]
+      body = buildRequestBody "max_tokens" msgs "gpt-4o" 1024 defaultRegistry AdvertiseTools
+  case decode body of
+    Nothing -> pure $ Left "buildRequestBody (AdvertiseTools) produced invalid JSON"
+    Just (Object obj) -> do
+      let hasTools = case KM.lookup (Key.fromText "tools") obj of
+                       Just (Array arr) -> length arr > 0
+                       _                -> False
+          hasToolChoice = KM.lookup (Key.fromText "tool_choice") obj == Just (String "auto")
+      if hasTools && hasToolChoice
+        then pure $ Right ()
+        else pure $ Left $ "AdvertiseTools: tools=" ++ show hasTools
+                        ++ " tool_choice=" ++ show hasToolChoice
+    Just other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
+
 tests :: [Test]
 tests =
   [ testOpenAIRequestShape
@@ -1225,4 +1281,7 @@ tests =
   , testStreamToolCallMissingName
   , testStreamToolCallEmptyAssembly
   , testStreamToolCallCompletionResponse
+  , testOpenAIRequestNoToolsMode
+  , testOpenAIStreamingRequestNoToolsMode
+  , testOpenAIRequestAdvertiseToolsIncludesTools
   ]

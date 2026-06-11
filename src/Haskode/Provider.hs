@@ -34,6 +34,8 @@ module Haskode.Provider
     -- * Request / response types
   , CompletionRequest (..)
   , CompletionResponse (..)
+    -- * Tool advertisement mode
+  , ToolMode (..)
   ) where
 
 import Data.IORef         (newIORef, readIORef, writeIORef)
@@ -46,11 +48,23 @@ import Haskode.Core       (Message (..), Role (..), ToolCall (..),
 -- Request / response
 -- ---------------------------------------------------------------------------
 
+-- | Tool advertisement mode for a provider request.
+--
+--   This controls whether the provider includes tool definitions in the
+--   request.  Normal agent turns use 'AdvertiseTools'.  Internal calls
+--   such as /compact can use 'NoTools' to suppress tool advertisement
+--   without changing the provider or registry.
+data ToolMode
+  = AdvertiseTools  -- ^ Include tool definitions in the request (normal behavior)
+  | NoTools         -- ^ Omit tool definitions from the request
+  deriving stock (Show, Eq)
+
 -- | What we send to a provider.
 data CompletionRequest = CompletionRequest
   { crMessages  :: ![Message]  -- ^ Conversation history (system + user + assistant)
   , crModel     :: !Text       -- ^ Model identifier
   , crMaxTokens :: !Int        -- ^ Token budget for this response
+  , crToolMode  :: !ToolMode   -- ^ Whether to advertise tools in this request
   } deriving stock (Show, Eq)
 
 -- | What we get back.

@@ -20,7 +20,7 @@ import Haskode.Config
 import Haskode.Core
     ( Message(..), Role(..), ToolCall(..), mkSystemMessage, mkUserMessage )
 import Haskode.Provider
-    ( CompletionResponse(..), Provider(..) )
+    ( CompletionResponse(..), Provider(..), ToolMode(..) )
 import Haskode.Provider.Anthropic
     ( AnthropicError(..), AnthropicStreamEvent(..),
       AnthropicStreamState(..), applyStreamEvent, assembleStreamEvents,
@@ -71,7 +71,7 @@ testAnthropicRequestShape = do
         [ mkSystemMessage "system instructions"
         , mkUserMessage "hello"
         ]
-      body = buildRequestBody msgs "claude-test" 1024 mempty
+      body = buildRequestBody msgs "claude-test" 1024 mempty AdvertiseTools
   case decodeRequestBody body of
     Left err -> pure $ Left err
     Right (Object obj) -> do
@@ -94,7 +94,7 @@ testAnthropicRequestShape = do
 --   registry is non-empty.
 testAnthropicRequestTools :: Test
 testAnthropicRequestTools = do
-  let body = buildRequestBody [mkUserMessage "hello"] "claude-test" 1024 defaultRegistry
+  let body = buildRequestBody [mkUserMessage "hello"] "claude-test" 1024 defaultRegistry AdvertiseTools
   case decodeRequestBody body of
     Left err -> pure $ Left err
     Right (Object obj) -> do
@@ -117,7 +117,7 @@ testAnthropicRequestTools = do
 --   stream:true.
 testAnthropicStreamingRequestShape :: Test
 testAnthropicStreamingRequestShape = do
-  let body = buildStreamingRequestBody [mkUserMessage "hello"] "claude-test" 1024 mempty
+  let body = buildStreamingRequestBody [mkUserMessage "hello"] "claude-test" 1024 mempty AdvertiseTools
   case decodeRequestBody body of
     Left err -> pure $ Left err
     Right (Object obj) -> do
@@ -184,7 +184,7 @@ testAnthropicSystemMessages =
 -- | Anthropic requests must include at least one non-system message.
 testAnthropicRejectsSystemOnlyRequest :: Test
 testAnthropicRejectsSystemOnlyRequest =
-  case buildRequestBody [mkSystemMessage "system only"] "claude-test" 1024 mempty of
+  case buildRequestBody [mkSystemMessage "system only"] "claude-test" 1024 mempty AdvertiseTools of
     Left (AnthropicRequestError msg)
       | "non-system" `T.isInfixOf` T.pack msg -> pure $ Right ()
       | otherwise -> pure $ Left $ "Expected non-system error, got: " ++ msg
@@ -501,6 +501,53 @@ testAnthropicProviderEnvKey =
         | providerName prov == "anthropic" -> pure $ Right ()
         | otherwise -> pure $ Left $ "Unexpected provider name: " ++ show (providerName prov)
 
+-- ---------------------------------------------------------------------------
+-- ToolMode tests
+-- ---------------------------------------------------------------------------
+
+-- | buildRequestBody with NoTools omits tools even when registry is non-empty.
+testAnthropicRequestNoToolsMode :: Test
+testAnthropicRequestNoToolsMode = do
+  let body = buildRequestBody [mkUserMessage "hello"] "claude-test" 1024 defaultRegistry NoTools
+  case decodeRequestBody body of
+    Left err -> pure $ Left err
+    Right (Object obj) -> do
+      let noTools = KM.lookup (Key.fromText "tools") obj == Nothing
+      if noTools
+        then pure $ Right ()
+        else pure $ Left $ "NoTools: expected no tools, got: " ++ show obj
+    Right other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
+-- | buildStreamingRequestBody with NoTools omits tools even when registry is non-empty.
+testAnthropicStreamingRequestNoToolsMode :: Test
+testAnthropicStreamingRequestNoToolsMode = do
+  let body = buildStreamingRequestBody [mkUserMessage "hello"] "claude-test" 1024 defaultRegistry NoTools
+  case decodeRequestBody body of
+    Left err -> pure $ Left err
+    Right (Object obj) -> do
+      let noTools   = KM.lookup (Key.fromText "tools") obj == Nothing
+          hasStream = KM.lookup (Key.fromText "stream") obj == Just (Bool True)
+      if noTools && hasStream
+        then pure $ Right ()
+        else pure $ Left $ "NoTools streaming: tools=" ++ show (not noTools)
+                        ++ " stream=" ++ show hasStream
+    Right other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
+-- | AdvertiseTools with non-empty registry still includes tools (regression guard).
+testAnthropicRequestAdvertiseToolsIncludesTools :: Test
+testAnthropicRequestAdvertiseToolsIncludesTools = do
+  let body = buildRequestBody [mkUserMessage "hello"] "claude-test" 1024 defaultRegistry AdvertiseTools
+  case decodeRequestBody body of
+    Left err -> pure $ Left err
+    Right (Object obj) -> do
+      let hasTools = case KM.lookup (Key.fromText "tools") obj of
+                       Just (Array arr) -> length arr > 0
+                       _                -> False
+      if hasTools
+        then pure $ Right ()
+        else pure $ Left $ "AdvertiseTools: expected tools, got none"
+    Right other -> pure $ Left $ "Request JSON is not an object: " ++ show other
+
 tests :: [Test]
 tests =
   [ testAnthropicRequestShape
@@ -528,4 +575,7 @@ tests =
   , testAnthropicProviderMissingKey
   , testAnthropicProviderConfigKeyStream
   , testAnthropicProviderEnvKey
+  , testAnthropicRequestNoToolsMode
+  , testAnthropicStreamingRequestNoToolsMode
+  , testAnthropicRequestAdvertiseToolsIncludesTools
   ]

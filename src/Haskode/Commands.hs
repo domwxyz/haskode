@@ -46,6 +46,12 @@ import Haskode.Agent      (AgentState (..), ContextStats (..), contextStats)
 import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Core       (Conversation, emptyConversation)
 import Haskode.Provider   (Provider (..))
+import Haskode.Provider.Resolve
+  ( providerApiKeyEnvVar
+  , providerDefaultBaseUrlHint
+  , providerKindLabel
+  , providerRequiresApiKey
+  )
 import Haskode.Session    (events)
 import Haskode.Tools      (toolNames)
 
@@ -59,6 +65,7 @@ data CommandAction
   = CmdHelp
   | CmdStatus
   | CmdNew
+  | CmdCompact
   | CmdExit
   | CmdDoctor
   | CmdExtensionText !Text
@@ -107,6 +114,7 @@ commandRegistry :: CommandRegistry
 commandRegistry =
   [ CommandSpec "help"   "show this help"                    CmdHelp   True True
   , CommandSpec "new"    "start a fresh conversation"         CmdNew    True True
+  , CommandSpec "compact" "summarize and replace conversation context" CmdCompact True True
   , CommandSpec "status" "show current runtime/config status" CmdStatus True True
   , CommandSpec "doctor" "local diagnostic checks"            CmdDoctor True True
   , CommandSpec "exit"   "save session log and exit"          CmdExit   True True
@@ -408,28 +416,12 @@ doctorChecks st = do
 -- Returns two checks: recognition status and provider kind.
 checkProvider :: String -> [DoctorCheck]
 checkProvider name =
-  case classifyProvider name of
-    (True, kind) ->
+  case providerKindLabel name of
+    Just kind ->
       [ DoctorCheck "provider" Ok (T.pack name <> " (" <> kind <> ")") ]
-    (False, _) ->
+    Nothing ->
       [ DoctorCheck "provider" Warn
           (T.pack name <> " (unknown; supported: openai, anthropic, ollama, vllm, litellm, openrouter, stub)") ]
-
--- | Classify a provider name as recognized and its kind.
-classifyProvider :: String -> (Bool, Text)
-classifyProvider name = case name of
-  "stub"       -> (True, "local development")
-  "ollama"     -> (True, "local model server")
-  "vllm"       -> (True, "local model server")
-  "openai"     -> (True, "hosted")
-  "litellm"    -> (True, "hosted/proxy")
-  "openrouter" -> (True, "hosted/proxy")
-  "anthropic"  -> (True, "hosted")
-  _            -> (False, "unknown")
-
--- | Whether a provider requires an API key.
-providerRequiresKey :: String -> Bool
-providerRequiresKey name = name `notElem` ["stub", "ollama", "vllm"]
 
 -- | Check whether the model field is non-empty.
 checkModel :: String -> [DoctorCheck]
@@ -442,20 +434,8 @@ checkModel model
 -- Reports the configured URL or notes that the provider default will be used.
 checkBaseUrl :: String -> String -> [DoctorCheck]
 checkBaseUrl provName url
-  | null url  = [DoctorCheck "base URL" Info (defaultBaseUrlHint provName)]
+  | null url  = [DoctorCheck "base URL" Info (providerDefaultBaseUrlHint provName)]
   | otherwise = [DoctorCheck "base URL" Ok (T.pack url)]
-
--- | Hint text for the default base URL of a known provider.
-defaultBaseUrlHint :: String -> Text
-defaultBaseUrlHint name = case name of
-  "openai"     -> "provider default (https://api.openai.com)"
-  "anthropic"  -> "provider default (https://api.anthropic.com)"
-  "ollama"     -> "provider default (http://localhost:11434)"
-  "vllm"       -> "provider default (http://localhost:8000)"
-  "litellm"    -> "provider default (http://localhost:4000)"
-  "openrouter" -> "provider default (https://openrouter.ai/api)"
-  "stub"       -> "not needed"
-  _            -> "provider default"
 
 -- | Check API key presence without printing the key value.
 --
@@ -464,22 +444,17 @@ defaultBaseUrlHint name = case name of
 -- environment variable.
 checkApiKey :: String -> String -> IO DoctorCheck
 checkApiKey provName configKey
-  | not (providerRequiresKey provName) =
+  | not (providerRequiresApiKey provName) =
       pure $ DoctorCheck "API key" Ok "not required"
   | not (null configKey) =
       pure $ DoctorCheck "API key" Ok "present"
   | otherwise = do
-      mEnvKey <- lookupEnv (envVarForProvider provName)
+      mEnvKey <- lookupEnv (providerApiKeyEnvVar provName)
       case mEnvKey of
         Just k | not (null k) ->
           pure $ DoctorCheck "API key" Ok "present (from env)"
         _ ->
           pure $ DoctorCheck "API key" Warn "missing"
-
--- | The environment variable name for a provider's API key.
-envVarForProvider :: String -> String
-envVarForProvider "anthropic" = "ANTHROPIC_API_KEY"
-envVarForProvider _           = "OPENAI_API_KEY"
 
 -- | Check the working directory.
 checkWorkingDir :: FilePath -> [DoctorCheck]

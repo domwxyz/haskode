@@ -358,7 +358,7 @@ testFormatContextLimitRefusalPercent =
 testFormatContextLimitRefusalNoAutoTruncate :: Test
 testFormatContextLimitRefusalNoAutoTruncate =
   let msg = formatContextLimitRefusal 130000 120000
-  in if "does not auto-truncate or summarize" `T.isInfixOf` msg
+  in if "does not auto-truncate or auto-summarize" `T.isInfixOf` msg
        then pure $ Right ()
        else pure $ Left $ "Missing no-auto-truncate note in: " ++ T.unpack msg
 
@@ -375,6 +375,7 @@ testFormatContextLimitRefusalNextSteps :: Test
 testFormatContextLimitRefusalNextSteps =
   let msg = formatContextLimitRefusal 130000 120000
   in if "Suggested next steps" `T.isInfixOf` msg
+       && "/compact"           `T.isInfixOf` msg
        && "fresh session"       `T.isInfixOf` msg
        && "cfgMaxContextChars"  `T.isInfixOf` msg
        then pure $ Right ()
@@ -389,7 +390,7 @@ testFormatContextLimitRefusalExactOver =
        else pure $ Left $ "Exact-over case failed: " ++ T.unpack msg
 
 -- ---------------------------------------------------------------------------
--- Streaming display helpers (future scaffolding)
+-- Streaming display helpers
 -- ---------------------------------------------------------------------------
 
 -- | formatStreamBegin produces the assistant label prefix.

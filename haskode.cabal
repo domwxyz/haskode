@@ -57,6 +57,7 @@ library
     Haskode.Provider
     Haskode.Provider.Anthropic
     Haskode.Provider.OpenAI
+    Haskode.Provider.Resolve
     Haskode.Tools
     Haskode.Policy
     Haskode.Session
@@ -98,6 +99,7 @@ test-suite haskode-test
     Haskode.Test.Patch
     Haskode.Test.Policy
     Haskode.Test.Provider
+    Haskode.Test.ProviderResolve
     Haskode.Test.Session
     Haskode.Test.Tools
     Haskode.Test.Tui

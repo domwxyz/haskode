@@ -27,8 +27,20 @@ module Haskode.Agent
   ( -- * Agent loop
     AgentState (..)
   , runAgent
+  , runAgentWithLimits
   , initState
   , initStateWithDisplay
+    -- * Manual compaction
+  , hasMeaningfulConversation
+  , proposeCompaction
+  , applyCompactionDecision
+  , acceptCompaction
+    -- * Run control
+  , RunLimits (..)
+  , RunStats (..)
+  , RunLimit (..)
+  , RunOutcome (..)
+  , defaultRunLimits
     -- * Single-turn processing
   , processTurn
     -- * System prompt
@@ -57,7 +69,7 @@ module Haskode.Agent
   , terminalAgentDisplay
   ) where
 
-import Control.Exception  (IOException, try, SomeException, throwIO)
+import Control.Exception  (IOException, try, SomeException, throwIO, displayException)
 import Control.Monad      (when, unless)
 import Data.Aeson         (Value, encode)
 import qualified Data.ByteString.Lazy as LBS
@@ -76,14 +88,17 @@ import Haskode.Display    (DisplayEvent (..), renderDisplayEvent,
                            formatConfirmReason, formatConfirmPrompt,
                            formatConfirmFile, formatConfirmDiffHeader,
                            formatConfirmPreviewHeader, formatContextLimitRefusal,
+                           formatCompactionUnavailable,
                            indentBlock,
                            streamBegin, streamChunk, streamEnd)
 import Haskode.Core       (Conversation, Message (..), Role (..), ToolCall (..),
                            ToolResult (..), emptyConversation,
-                           mkUserMessage, mkSystemMessage, appendMessage)
+                           mkUserMessage, mkAssistantMessage, mkSystemMessage,
+                           appendMessage)
 import Haskode.Policy     (Policy, Decision (..), checkPolicy)
 import Haskode.Provider   (Provider (..), CompletionRequest (..),
-                           CompletionResponse (..), StreamHandler (..))
+                           CompletionResponse (..), StreamHandler (..),
+                           ToolMode (..))
 import Haskode.Session    (Event (..), EventType (..), SessionLog,
                            emptyLog, logEvent)
 import Haskode.Tools      (Tool (..), ToolRegistry, toolNames, lookupTool,
@@ -143,8 +158,8 @@ terminalApproval tc reason = do
 -- | A function that consumes structured display events.
 --
 -- The CLI uses 'terminalDisplay', which renders each event as plain
--- terminal text. A future TUI can inject its own sink and update widgets
--- from the same structured events without parsing terminal strings.
+-- terminal text. Other front ends can inject their own sink and update
+-- widgets from the same structured events without parsing terminal strings.
 type DisplayFunc = DisplayEvent -> IO ()
 
 -- | Render display events to the current CLI terminal.
@@ -413,13 +428,189 @@ contextStats conv maxChars =
        }
 
 -- ---------------------------------------------------------------------------
+-- Manual compaction
+-- ---------------------------------------------------------------------------
+
+-- | Whether the current conversation has text worth compacting.
+--
+-- Tool results alone do not make a conversation meaningful for this command;
+-- /compact is intended to summarize user/assistant dialogue into working
+-- memory.
+hasMeaningfulConversation :: AgentState -> Bool
+hasMeaningfulConversation =
+  any meaningfulMessage . asConversation
+  where
+    meaningfulMessage m =
+      msgCallId m == Nothing
+        && msgRole m `elem` [User, Assistant]
+        && not (T.null (T.strip (msgContent m)))
+
+-- | Ask the current provider for a compact working-memory draft.
+--
+-- This deliberately uses 'providerComplete' rather than the streaming path so
+-- the draft is not displayed as an assistant reply before confirmation. Tools
+-- are not advertised, and any returned tool calls make the draft invalid.
+proposeCompaction :: AgentState -> IO (Either Text Text)
+proposeCompaction state
+  | not (hasMeaningfulConversation state) =
+      pure (Left formatCompactionUnavailable)
+  | otherwise = do
+      let cfg = asConfig state
+          pc = cfgProvider cfg
+          req = CompletionRequest
+            { crMessages =
+                [ mkSystemMessage compactionSystemPrompt
+                , mkUserMessage (renderConversationForCompaction (asConversation state))
+                ]
+            , crModel = T.pack (pcModel pc)
+            , crMaxTokens = cfgMaxTokens cfg
+            , crToolMode = NoTools
+            }
+      result <- try (providerComplete (asProvider state) req) :: IO (Either SomeException CompletionResponse)
+      case result of
+        Left err ->
+          pure $ Left ("Compaction failed: " <> T.pack (displayException err))
+        Right resp ->
+          validateCompactionResponse resp
+
+-- | Replace the live conversation with a single system memory message and
+-- record an explicit compaction event in the session log.
+acceptCompaction :: Text -> AgentState -> IO AgentState
+acceptCompaction draft state = do
+  now <- getCurrentTime
+  let memory = T.strip draft
+      state1 = state
+        { asConversation =
+            [ mkSystemMessage ("Compacted conversation memory:\n\n" <> memory) ]
+        , asSession =
+            logEvent (Event now EConversationCompacted memory) (asSession state)
+        }
+  pure state1
+
+compactionSystemPrompt :: Text
+compactionSystemPrompt =
+  "You are compacting Haskode conversation context for a future coding turn.\n\
+  \Write a concise working-memory summary of the conversation so far.\n\
+  \Include the user's current goal, important constraints, decisions made,\n\
+  \files or commands already discussed, known test results, and open blockers.\n\
+  \Do not call tools. Do not ask follow-up questions. Do not include raw tool\n\
+  \transcripts unless they are essential. Return only the compact memory text."
+
+renderConversationForCompaction :: Conversation -> Text
+renderConversationForCompaction conv =
+  "Summarize this conversation into compact working memory:\n\n"
+  <> T.intercalate "\n\n" (map renderMessage (zip [(1 :: Int)..] conv))
+  where
+    renderMessage (n, msg) =
+      "Message " <> T.pack (show n) <> " (" <> roleLabel (msgRole msg) <> flags msg <> "):\n"
+      <> msgContent msg
+      <> toolCallsSummary msg
+
+    roleLabel System = "system"
+    roleLabel User = "user"
+    roleLabel Assistant = "assistant"
+
+    flags msg =
+      case msgCallId msg of
+        Nothing -> ""
+        Just callId -> ", tool result for " <> callId
+
+    toolCallsSummary msg =
+      case msgToolCalls msg of
+        Nothing -> ""
+        Just [] -> ""
+        Just calls ->
+          "\n[assistant requested tools: "
+          <> T.intercalate ", " [tcId tc <> "=" <> tcName tc | tc <- calls]
+          <> "]"
+
+validateCompactionResponse :: CompletionResponse -> IO (Either Text Text)
+validateCompactionResponse resp =
+  case returnedToolCalls of
+    _:_ ->
+      pure $ Left "Compaction rejected: provider returned tool calls even though tools were disabled."
+    [] ->
+      let draft = T.strip (msgContent (crReply resp))
+      in if T.null draft
+           then pure $ Left "Compaction failed: provider returned an empty summary."
+           else pure (Right draft)
+  where
+    returnedToolCalls =
+      maybe [] id (crToolCalls resp)
+        <> maybe [] id (msgToolCalls (crReply resp))
+
+-- | Apply a user's compaction decision. Rejection deliberately leaves the
+-- conversation and session log untouched.
+applyCompactionDecision :: Bool -> Text -> AgentState -> IO AgentState
+applyCompactionDecision approved draft state
+  | approved  = acceptCompaction draft state
+  | otherwise = pure state
+
+-- ---------------------------------------------------------------------------
 -- Agent loop
 -- ---------------------------------------------------------------------------
+
+-- | Optional bounds for one agent run.
+--
+-- Nothing means unbounded and preserves the historical recursive agent loop.
+-- A Just value stops before exceeding that count.
+data RunLimits = RunLimits
+  { rlMaxProviderTurns :: !(Maybe Int)
+  , rlMaxToolCalls     :: !(Maybe Int)
+  } deriving (Show, Eq)
+
+-- | Counters accumulated during one agent run.
+data RunStats = RunStats
+  { rsProviderTurns :: !Int
+  , rsToolCalls     :: !Int
+  } deriving (Show, Eq)
+
+-- | Which configured bound stopped the run.
+data RunLimit
+  = ProviderTurnLimit
+  | ToolCallLimit
+  deriving (Show, Eq)
+
+-- | Result of running an agent turn with explicit bounds.
+data RunOutcome
+  = RunCompleted
+      { roState :: !AgentState
+      , roStats :: !RunStats
+      }
+  | RunLimitReached
+      { roState   :: !AgentState
+      , roStats   :: !RunStats
+      , roLimit   :: !RunLimit
+      , roMessage :: !Text
+      }
+
+-- | Historical default: no provider-turn or tool-call limit.
+defaultRunLimits :: RunLimits
+defaultRunLimits = RunLimits
+  { rlMaxProviderTurns = Nothing
+  , rlMaxToolCalls     = Nothing
+  }
+
+initialRunStats :: RunStats
+initialRunStats = RunStats
+  { rsProviderTurns = 0
+  , rsToolCalls     = 0
+  }
 
 -- | Run the agent.  Records the user message, then processes turns
 --   until the provider returns a final text reply (no tool calls).
 runAgent :: AgentState -> Text -> IO AgentState
-runAgent state input = do
+runAgent state input =
+  roState <$> runAgentWithLimits defaultRunLimits state input
+
+-- | Run the agent with explicit provider-turn and tool-call bounds.
+--
+-- The user message is recorded exactly as in 'runAgent'.  When a bound is
+-- reached, the run stops before the next provider call or tool call, appends a
+-- clear local assistant message, emits a display error, and returns
+-- 'RunLimitReached'.
+runAgentWithLimits :: RunLimits -> AgentState -> Text -> IO RunOutcome
+runAgentWithLimits limits state input = do
   -- Record the user message
   now <- getCurrentTime
   let userMsg = mkUserMessage input
@@ -429,8 +620,7 @@ runAgent state input = do
         }
 
   -- Process turns until we get a final text reply
-  state2 <- processTurn state1
-  pure state2
+  processTurnWithLimits limits initialRunStats state1
 
 -- ---------------------------------------------------------------------------
 -- Single-turn processing
@@ -444,112 +634,176 @@ runAgent state input = do
 --   3. If the response contains tool calls, checks policy and executes them
 --   4. Loops back with updated conversation
 processTurn :: AgentState -> IO AgentState
-processTurn state = do
-  let cfg  = asConfig state
-      prov = asProvider state
-      reg  = asRegistry state
+processTurn state =
+  roState <$> processTurnWithLimits defaultRunLimits initialRunStats state
 
-  -- Build context: system prompt + conversation
-  systemMd <- loadSystemMd
-  agentsMd <- loadAgentsMd
-  let sysMsg    = mkSystemMessage (buildSystemPrompt reg systemMd agentsMd)
-      context   = sysMsg : asConversation state
+processTurnWithLimits :: RunLimits -> RunStats -> AgentState -> IO RunOutcome
+processTurnWithLimits limits stats state
+  | limitReached (rsProviderTurns stats) (rlMaxProviderTurns limits) =
+      finishRunLimit limits stats state ProviderTurnLimit
+  | otherwise = do
+      let cfg  = asConfig state
+          prov = asProvider state
+          reg  = asRegistry state
+
+      -- Build context: system prompt + conversation
+      systemMd <- loadSystemMd
+      agentsMd <- loadAgentsMd
+      let sysMsg    = mkSystemMessage (buildSystemPrompt reg systemMd agentsMd)
+          context   = sysMsg : asConversation state
 
   -- Context-window guard: estimate total size before calling provider.
   -- This is a cheap character-count check that prevents oversized
-  -- requests from reaching the provider.  No truncation or summarization
-  -- is performed — the conversation must be shortened manually.
-  let stats = contextStats context (cfgMaxContextChars cfg)
-  when (csCurrent stats > csMax stats) $ do
-    let msg = formatContextLimitRefusal (csCurrent stats) (csMax stats)
-    emitDisplayEvent state $ DisplayContextLimitRefusal (csCurrent stats) (csMax stats)
-    fail (T.unpack msg)
+  -- requests from reaching the provider. No automatic truncation or
+  -- summarization is performed; use /compact or /new manually.
+      let ctxStats = contextStats context (cfgMaxContextChars cfg)
+      when (csCurrent ctxStats > csMax ctxStats) $ do
+        let msg = formatContextLimitRefusal (csCurrent ctxStats) (csMax ctxStats)
+        emitDisplayEvent state $
+          DisplayContextLimitRefusal (csCurrent ctxStats) (csMax ctxStats)
+        fail (T.unpack msg)
 
   -- Call the provider (prefer streaming when available)
-  let req = CompletionRequest
-        { crMessages  = context
-        , crModel     = T.pack (pcModel (cfgProvider cfg))
-        , crMaxTokens = cfgMaxTokens cfg
-        }
-  let mStream = providerStream prov
-  resp <- case mStream of
-    Just stream -> do
-      displayStarted <- newIORef False
-      let display = asDisplay state
-      let onTokenLazy chunk
-            | T.null chunk = pure ()
-            | otherwise = do
+      let req = CompletionRequest
+            { crMessages  = context
+            , crModel     = T.pack (pcModel (cfgProvider cfg))
+            , crMaxTokens = cfgMaxTokens cfg
+            , crToolMode  = AdvertiseTools
+            }
+      let mStream = providerStream prov
+      resp <- case mStream of
+        Just stream -> do
+          displayStarted <- newIORef False
+          let display = asDisplay state
+          let onTokenLazy chunk
+                | T.null chunk = pure ()
+                | otherwise = do
+                    started <- readIORef displayStarted
+                    unless started $ do
+                      writeIORef displayStarted True
+                      agentDisplayStreamBegin display
+                    agentDisplayStreamChunk display chunk
+          r <- do
+            result <- try $ stream req StreamHandler { onToken = onTokenLazy }
+            case result of
+              Left (e :: SomeException) -> do
                 started <- readIORef displayStarted
-                unless started $ do
-                  writeIORef displayStarted True
-                  agentDisplayStreamBegin display
-                agentDisplayStreamChunk display chunk
-      r <- do
-        result <- try $ stream req StreamHandler { onToken = onTokenLazy }
-        case result of
-          Left (e :: SomeException) -> do
-            started <- readIORef displayStarted
-            when started (agentDisplayStreamEnd display)
-            throwIO e
-          Right val -> pure val
-      started <- readIORef displayStarted
-      when started (agentDisplayStreamEnd display)
-      pure r
-    Nothing ->
-      providerComplete prov req
+                when started (agentDisplayStreamEnd display)
+                throwIO e
+              Right val -> pure val
+          started <- readIORef displayStarted
+          when started (agentDisplayStreamEnd display)
+          pure r
+        Nothing ->
+          providerComplete prov req
 
   -- Record the assistant reply (identical for both paths)
-  now <- getCurrentTime
-  let reply = crReply resp
-      -- If the response includes tool calls, attach them to the
-      -- assistant message so the OpenAI wire format includes the
-      -- required "tool_calls" array on the preceding assistant
-      -- message.  Without this, subsequent "tool" role messages
-      -- would fail validation.
-      replyWithCalls = case crToolCalls resp of
-        Nothing  -> reply
-        Just tcs -> reply { msgToolCalls = Just tcs }
-      -- Build a descriptive event payload.  When tool calls are
-      -- present we include a summary so the session log shows
-      -- what the assistant asked to do, not just the text reply.
-      replyEventData = case crToolCalls resp of
-        Nothing  -> msgContent reply
-        Just tcs -> msgContent reply
-                 <> " | tool_calls: "
-                 <> T.intercalate ", "
-                      [ tcId t <> "=" <> tcName t | t <- tcs ]
-      state1 = state
-        { asConversation = appendMessage replyWithCalls (asConversation state)
-        , asSession = logEvent
-            (Event now EAssistantReply replyEventData)
-            (asSession state)
-        }
+      now <- getCurrentTime
+      let reply = crReply resp
+          -- If the response includes tool calls, attach them to the
+          -- assistant message so the OpenAI wire format includes the
+          -- required "tool_calls" array on the preceding assistant
+          -- message.  Without this, subsequent "tool" role messages
+          -- would fail validation.
+          replyWithCalls = case crToolCalls resp of
+            Nothing  -> reply
+            Just tcs -> reply { msgToolCalls = Just tcs }
+          -- Build a descriptive event payload.  When tool calls are
+          -- present we include a summary so the session log shows
+          -- what the assistant asked to do, not just the text reply.
+          replyEventData = case crToolCalls resp of
+            Nothing  -> msgContent reply
+            Just tcs -> msgContent reply
+                     <> " | tool_calls: "
+                     <> T.intercalate ", "
+                          [ tcId t <> "=" <> tcName t | t <- tcs ]
+          state1 = state
+            { asConversation = appendMessage replyWithCalls (asConversation state)
+            , asSession = logEvent
+                (Event now EAssistantReply replyEventData)
+                (asSession state)
+            }
+          stats1 = stats { rsProviderTurns = rsProviderTurns stats + 1 }
 
   -- Check for tool calls
-  case crToolCalls resp of
-    Nothing -> do
-      -- Final text reply.  Streaming already displayed it via
-      -- streamBegin/streamChunk/streamEnd; non-streaming displays it now.
-      case mStream of
-        Just _  -> pure ()
-        Nothing -> emitDisplayEvent state1 $ DisplayAssistant (msgContent reply)
-      pure state1
-    Just calls -> do
-      -- Process each tool call and loop
-      state2 <- processToolCalls state1 calls
-      processTurn state2
+      case crToolCalls resp of
+        Nothing -> do
+          -- Final text reply.  Streaming already displayed it via
+          -- streamBegin/streamChunk/streamEnd; non-streaming displays it now.
+          case mStream of
+            Just _  -> pure ()
+            Nothing -> emitDisplayEvent state1 $
+              DisplayAssistant (msgContent reply)
+          pure RunCompleted
+            { roState = state1
+            , roStats = stats1
+            }
+        Just calls -> do
+          -- Process each tool call and loop
+          result <- processToolCallsWithLimits limits stats1 state1 calls
+          case result of
+            Left outcome -> pure outcome
+            Right (state2, stats2) -> processTurnWithLimits limits stats2 state2
+
+limitReached :: Int -> Maybe Int -> Bool
+limitReached _ Nothing = False
+limitReached count (Just maxCount) = count >= maxCount
+
+processToolCallsWithLimits
+  :: RunLimits
+  -> RunStats
+  -> AgentState
+  -> [ToolCall]
+  -> IO (Either RunOutcome (AgentState, RunStats))
+processToolCallsWithLimits _limits stats state [] =
+  pure (Right (state, stats))
+processToolCallsWithLimits limits stats state (tc:tcs)
+  | limitReached (rsToolCalls stats) (rlMaxToolCalls limits) =
+      Left <$> finishRunLimit limits stats state ToolCallLimit
+  | otherwise = do
+      state1 <- processSingleToolCall state tc
+      let stats1 = stats { rsToolCalls = rsToolCalls stats + 1 }
+      processToolCallsWithLimits limits stats1 state1 tcs
+
+finishRunLimit :: RunLimits -> RunStats -> AgentState -> RunLimit -> IO RunOutcome
+finishRunLimit limits stats state reached = do
+  now <- getCurrentTime
+  let msg = formatRunLimitReached limits stats reached
+      state1 = state
+        { asConversation =
+            appendMessage (mkAssistantMessage msg) (asConversation state)
+        , asSession =
+            logEvent (Event now ERunLimitReached msg) (asSession state)
+        }
+  emitDisplayEvent state1 (DisplayError msg)
+  pure RunLimitReached
+    { roState = state1
+    , roStats = stats
+    , roLimit = reached
+    , roMessage = msg
+    }
+
+formatRunLimitReached :: RunLimits -> RunStats -> RunLimit -> Text
+formatRunLimitReached limits stats reached =
+  "Error: agent run limit reached\n"
+  <> "  Reason: " <> reason <> "\n"
+  <> "  Provider turns: " <> formatCount (rsProviderTurns stats) (rlMaxProviderTurns limits) <> "\n"
+  <> "  Tool calls:     " <> formatCount (rsToolCalls stats) (rlMaxToolCalls limits) <> "\n"
+  <> "  Haskode stopped this turn before continuing."
+  where
+    reason = case reached of
+      ProviderTurnLimit ->
+        "stopped before another provider call"
+      ToolCallLimit ->
+        "stopped before executing another tool"
+
+formatCount :: Int -> Maybe Int -> Text
+formatCount count mLimit =
+  T.pack (show count) <> "/" <> maybe "unbounded" (T.pack . show) mLimit
 
 -- ---------------------------------------------------------------------------
 -- Tool-call processing
 -- ---------------------------------------------------------------------------
-
--- | Process a list of tool calls: check policy, execute allowed ones,
---   deny blocked ones, and append results to the conversation.
-processToolCalls :: AgentState -> [ToolCall] -> IO AgentState
-processToolCalls state [] = pure state
-processToolCalls state (tc:tcs) = do
-  state1 <- processSingleToolCall state tc
-  processToolCalls state1 tcs
 
 -- | Write-like tools get a short action label in confirmation
 --   metadata.  These labels are user-facing, so keep them stable.

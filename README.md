@@ -147,6 +147,7 @@ In interactive mode, the following slash commands are available:
 |---------|-------------|
 | `/help` | Show available commands |
 | `/new` | Start a fresh conversation context |
+| `/compact` | Manually summarize the current conversation and replace live context after confirmation |
 | `/status` | Show current provider, model, working dir, disabled/available tools, character-based context usage, and runtime info |
 | `/doctor` | Local diagnostic checks for provider/config, API-key presence, `SYSTEM.md`, `AGENTS.md`, disabled/available tools, and session-log settings. Read-only: no provider contact, no shell, no file writes |
 | `/exit` | Save session log and exit |
@@ -155,6 +156,13 @@ In interactive mode, the following slash commands are available:
 Unknown slash commands print a short hint.  Anything without a leading `/` is sent to the agent as a normal prompt.
 Forks may compile in additional pure text slash commands through
 `compiledExtensions`; those commands appear in `/help` only when registered.
+
+`/compact` is manual, provider-assisted context management.  It asks the
+current provider for a compact working-memory summary with tools disabled,
+shows the proposed memory, and asks for confirmation before replacing the
+live conversation context.  It does not replay tools, does not advertise
+tools, and rejects the draft if the provider somehow returns tool calls.
+It is not automatic context management or full memory.
 
 ### Experimental TUI mode
 
@@ -167,7 +175,7 @@ seam as the CLI.
 Supported in TUI mode:
 
 - Submit normal prompts, including the default local `stub` provider path.
-- `/help`, `/status`, `/doctor`, `/new`, `/exit`, and `/quit`.
+- `/help`, `/status`, `/doctor`, `/new`, `/compact`, `/exit`, and `/quit`.
 - Any compiled pure text extension commands registered in the final command
   registry.
 - Basic display of assistant replies, tool notices, policy notices, and
@@ -676,6 +684,7 @@ debugging, inspection, or fine-tuning data export.
 | `session_start` | Interactive or single-shot run begins | `"session started"` |
 | `session_end` | Run exits normally (before log flush) | `"session ended"` |
 | `conversation_reset` | `/new` resets the in-memory conversation | `"conversation reset by /new"` |
+| `conversation_compacted` | Accepted `/compact` replaces live context with compact memory | Compact memory text |
 | `user_message` | User sends input | Raw user text |
 | `assistant_reply` | Model replies | Reply text; when tool calls are present, a summary of call IDs and tool names is appended (e.g. `\| tool_calls: call_1=read_file, call_2=list_files`) |
 | `tool_call` | Tool begins execution | Call ID, tool name, JSON arguments |
@@ -704,15 +713,15 @@ to `session.jsonl` on normal exit (single-shot completion or typing
 `/exit` in interactive mode) and when the agent encounters a handled
 error (e.g. a provider failure).  The file is appended to — multiple
 runs in the same directory accumulate events.  The JSONL file is a
-write-only audit trail and cannot restore executable session state.  Lifecycle events
-(`session_start`, `session_end`, `conversation_reset`) mark the
-boundaries of each run and `/new` resets.  Resume uses
-`conversation_reset` only as a text-context boundary; lifecycle events
-are never used for executable replay.
+write-only audit trail and cannot restore executable session state.  Lifecycle
+events (`session_start`, `session_end`) mark run boundaries.  Resume uses
+`conversation_reset` and `conversation_compacted` as text-context boundaries;
+lifecycle events are never used for executable replay.
 
 **Empty and command-only sessions.**  A session is flushed only when
 it contains at least one *content* event (`user_message`,
-`assistant_reply`, `tool_call`, `tool_result`, or `policy_decision`).
+`assistant_reply`, `tool_call`, `tool_result`, `policy_decision`, or
+`conversation_compacted`).
 Sessions that contain only lifecycle events — such as an immediate
 `/exit`, `/help` then `/exit`, `/status` then `/exit`, or `/new` then
 `/exit` — are silently discarded and do not create `session.jsonl`.
@@ -744,6 +753,7 @@ Session summary:
   session_start: 1
   session_end: 0
   conversation_reset: 0
+  conversation_compacted: 0
   Malformed:     0
   Backup:        (none)
 ```
@@ -756,10 +766,12 @@ reported but not read.
 
 **Resuming a session.**  The `--resume` flag loads safe text resume
 context from `session.jsonl` without re-executing tools or provider
-calls.  Only `user_message` and `assistant_reply` events after the
-last `/new` boundary are reconstructed.  Tool calls, tool results,
-policy decisions, and lifecycle events are skipped.  On startup a
-concise summary is printed:
+calls.  `user_message` and `assistant_reply` events after the last
+`/new` or accepted `/compact` boundary are reconstructed.  An accepted
+`conversation_compacted` event resumes as a single safe system-memory
+message; older pre-compaction messages are not live context.  Tool calls,
+tool results, policy decisions, and lifecycle events are skipped.  On
+startup a concise summary is printed:
 
 ```
 $ haskode --resume
@@ -770,6 +782,7 @@ Message events: 7
 Skipped:        5
 Malformed:      0
 Reset boundary: yes
+Compact boundary: no
 ```
 
 If no `session.jsonl` exists, a "starting fresh" message is shown.
@@ -788,20 +801,24 @@ is not implemented.
   through `tool_use` / `tool_result` blocks in both non-streaming and
   streaming responses.  Streamed `tool_use` input JSON fragments are
   assembled before tool execution.
-- **No context window management** — long conversations may exceed the
+- **Manual-only context compaction** — long conversations may exceed the
   model's context limit.  A conservative character-count guard
   (`cfgMaxContextChars`, default 120K chars / ~30K tokens) prevents
   oversized requests from reaching the provider and returns a clear
   error.  `/status` shows character-based context usage (current,
   max, remaining, percentage) so the user can monitor consumption.
-  No truncation, summarization, or automatic message deletion
-  is performed — the user must start a new session to continue.
+  `/compact` can manually ask the current provider for a compact
+  working-memory summary with tools disabled, then replace live context
+  only after confirmation.  Haskode still has no automatic truncation,
+  automatic summarization, token-aware pruning, vector memory, or
+  automatic message deletion.
 - **Limited session resume; no full replay** — `--resume` loads safe
-  text resume context from `session.jsonl` (user messages and assistant
-  replies after the last `/new` boundary).  Tool calls, tool results,
-  policy decisions, and lifecycle events are not reconstructed.  No
-  tools or provider calls are re-executed.  Full replay (re-running
-  tool calls or provider turns from the log) is not implemented.
+  text resume context from `session.jsonl` (user messages, assistant
+  replies, and accepted compact memory after the last `/new` or
+  `/compact` boundary).  Tool calls, tool results, policy decisions,
+  and lifecycle events are not reconstructed.  No tools or provider
+  calls are re-executed.  Full replay (re-running tool calls or provider
+  turns from the log) is not implemented.
 - **Experimental TUI** - `--tui` provides a minimal Brick wrapper with a
   transcript, input line, status/tool area, and synchronous confirmation
   panel for confirmation-required tool and policy actions. It is still
@@ -845,11 +862,10 @@ is not implemented.
 - [x] Anthropic provider (Messages API)
 - [x] `write_file` tool with patch integration
 - [x] `search` / `glob` tools
-- [ ] Token counting and context window management
 
 ### Phase 2 — Usable daily driver
 - [x] Streaming token output
-- [ ] Rich diff display: colored unified diffs (done), side-by-side (not yet)
+- [/] Rich diff display: colored unified diffs (done), side-by-side (not yet)
 - [x] Session save/resume (phase zero: conservative, non-replaying)
 - [x] `.agentignore` file support (root-level, shared by `glob` and `search`)
 - [x] Read-only batch preview (`preview_patch_batch`)
@@ -866,6 +882,7 @@ is not implemented.
 
 ### Phase 4 — Advanced
 - [ ] Multi-agent orchestration
+- [ ] Token counting and context window management
 - [ ] Fine-tuning data export from session logs
 - [ ] Local model integration (llama.cpp / GGUF)
 
@@ -881,7 +898,7 @@ rather than a typeclass hierarchy, it is.
 
 ## Contributing
 
-This is an educational project. Read the code, learn from it, fork it,
+This is a fully open project. Read the code, learn from it, fork it,
 make it your own. Pull requests welcome if they follow the existing
 style: simple, readable, well-commented.
 

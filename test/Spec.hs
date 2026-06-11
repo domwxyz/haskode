@@ -15,6 +15,7 @@ import qualified Haskode.Test.OpenAI   as OpenAI
 import qualified Haskode.Test.Patch    as Patch
 import qualified Haskode.Test.Policy   as Policy
 import qualified Haskode.Test.Provider as Provider
+import qualified Haskode.Test.ProviderResolve as ProviderResolve
 import qualified Haskode.Test.Session  as Session
 import qualified Haskode.Test.Tools    as Tools
 import qualified Haskode.Test.Tui      as Tui
@@ -35,3 +36,4 @@ main = runTests $
   ++ Extension.tests
   ++ Tui.tests
   ++ Provider.tests
+  ++ ProviderResolve.tests

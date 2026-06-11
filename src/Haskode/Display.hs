@@ -58,6 +58,12 @@ module Haskode.Display
   , formatConfirmFile
   , formatConfirmDiffHeader
   , formatConfirmPreviewHeader
+    -- * Compaction
+  , formatCompactionUnavailable
+  , formatCompactionDraft
+  , formatCompactionPrompt
+  , formatCompactionAccepted
+  , formatCompactionRejected
     -- * Error output
   , formatError
     -- * Context limit refusal
@@ -78,10 +84,9 @@ import System.IO             (hFlush, hSetBuffering, stdout, BufferMode (..))
 -- | Small structured boundary for terminal-visible agent output.
 --
 -- This is the CLI/TUI seam, not a general event bus.  The CLI renders these
--- events back to the existing terminal strings; a future TUI can consume the
--- same values without parsing formatted text.  Streaming and confirmation
--- previews intentionally stay on their existing terminal-specific paths for
--- now.
+-- events back to the existing terminal strings; the TUI consumes the same
+-- values without parsing formatted text.  Streaming and confirmation previews
+-- intentionally stay on their existing front-end-specific paths for now.
 data DisplayEvent
   = DisplayAssistant Text
   | DisplayToolExecuting Text
@@ -308,6 +313,26 @@ formatConfirmPreviewHeader :: Text
 formatConfirmPreviewHeader = "  [confirm] Preview:"
 
 -- ---------------------------------------------------------------------------
+-- Compaction
+-- ---------------------------------------------------------------------------
+
+formatCompactionUnavailable :: Text
+formatCompactionUnavailable = "No conversation to compact yet."
+
+formatCompactionDraft :: Text -> Text
+formatCompactionDraft draft =
+  "Proposed compact memory:\n" <> indentBlock 2 draft
+
+formatCompactionPrompt :: Text
+formatCompactionPrompt = "Replace conversation with this compact memory? (y/N) "
+
+formatCompactionAccepted :: Text
+formatCompactionAccepted = "Conversation compacted."
+
+formatCompactionRejected :: Text
+formatCompactionRejected = "Compaction canceled; conversation unchanged."
+
+-- ---------------------------------------------------------------------------
 -- Error output
 -- ---------------------------------------------------------------------------
 
@@ -339,8 +364,9 @@ formatContextLimitRefusal estimated maxChars =
      <> "  Limit:          " <> T.pack (show maxChars) <> " chars\n"
      <> "  Over limit by:  " <> T.pack (show overBy) <> " chars\n"
      <> "  Note: This is a character-based estimate, not a token count.\n"
-     <> "  Haskode does not auto-truncate or summarize conversations.\n"
+     <> "  Haskode does not auto-truncate or auto-summarize conversations.\n"
      <> "  Suggested next steps:\n"
+     <> "    - Use /compact to manually summarize and replace context\n"
      <> "    - Use /new to start a fresh session\n"
      <> "    - Reduce the size of your prompt or context\n"
      <> "    - Start a new session or raise cfgMaxContextChars"

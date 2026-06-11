@@ -50,10 +50,12 @@
 -- and proxy providers fail fast with a helpful error when no key is
 -- available.
 --
--- = Limitations (Phase 1)
+-- = Limitations
 --
---   * No token counting or context-window management.
---   * No Anthropic or Ollama-specific extensions.
+--   * No token counting in this provider adapter. The agent owns its
+--     character-based context guard.
+--   * No provider-specific APIs beyond the OpenAI-compatible chat
+--     completions shape.
 
 module Haskode.Provider.OpenAI
   ( -- * Provider constructor
@@ -112,7 +114,8 @@ import Haskode.Config           (Config (..), ProviderConfig (..),
 import Haskode.Core             (Message (..), Role (..), ToolCall (..))
 import Haskode.Provider         (CompletionRequest (..),
                                  CompletionResponse (..), Provider (..),
-                                 StreamHandler (..))
+                                 StreamHandler (..), ToolMode (..))
+import Haskode.Provider.Resolve (localOpenAICompatibleProviders)
 import Haskode.Tools            (Tool (..), ToolRegistry, toolNames, lookupTool)
 
 -- ---------------------------------------------------------------------------
@@ -198,12 +201,12 @@ openaiProviderWithApiKeyOverride mCliKey cfg reg = do
         { providerName = T.pack provider
         , providerComplete = \req -> do
             reg' <- readIORef regRef
-            let body = buildRequestBody tokenField (crMessages req) model' maxTok reg'
+            let body = buildRequestBody tokenField (crMessages req) model' maxTok reg' (crToolMode req)
             respBody <- sendRequest mgr baseUrl (T.pack apiKey) body
             either throwIO pure (parseResponseBody respBody)
         , providerStream = Just $ \req handler -> do
             reg' <- readIORef regRef
-            let body = buildStreamingRequestBody tokenField (crMessages req) model' maxTok reg'
+            let body = buildStreamingRequestBody tokenField (crMessages req) model' maxTok reg' (crToolMode req)
             sendRequestStreaming mgr baseUrl (T.pack apiKey) body handler
         }
 
@@ -213,7 +216,7 @@ openaiProviderWithApiKeyOverride mCliKey cfg reg = do
 -- proxies should fail clearly rather than sending anonymous requests.
 openAICompatibleRequiresApiKey :: String -> Bool
 openAICompatibleRequiresApiKey provider =
-  provider `notElem` ["ollama", "vllm"]
+  provider `notElem` localOpenAICompatibleProviders
 
 -- | Resolve an OpenAI-compatible API key.
 --
@@ -449,26 +452,28 @@ mergeToolCallFragment tcRef (idx, frag) = do
 --   > { "model": "gpt-4o"
 --   > , "messages": [ ... ]
 --   > , "max_completion_tokens": 4096   -- or "max_tokens" for local providers
---   > , "tools": [ ... ]               -- only when tools are registered
+--   > , "tools": [ ... ]               -- only when tools are registered and mode is AdvertiseTools
 --   > }
 --
 --   The token-limit field name is passed explicitly so that callers
 --   can choose between @"max_completion_tokens"@ (OpenAI) and
 --   @"max_tokens"@ (local/proxy providers).  See
 --   'tokenLimitFieldName'.
-buildRequestBody :: Text -> [Message] -> Text -> Int -> ToolRegistry -> LBS.ByteString
-buildRequestBody tokenField msgs model' maxTok reg =
+buildRequestBody :: Text -> [Message] -> Text -> Int -> ToolRegistry -> ToolMode -> LBS.ByteString
+buildRequestBody tokenField msgs model' maxTok reg mode =
   encode $ object $
     [ "model"      .= model'
     , "messages"   .= messagesToJSON msgs
     , Key.fromText tokenField .= maxTok
-    ] ++ toolsField reg
+    ] ++ toolsField reg mode
   where
     -- The "tools" field is omitted entirely when the registry is
-    -- empty.  Some providers reject requests with an empty tools
-    -- array.  When tools are present we also set tool_choice to
-    -- "auto" so the model knows it may call them.
-    toolsField r
+    -- empty or when tool mode is NoTools.  Some providers reject
+    -- requests with an empty tools array.  When tools are present
+    -- and mode is AdvertiseTools we also set tool_choice to "auto"
+    -- so the model knows it may call them.
+    toolsField _ NoTools        = []
+    toolsField r AdvertiseTools
       | null (toolNames r) = []
       | otherwise          = [ "tools"       .= toolsToJSON r
                              , "tool_choice" .= ("auto" :: Text)
@@ -479,16 +484,17 @@ buildRequestBody tokenField msgs model' maxTok reg =
 --   Identical to 'buildRequestBody' but adds @"stream": true@ so
 --   the provider returns Server-Sent Events instead of a single
 --   JSON response.
-buildStreamingRequestBody :: Text -> [Message] -> Text -> Int -> ToolRegistry -> LBS.ByteString
-buildStreamingRequestBody tokenField msgs model' maxTok reg =
+buildStreamingRequestBody :: Text -> [Message] -> Text -> Int -> ToolRegistry -> ToolMode -> LBS.ByteString
+buildStreamingRequestBody tokenField msgs model' maxTok reg mode =
   encode $ object $
     [ "model"      .= model'
     , "messages"   .= messagesToJSON msgs
     , Key.fromText tokenField .= maxTok
     , "stream"     .= True
-    ] ++ toolsField reg
+    ] ++ toolsField reg mode
   where
-    toolsField r
+    toolsField _ NoTools        = []
+    toolsField r AdvertiseTools
       | null (toolNames r) = []
       | otherwise          = [ "tools"       .= toolsToJSON r
                              , "tool_choice" .= ("auto" :: Text)

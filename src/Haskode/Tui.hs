@@ -20,6 +20,7 @@ module Haskode.Tui
   , formatTuiHelp
   , formatTuiStatusLine
   , formatTuiConfirmationLines
+  , formatTuiCompactionConfirmationLines
   , tuiConfirmationInputDecision
   , truncateEntryText
   , truncateArgsText
@@ -64,6 +65,8 @@ import Haskode.Agent
   ( AgentDisplay (..)
   , AgentState (..)
   , runAgent
+  , proposeCompaction
+  , applyCompactionDecision
   , recordConversationReset
   )
 import Haskode.Commands
@@ -81,7 +84,12 @@ import Haskode.Commands
   )
 import Haskode.Config     (Config (..), ProviderConfig (..))
 import Haskode.Core       (ToolCall (..))
-import Haskode.Display    (DisplayEvent (..), formatContextLimitRefusal)
+import Haskode.Display
+  ( DisplayEvent (..)
+  , formatContextLimitRefusal
+  , formatCompactionAccepted
+  , formatCompactionRejected
+  )
 import Haskode.Provider   (Provider (..))
 import Haskode.Session    (flushLogOnException)
 import Haskode.Tools
@@ -218,6 +226,16 @@ formatTuiConfirmationLines confirmation =
       | null preview = []
       | otherwise    = "" : "Preview:" : map ("  " <>) preview
 
+formatTuiCompactionConfirmationLines :: Text -> [Text]
+formatTuiCompactionConfirmationLines draft =
+  [ "Proposed compact memory:"
+  , ""
+  ]
+  <> T.lines (truncateEntryText transcriptEntryLimit draft)
+  <> [ ""
+     , "Accept? y = accept, n/Esc/Enter/Ctrl-C = reject"
+     ]
+
 tuiConfirmationInputDecision :: TuiConfirmationInput -> Maybe Bool
 tuiConfirmationInputDecision input =
   case input of
@@ -248,6 +266,11 @@ data TuiName = TranscriptViewport
 data TuiConfirmationState = TuiConfirmationState
   { tcsConfirmation :: !TuiConfirmation
   , tcsDecision     :: !(Maybe Bool)
+  }
+
+data TuiCompactionConfirmationState = TuiCompactionConfirmationState
+  { tccsDraft    :: !Text
+  , tccsDecision :: !(Maybe Bool)
   }
 
 data TuiState = TuiState
@@ -387,6 +410,15 @@ tuiConfirmationApp = App
   , appAttrMap = const (attrMap V.defAttr [])
   }
 
+tuiCompactionConfirmationApp :: App TuiCompactionConfirmationState e TuiName
+tuiCompactionConfirmationApp = App
+  { appDraw = drawTuiCompactionConfirmation
+  , appChooseCursor = neverShowCursor
+  , appHandleEvent = handleTuiCompactionConfirmationEvent
+  , appStartEvent = pure ()
+  , appAttrMap = const (attrMap V.defAttr [])
+  }
+
 runTuiConfirmationDialog :: TuiConfirmation -> IO Bool
 runTuiConfirmationDialog confirmation = do
   final <- defaultMain tuiConfirmationApp $
@@ -395,6 +427,15 @@ runTuiConfirmationDialog confirmation = do
       , tcsDecision = Nothing
       }
   pure (maybe False id (tcsDecision final))
+
+runTuiCompactionConfirmationDialog :: Text -> IO Bool
+runTuiCompactionConfirmationDialog draft = do
+  final <- defaultMain tuiCompactionConfirmationApp $
+    TuiCompactionConfirmationState
+      { tccsDraft = draft
+      , tccsDecision = Nothing
+      }
+  pure (maybe False id (tccsDecision final))
 
 drawTui :: TuiState -> [Widget TuiName]
 drawTui st =
@@ -422,6 +463,14 @@ drawTuiConfirmation st =
       padAll 1 $
         viewport ConfirmationViewport Vertical $
           vBox (map txtWrap (formatTuiConfirmationLines (tcsConfirmation st)))
+  ]
+
+drawTuiCompactionConfirmation :: TuiCompactionConfirmationState -> [Widget TuiName]
+drawTuiCompactionConfirmation st =
+  [ B.borderWithLabel (str "Confirm Compaction") $
+      padAll 1 $
+        viewport ConfirmationViewport Vertical $
+          vBox (map txtWrap (formatTuiCompactionConfirmationLines (tccsDraft st)))
   ]
 
 handleTuiEvent :: BrickEvent TuiName e -> EventM TuiName TuiState ()
@@ -460,6 +509,19 @@ handleTuiConfirmationEvent event =
         Just decision -> do
           st <- get
           put st { tcsDecision = Just decision }
+          halt
+    _ ->
+      pure ()
+
+handleTuiCompactionConfirmationEvent :: BrickEvent TuiName e -> EventM TuiName TuiCompactionConfirmationState ()
+handleTuiCompactionConfirmationEvent event =
+  case event of
+    VtyEvent vtyEvent ->
+      case vtyEventToConfirmationInput vtyEvent >>= tuiConfirmationInputDecision of
+        Nothing -> pure ()
+        Just decision -> do
+          st <- get
+          put st { tccsDecision = Just decision }
           halt
     _ ->
       pure ()
@@ -648,6 +710,35 @@ runTuiCommand action st =
             }
         , False
         )
+    CmdCompact -> do
+      result <- proposeCompaction (tuiAgentState st)
+      case result of
+        Left err ->
+          pure
+            ( (appendEntry (TuiEntry TuiSystemEntry err) st)
+                { tuiStatus = "Compaction skipped." }
+            , False
+            )
+        Right draft -> do
+          approved <- runTuiCompactionConfirmationDialog draft
+          if approved
+            then do
+              compacted <- applyCompactionDecision True draft (tuiAgentState st)
+              pure
+                ( (appendEntry (TuiEntry TuiSystemEntry formatCompactionAccepted) st)
+                    { tuiAgentState = compacted
+                    , tuiStatus = formatCompactionAccepted
+                    , tuiToolActivity = "No active tool."
+                    , tuiStreamBuffer = ""
+                    }
+                , False
+                )
+            else
+              pure
+                ( (appendEntry (TuiEntry TuiSystemEntry formatCompactionRejected) st)
+                    { tuiStatus = formatCompactionRejected }
+                , False
+                )
     CmdExit ->
       pure
         ( (appendEntry (TuiEntry TuiSystemEntry "Goodbye.") st)

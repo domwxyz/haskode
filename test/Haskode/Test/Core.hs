@@ -10,13 +10,21 @@ import Haskode.Agent
     ( AgentState(asSession, asConversation),
       AgentDisplay(..),
       ContextStats (..),
+      RunLimit (..),
+      RunLimits (..),
+      RunOutcome (..),
+      RunStats (..),
       autoApprove,
+      applyCompactionDecision,
       buildSystemPrompt,
       contextStats,
       estimateContextChars,
+      hasMeaningfulConversation,
       initState,
       initStateWithDisplay,
-      runAgent )
+      proposeCompaction,
+      runAgent,
+      runAgentWithLimits )
 import Haskode.Config
     ( defaultConfig,
       defaultMaxContextChars,
@@ -26,7 +34,7 @@ import Haskode.Core
       mkAssistantMessage,
       mkUserMessage,
       Message(Message, msgRole, msgToolCalls, msgCallId, msgContent),
-      Role(User, Assistant),
+      Role(User, Assistant, System),
       ToolCall(ToolCall, tcId, tcName) )
 import Haskode.Display ( DisplayEvent(..) )
 import Haskode.Patch ( makePatch, showDiff )
@@ -35,16 +43,18 @@ import Haskode.Provider
     ( scriptedProvider,
       stubProvider,
       CompletionRequest(crMaxTokens, CompletionRequest, crMessages,
-                        crModel),
+                        crModel, crToolMode),
       CompletionResponse(crToolCalls, CompletionResponse, crReply),
-      Provider(providerComplete) )
+      Provider(..),
+      ToolMode(..) )
 import Haskode.Session
     ( emptyLog,
       events,
       logEvent,
       Event(evType, Event, evData),
       EventType(EToolResult, EPolicyDecision, EUserMessage,
-                EAssistantReply, EToolCall) )
+                EAssistantReply, EToolCall, ERunLimitReached,
+                EConversationCompacted) )
 import Haskode.Test.Util ( createTestTree, Test )
 import Haskode.Tools
     ( defaultRegistry,
@@ -90,6 +100,7 @@ testStubProvider = do
         { crMessages  = [mkUserMessage "test input"]
         , crModel     = "test"
         , crMaxTokens = 100
+        , crToolMode  = AdvertiseTools
         }
   resp <- providerComplete stubProvider req
   if T.isInfixOf "test input" (msgContent (crReply resp))
@@ -330,6 +341,297 @@ testMultiToolConversationHistory = do
     else pure $ Left $ "events=" ++ show types
                      ++ " assistantWithCalls=" ++ show hasAssistantWithCalls
                      ++ " toolResults=" ++ show toolResultCount
+
+describeRunOutcome :: RunOutcome -> String
+describeRunOutcome RunCompleted{} = "RunCompleted"
+describeRunOutcome RunLimitReached{} = "RunLimitReached"
+
+captureDisplay :: IORef.IORef [DisplayEvent] -> AgentDisplay
+captureDisplay ref = AgentDisplay
+  { agentDisplayEvent = \event -> IORef.modifyIORef ref (<> [event])
+  , agentDisplayStreamBegin = pure ()
+  , agentDisplayStreamChunk = \_chunk -> pure ()
+  , agentDisplayStreamEnd = pure ()
+  , agentDisplayPreview = \_toolCall -> pure ()
+  }
+
+recordingProvider :: CompletionResponse -> IO (Provider, IO [CompletionRequest])
+recordingProvider response = do
+  ref <- IORef.newIORef []
+  let prov = Provider
+        { providerName = "recording"
+        , providerComplete = \req -> do
+            IORef.modifyIORef ref (<> [req])
+            pure response
+        , providerStream = Nothing
+        }
+  pure (prov, IORef.readIORef ref)
+
+-- | Bounded runs report provider-turn and tool-call stats on completion.
+testRunAgentWithLimitsCompletedStats :: Test
+testRunAgentWithLimitsCompletedStats = do
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Let me inspect."
+        , crToolCalls = Just
+            [ ToolCall "tc-stats-1" "list_files" (object ["dir" .= ("." :: T.Text)])
+            , ToolCall "tc-stats-2" "list_files" (object ["dir" .= ("." :: T.Text)])
+            ]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "Stats complete."
+        , crToolCalls = Nothing
+        }
+    ]
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
+  outcome <- runAgentWithLimits (RunLimits Nothing Nothing) state "check stats"
+  case outcome of
+    RunCompleted { roState = state', roStats = stats }
+      | stats == RunStats 2 2
+        && any ((== "Stats complete.") . msgContent) (asConversation state') ->
+          pure $ Right ()
+      | otherwise ->
+          pure $ Left $ "completed stats=" ++ show stats
+    other ->
+      pure $ Left $ "Expected RunCompleted, got " ++ describeRunOutcome other
+
+-- | A provider-turn limit stops before recursive provider calls.
+testRunAgentWithLimitsProviderTurnLimit :: Test
+testRunAgentWithLimitsProviderTurnLimit = do
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Let me list files."
+        , crToolCalls = Just
+            [ ToolCall "tc-provider-limit-1" "list_files"
+                (object ["dir" .= ("." :: T.Text)])
+            ]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "This provider response should not be used."
+        , crToolCalls = Nothing
+        }
+    ]
+  let limits = RunLimits
+        { rlMaxProviderTurns = Just 1
+        , rlMaxToolCalls = Nothing
+        }
+      state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
+  outcome <- runAgentWithLimits limits state "hit provider limit"
+  case outcome of
+    RunLimitReached
+      { roState = state'
+      , roStats = stats
+      , roLimit = reached
+      , roMessage = msg
+      } -> do
+        let evts = events (asSession state')
+            contents = map msgContent (asConversation state')
+            finalWasSkipped =
+              not (any (T.isInfixOf "should not be used") contents)
+            limitWasAppended =
+              not (null contents) && last contents == msg
+            limitWasLogged =
+              any (\e -> evType e == ERunLimitReached
+                      && T.isInfixOf "provider call" (evData e)) evts
+        if reached == ProviderTurnLimit
+           && stats == RunStats 1 1
+           && T.isInfixOf "provider call" msg
+           && finalWasSkipped
+           && limitWasAppended
+           && limitWasLogged
+          then pure $ Right ()
+          else pure $ Left $ "provider limit: reached=" ++ show reached
+                         ++ " stats=" ++ show stats
+                         ++ " finalSkipped=" ++ show finalWasSkipped
+                         ++ " appended=" ++ show limitWasAppended
+                         ++ " logged=" ++ show limitWasLogged
+    other ->
+      pure $ Left $ "Expected RunLimitReached, got " ++ describeRunOutcome other
+
+-- | A tool-call limit stops before executing additional tool calls.
+testRunAgentWithLimitsToolCallLimit :: Test
+testRunAgentWithLimitsToolCallLimit = do
+  displayRef <- IORef.newIORef []
+  prov <- scriptedProvider
+    [ CompletionResponse
+        { crReply     = mkAssistantMessage "Let me list twice."
+        , crToolCalls = Just
+            [ ToolCall "tc-tool-limit-1" "list_files"
+                (object ["dir" .= ("." :: T.Text)])
+            , ToolCall "tc-tool-limit-2" "list_files"
+                (object ["dir" .= ("." :: T.Text)])
+            ]
+        }
+    , CompletionResponse
+        { crReply     = mkAssistantMessage "This provider response should not be used."
+        , crToolCalls = Nothing
+        }
+    ]
+  let limits = RunLimits
+        { rlMaxProviderTurns = Nothing
+        , rlMaxToolCalls = Just 1
+        }
+      state = initStateWithDisplay
+        defaultConfig
+        prov
+        defaultPolicy
+        defaultRegistry
+        autoApprove
+        (captureDisplay displayRef)
+        False
+  outcome <- runAgentWithLimits limits state "hit tool limit"
+  displayEvents <- IORef.readIORef displayRef
+  case outcome of
+    RunLimitReached
+      { roState = state'
+      , roStats = stats
+      , roLimit = reached
+      , roMessage = msg
+      } -> do
+        let evts = events (asSession state')
+            toolCallEvents = filter (\e -> evType e == EToolCall) evts
+            toolResults = filter (\m -> msgCallId m /= Nothing) (asConversation state')
+            resultIds = map (maybe "" id . msgCallId) toolResults
+            secondToolSkipped = "tc-tool-limit-2" `notElem` resultIds
+            limitWasLogged = any ((== ERunLimitReached) . evType) evts
+            limitWasDisplayed = DisplayError msg `elem` displayEvents
+        if reached == ToolCallLimit
+           && stats == RunStats 1 1
+           && length toolCallEvents == 1
+           && resultIds == ["tc-tool-limit-1"]
+           && secondToolSkipped
+           && T.isInfixOf "executing another tool" msg
+           && limitWasLogged
+           && limitWasDisplayed
+          then pure $ Right ()
+          else pure $ Left $ "tool limit: reached=" ++ show reached
+                         ++ " stats=" ++ show stats
+                         ++ " toolCalls=" ++ show (length toolCallEvents)
+                         ++ " resultIds=" ++ show resultIds
+                         ++ " logged=" ++ show limitWasLogged
+                         ++ " displayed=" ++ show limitWasDisplayed
+    other ->
+      pure $ Left $ "Expected RunLimitReached, got " ++ describeRunOutcome other
+
+-- | /compact has nothing to do when there is no text conversation.
+testCompactionEmptyConversationNoop :: Test
+testCompactionEmptyConversationNoop = do
+  (prov, getRequests) <- recordingProvider
+    CompletionResponse
+      { crReply = mkAssistantMessage "should not be requested"
+      , crToolCalls = Nothing
+      }
+  let state = initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False
+  result <- proposeCompaction state
+  requests <- getRequests
+  case result of
+    Left err
+      | "No conversation" `T.isInfixOf` err
+        && null requests
+        && not (hasMeaningfulConversation state)
+        && null (asConversation state) ->
+          pure $ Right ()
+      | otherwise ->
+          pure $ Left $ "empty compaction mismatch: err=" ++ T.unpack err
+    Right draft ->
+      pure $ Left $ "empty compaction should not produce draft: " ++ T.unpack draft
+
+-- | Compaction draft requests are internal provider calls with tools disabled.
+testCompactionRequestUsesNoTools :: Test
+testCompactionRequestUsesNoTools = do
+  (prov, getRequests) <- recordingProvider
+    CompletionResponse
+      { crReply = mkAssistantMessage "compact summary"
+      , crToolCalls = Nothing
+      }
+  let state = (initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False)
+        { asConversation =
+            [ mkUserMessage "Implement feature"
+            , mkAssistantMessage "Discussed design"
+            ]
+        }
+  result <- proposeCompaction state
+  requests <- getRequests
+  case (result, requests) of
+    (Right "compact summary", [req])
+      | crToolMode req == NoTools
+        && length (crMessages req) == 2
+        && all (\m -> msgCallId m == Nothing && msgToolCalls m == Nothing) (crMessages req) ->
+          pure $ Right ()
+      | otherwise ->
+          pure $ Left $ "compaction request should use NoTools and safe messages: " ++ show req
+    _ -> pure $ Left $ "unexpected compaction result/requests: " ++ show (result, requests)
+
+-- | If a provider returns tool calls during compaction, the draft is rejected.
+testCompactionRejectsProviderToolCalls :: Test
+testCompactionRejectsProviderToolCalls = do
+  (prov, getRequests) <- recordingProvider
+    CompletionResponse
+      { crReply = mkAssistantMessage "draft"
+      , crToolCalls = Just [ToolCall "compact-tool-1" "read_file" (object ["path" .= ("x.hs" :: T.Text)])]
+      }
+  let state = (initState defaultConfig prov defaultPolicy defaultRegistry autoApprove False)
+        { asConversation = [mkUserMessage "Summarize this"] }
+      originalConversation = asConversation state
+  result <- proposeCompaction state
+  requests <- getRequests
+  case result of
+    Left err
+      | "tool calls" `T.isInfixOf` err
+        && asConversation state == originalConversation
+        && length requests == 1
+        && all ((== NoTools) . crToolMode) requests ->
+          pure $ Right ()
+      | otherwise ->
+          pure $ Left $ "tool-call rejection mismatch: " ++ T.unpack err
+    Right draft ->
+      pure $ Left $ "tool-call compaction should be rejected: " ++ T.unpack draft
+
+-- | Accepted compaction replaces live context with one safe system memory.
+testAcceptedCompactionReplacesConversation :: Test
+testAcceptedCompactionReplacesConversation = do
+  let state = (initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False)
+        { asConversation =
+            [ mkUserMessage "Need Stage 8A"
+            , mkAssistantMessage "Will implement compact"
+            ]
+        }
+  state' <- applyCompactionDecision True "compact summary" state
+  let conv = asConversation state'
+      compactEvents = filter ((== EConversationCompacted) . evType) (events (asSession state'))
+  case (conv, compactEvents) of
+    ([msg], [ev]) ->
+      if msgRole msg == System
+         && "compact summary" `T.isInfixOf` msgContent msg
+         && msgCallId msg == Nothing
+         && msgToolCalls msg == Nothing
+         && evData ev == "compact summary"
+        then
+          pure $ Right ()
+        else
+          pure $ Left $ "accepted compaction mismatch: conv=" ++ show conv
+                      ++ " events=" ++ show (map evData compactEvents)
+    _ -> pure $ Left $ "accepted compaction mismatch: conv=" ++ show conv
+                    ++ " events=" ++ show (map evData compactEvents)
+
+-- | Rejected compaction leaves conversation and session log unchanged.
+testRejectedCompactionLeavesConversationUnchanged :: Test
+testRejectedCompactionLeavesConversationUnchanged = do
+  let state = (initState defaultConfig stubProvider defaultPolicy defaultRegistry autoApprove False)
+        { asConversation =
+            [ mkUserMessage "Keep this"
+            , mkAssistantMessage "Unchanged"
+            ]
+        }
+      originalConversation = asConversation state
+      originalEventCount = length (events (asSession state))
+  state' <- applyCompactionDecision False "unused summary" state
+  if asConversation state' == originalConversation
+     && length (events (asSession state')) == originalEventCount
+    then pure $ Right ()
+    else pure $ Left $ "rejected compaction changed state: conv="
+                    ++ show (asConversation state')
+                    ++ " events=" ++ show (events (asSession state'))
 
 -- | Shell approval flow: a safe shell command is flagged AskUser by
 --   policy, autoApprove lets it through, and the agent loop completes
@@ -629,6 +931,14 @@ tests =
   , testAgentCustomDisplaySink
   , testAgentLoopToolExecution
   , testMultiToolConversationHistory
+  , testRunAgentWithLimitsCompletedStats
+  , testRunAgentWithLimitsProviderTurnLimit
+  , testRunAgentWithLimitsToolCallLimit
+  , testCompactionEmptyConversationNoop
+  , testCompactionRequestUsesNoTools
+  , testCompactionRejectsProviderToolCalls
+  , testAcceptedCompactionReplacesConversation
+  , testRejectedCompactionLeavesConversationUnchanged
   , testBuildSystemPrompt
   , testEstimateContextCharsUserMsg
   , testEstimateContextCharsAssistantMsg

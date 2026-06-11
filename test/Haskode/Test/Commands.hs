@@ -372,11 +372,37 @@ testParseSlashCommandNew =
     then pure $ Right ()
     else pure $ Left "parseSlashCommand \"/new\" should be Just \"new\""
 
+testParseSlashCommandCompact :: Test
+testParseSlashCommandCompact =
+  if parseSlashCommand "/compact" == Just "compact"
+    then pure $ Right ()
+    else pure $ Left "parseSlashCommand \"/compact\" should be Just \"compact\""
+
 testFormatHelpContentIncludesNew :: Test
 testFormatHelpContentIncludesNew =
   if T.isInfixOf "/new" formatHelp
     then pure $ Right ()
     else pure $ Left $ "formatHelp missing /new: " ++ T.unpack (T.take 200 formatHelp)
+
+testFormatHelpContentIncludesCompact :: Test
+testFormatHelpContentIncludesCompact =
+  if T.isInfixOf "/compact" formatHelp
+    then pure $ Right ()
+    else pure $ Left $ "formatHelp missing /compact: " ++ T.unpack (T.take 300 formatHelp)
+
+testLookupCommandCompact :: Test
+testLookupCommandCompact =
+  case lookupCommand "compact" of
+    Just spec | cmdAction spec == CmdCompact -> pure $ Right ()
+    _ -> pure $ Left "lookupCommand \"compact\" should return CmdCompact"
+
+testResolveCommandActionForCompactCliAndTui :: Test
+testResolveCommandActionForCompactCliAndTui =
+  case ( resolveCommandActionFor commandRegistry cmdAvailableInCli "compact"
+       , resolveCommandActionFor commandRegistry cmdAvailableInTui "compact"
+       ) of
+    (Right CmdCompact, Right CmdCompact) -> pure $ Right ()
+    resolved -> pure $ Left $ "CLI/TUI should both resolve /compact, got: " ++ show resolved
 
 testFormatNewConfirmationText :: Test
 testFormatNewConfirmationText =
@@ -596,6 +622,7 @@ tests =
   , testParseSlashCommandEmpty
   , testParseSlashCommandSpacesOnly
   , testParseSlashCommandNew
+  , testParseSlashCommandCompact
   , testLookupCommandKnownActions
   , testLookupCommandUnknown
   , testResolveCommandForAvailable
@@ -603,10 +630,13 @@ tests =
   , testResolveCommandForUnavailable
   , testResolveCommandActionForQuitAlias
   , testResolveCommandActionForUnknown
+  , testResolveCommandActionForCompactCliAndTui
   , testLookupCommandDoctor
+  , testLookupCommandCompact
   , testQuitAliasesExitAction
   , testFormatHelpContent
   , testFormatHelpContentIncludesNew
+  , testFormatHelpContentIncludesCompact
   , testFormatHelpIncludesDoctor
   , testFormatHelpIncludesEveryRegisteredCliCommand
   , testFormatHelpLineCountMatchesRegistry

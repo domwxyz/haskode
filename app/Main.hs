@@ -28,6 +28,7 @@ module Main (main) where
 
 import Control.Monad      (unless, when)
 import Data.Text          (Text)
+import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Options.Applicative
 import System.Exit        (exitFailure, exitSuccess)
@@ -37,19 +38,29 @@ import System.IO          (hFlush, stdout, hSetBuffering, stdin, BufferMode (..)
 import Haskode.Commands        (CommandAction (..), CommandRegistry, CommandSpec (cmdAvailableInCli), parseSlashCommand, resolveCommandActionFor,
                                 formatHelpFor, formatStatus, formatDoctor, formatUnknownCommand, formatNewConfirmation, resetConversation)
 import Haskode.Config          (Config (..), ProviderConfig (..), loadConfig, loadConfigFrom)
-import Haskode.Display         (formatVerbose)
+import Haskode.Display         (formatVerbose,
+                                formatCompactionDraft, formatCompactionPrompt,
+                                formatCompactionAccepted, formatCompactionRejected)
 import Haskode.Extension       (buildFinalCommandRegistry, buildFinalRuntime)
 import Haskode.Extensions      (compiledExtensions)
 import Haskode.Provider        (Provider, stubProvider)
 import Haskode.Provider.Anthropic (anthropicProvider)
 import Haskode.Provider.OpenAI (openaiProviderWithApiKeyOverride)
+import Haskode.Provider.Resolve
+  ( ProviderKind (..)
+  , classifyProviderName
+  , formatAnthropicApiKeyError
+  , formatOpenAICompatibleApiKeyError
+  , formatUnknownProviderError
+  )
 import Haskode.Policy          (Policy, defaultPolicy)
 import Haskode.Session         (flushLog, flushLogOnException, summarizeSession, formatSessionSummary, isMeaningfulSession, loadResumeEvents, ResumeResult (..), formatResumeSummary)
 import Haskode.Tools           (ToolRegistry)
 import Haskode.Tui             (runTui)
 import Haskode.Agent           (AgentState (..), initState, runAgent, terminalApproval,
                                 recordSessionStart, recordSessionStartWithResume,
-                                recordSessionEnd, recordConversationReset)
+                                recordSessionEnd, recordConversationReset,
+                                proposeCompaction, applyCompactionDecision)
 
 -- ---------------------------------------------------------------------------
 -- CLI options
@@ -265,12 +276,6 @@ runSelectedMode commands opts' state =
 -- Provider resolution
 -- ---------------------------------------------------------------------------
 
--- | The set of provider names that are treated as OpenAI-compatible
---   HTTP endpoints.  All of these speak the @\/v1\/chat\/completions@
---   wire format and are handled by 'openaiProvider'.
-openaiCompatibleProviders :: [String]
-openaiCompatibleProviders = ["openai", "ollama", "vllm", "litellm", "openrouter"]
-
 -- | Resolve a 'Provider' from the config.
 --
 --   Supported provider names:
@@ -284,51 +289,28 @@ openaiCompatibleProviders = ["openai", "ollama", "vllm", "litellm", "openrouter"
 resolveProvider :: Config -> Options -> ToolRegistry -> IO Provider
 resolveProvider cfg opts' registry =
   let name = pcProvider (cfgProvider cfg)
-  in case () of
-    _ | name `elem` openaiCompatibleProviders -> do
-          eitherProv <- openaiProviderWithApiKeyOverride (optApiKey opts') cfg registry
-          case eitherProv of
-            Left err -> do
-              putStrLn $ "Error: " ++ err
-              putStrLn ""
-              putStrLn "To set an API key, either:"
-              putStrLn "  1. Pass --api-key on the command line, or"
-              putStrLn "  2. Set the OPENAI_API_KEY environment variable, or"
-              putStrLn "  3. Add \"pcApiKey\" to your haskode.json config file."
-              putStrLn ""
-              putStrLn "Example:"
-              putStrLn "  export OPENAI_API_KEY=\"sk-...\""
-              putStrLn "  cabal run haskode -- --provider openai --prompt \"Hello\""
-              exitFailure
-            Right prov -> pure prov
-      | name == "stub" -> pure stubProvider
-      | name == "anthropic" -> do
-          eitherProv <- anthropicProvider cfg registry
-          case eitherProv of
-            Left err -> do
-              putStrLn $ "Error: " ++ err
-              putStrLn ""
-              putStrLn "To set an Anthropic API key, either:"
-              putStrLn "  1. Pass --api-key on the command line, or"
-              putStrLn "  2. Add \"pcApiKey\" to your haskode.json config file, or"
-              putStrLn "  3. Set the ANTHROPIC_API_KEY environment variable."
-              putStrLn ""
-              putStrLn "Example:"
-              putStrLn "  export ANTHROPIC_API_KEY=\"sk-ant-...\""
-              putStrLn "  cabal run haskode -- --provider anthropic --model claude-3-5-sonnet-latest --prompt \"Hello\""
-              exitFailure
-            Right prov -> pure prov
-      | otherwise -> do
-          putStrLn $ "Error: unknown provider \"" ++ name ++ "\"."
-          putStrLn ""
-          putStrLn "Supported providers:"
-          putStrLn $ "  " ++ unwords openaiCompatibleProviders ++ "  (OpenAI-compatible HTTP)"
-          putStrLn "  anthropic                                  (Anthropic Messages API)"
-          putStrLn "  stub                                        (local echo, for development)"
-          putStrLn ""
-          putStrLn "Example:"
-          putStrLn "  cabal run haskode -- --provider openai --prompt \"Hello\""
+  in case classifyProviderName name of
+    ProviderOpenAICompatible -> do
+      eitherProv <- openaiProviderWithApiKeyOverride (optApiKey opts') cfg registry
+      case eitherProv of
+        Left err -> do
+          printProviderError (formatOpenAICompatibleApiKeyError err)
           exitFailure
+        Right prov -> pure prov
+    ProviderStub -> pure stubProvider
+    ProviderAnthropic -> do
+      eitherProv <- anthropicProvider cfg registry
+      case eitherProv of
+        Left err -> do
+          printProviderError (formatAnthropicApiKeyError err)
+          exitFailure
+        Right prov -> pure prov
+    ProviderUnknown -> do
+      printProviderError (formatUnknownProviderError name)
+      exitFailure
+
+printProviderError :: [String] -> IO ()
+printProviderError = mapM_ putStrLn
 
 -- ---------------------------------------------------------------------------
 -- Config overrides
@@ -402,9 +384,34 @@ runCliCommand commands commandAction state =
       let state1 = resetConversation state
       state2 <- recordConversationReset state1
       interactiveLoop commands state2
+    CmdCompact -> do
+      state' <- runCliCompact state
+      interactiveLoop commands state'
     CmdExtensionText output -> do
       TIO.putStrLn output
       interactiveLoop commands state
+
+-- | Run manual /compact in the CLI.
+runCliCompact :: AgentState -> IO AgentState
+runCliCompact state = do
+  result <- proposeCompaction state
+  case result of
+    Left err -> do
+      TIO.putStrLn err
+      pure state
+    Right draft -> do
+      TIO.putStrLn (formatCompactionDraft draft)
+      TIO.putStr formatCompactionPrompt
+      hFlush stdout
+      answer <- TIO.getLine
+      if T.strip answer `elem` ["y", "Y"]
+        then do
+          state' <- applyCompactionDecision True draft state
+          TIO.putStrLn formatCompactionAccepted
+          pure state'
+        else do
+          TIO.putStrLn formatCompactionRejected
+          pure state
 
 -- | Run the agent with exception-safe session flush.
 --   On exception the current session log is flushed before re-throwing.

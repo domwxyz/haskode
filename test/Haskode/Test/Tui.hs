@@ -19,6 +19,7 @@ import Haskode.Tui
   , TuiUpdate (..)
   , displayEventToTuiUpdate
   , formatTuiConfirmationLines
+  , formatTuiCompactionConfirmationLines
   , formatTuiHelp
   , formatTuiStatusLine
   , streamChunksToEntry
@@ -145,6 +146,16 @@ testFormatTuiConfirmationWithoutPreview =
         && not ("Preview:" `T.isInfixOf` out)
        then pure $ Right ()
        else pure $ Left $ "empty preview should be omitted: " ++ T.unpack out
+
+testFormatTuiCompactionConfirmationLines :: Test
+testFormatTuiCompactionConfirmationLines =
+  let out = T.unlines (formatTuiCompactionConfirmationLines "compact memory")
+  in if "Proposed compact memory:" `T.isInfixOf` out
+        && "compact memory" `T.isInfixOf` out
+        && "y = accept" `T.isInfixOf` out
+        && "reject" `T.isInfixOf` out
+       then pure $ Right ()
+       else pure $ Left $ "formatTuiCompactionConfirmationLines mismatch: " ++ T.unpack out
 
 testTuiConfirmationInputDecision :: Test
 testTuiConfirmationInputDecision =
@@ -275,6 +286,7 @@ tests =
   , testFormatTuiStatusLine
   , testFormatTuiConfirmationLines
   , testFormatTuiConfirmationWithoutPreview
+  , testFormatTuiCompactionConfirmationLines
   , testTuiConfirmationInputDecision
   , testTruncateEntryTextNoOp
   , testTruncateEntryTextExactLimit

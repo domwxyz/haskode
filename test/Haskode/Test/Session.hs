@@ -24,7 +24,7 @@ import Haskode.Core
     ( ToolResult(trOutput),
       mkAssistantMessage,
       Message(msgCallId, msgRole, msgToolCalls, msgContent),
-      Role(Assistant, User),
+      Role(Assistant, User, System),
       ToolCall(ToolCall, tcId) )
 import Haskode.Policy ( defaultPolicy )
 import Haskode.Provider
@@ -1049,6 +1049,49 @@ testFormatSessionSummaryConversationReset = withTestDir "haskode-summarize-forma
     then pure $ Right ()
     else pure $ Left $ "formatSessionSummary missing conversation_reset: " ++ T.unpack (T.take 300 out)
 
+-- | EConversationCompacted JSON roundtrip.
+testConversationCompactedJSON :: Test
+testConversationCompactedJSON = do
+  now <- getCurrentTime
+  let ev = Event now EConversationCompacted "compact memory"
+  case decode (encode ev) :: Maybe Event of
+    Nothing -> pure $ Left "EConversationCompacted JSON roundtrip failed"
+    Just ev'
+      | evType ev' == EConversationCompacted && evData ev' == "compact memory" ->
+          pure $ Right ()
+      | otherwise -> pure $ Left $ "EConversationCompacted roundtrip mismatch: " ++ show ev'
+
+-- | summarizeSession counts accepted compaction events.
+testSummarizeSessionConversationCompacted :: Test
+testSummarizeSessionConversationCompacted = withTestDir "haskode-summarize-compacted" $ \root -> do
+  now <- getCurrentTime
+  let log' = foldl (\acc e -> logEvent e acc) emptyLog
+        [ Event now EUserMessage "hello"
+        , Event now EAssistantReply "hi"
+        , Event now EConversationCompacted "compact memory"
+        ]
+  flushLog root 0 log'
+  ss <- summarizeSession root
+  let counts = ssTypeCounts ss
+      ok = ssTotalEvents ss == 3
+           && Map.findWithDefault 0 EConversationCompacted counts == 1
+  if ok
+    then pure $ Right ()
+    else pure $ Left $ "conversation_compacted count: total=" ++ show (ssTotalEvents ss)
+                     ++ " counts=" ++ show counts
+
+-- | formatSessionSummary includes conversation_compacted line.
+testFormatSessionSummaryConversationCompacted :: Test
+testFormatSessionSummaryConversationCompacted = withTestDir "haskode-summarize-format-compacted" $ \root -> do
+  now <- getCurrentTime
+  let log' = logEvent (Event now EConversationCompacted "compact memory") emptyLog
+  flushLog root 0 log'
+  ss <- summarizeSession root
+  let out = formatSessionSummary ss
+  if T.isInfixOf "conversation_compacted:" out
+    then pure $ Right ()
+    else pure $ Left $ "formatSessionSummary missing conversation_compacted: " ++ T.unpack (T.take 300 out)
+
 -- | recordSessionStart produces an ESessionStart event.
 testRecordSessionStartEvent :: Test
 testRecordSessionStartEvent = do
@@ -1205,6 +1248,15 @@ testIsMeaningfulWithReset = do
   if not (isMeaningfulSession log')
     then pure $ Right ()
     else pure $ Left "lifecycle+reset log should not be meaningful"
+
+-- | Accepted conversation compaction is meaningful and should be flushed.
+testIsMeaningfulWithCompaction :: Test
+testIsMeaningfulWithCompaction = do
+  now <- getCurrentTime
+  let log' = logEvent (Event now EConversationCompacted "compact memory") emptyLog
+  if isMeaningfulSession log'
+    then pure $ Right ()
+    else pure $ Left "conversation_compacted log should be meaningful"
 
 -- | Log with user_message is meaningful.
 testIsMeaningfulWithUserMessage :: Test
@@ -1594,6 +1646,58 @@ testResumeRespectsConversationReset = do
     then pure $ Right ()
     else pure $ Left $ "Contents after reset: " ++ show contents
 
+-- | resumeContextEventsToConversation treats compaction as a safe memory boundary.
+testResumeRespectsConversationCompaction :: Test
+testResumeRespectsConversationCompaction = do
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "before compact"
+             , Event now EAssistantReply "reply before"
+             , Event now EToolCall "tc-1 read_file"
+             , Event now EToolResult "tc-1 contents"
+             , Event now EConversationCompacted "compact memory"
+             ]
+      conv = resumeContextEventsToConversation evts
+  case conv of
+    [msg]
+      | msgRole msg == System
+        && "compact memory" `T.isInfixOf` msgContent msg
+        && msgCallId msg == Nothing
+        && msgToolCalls msg == Nothing ->
+          pure $ Right ()
+    _ -> pure $ Left $ "Compaction resume context: " ++ show conv
+
+-- | loadResumeEvents reports and applies accepted compaction boundaries.
+testResumeLoadConversationCompactionBoundary :: Test
+testResumeLoadConversationCompactionBoundary = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-compaction-boundary"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "before compact"
+             , Event now EAssistantReply "reply before"
+             , Event now EConversationCompacted "compact memory"
+             , Event now EUserMessage "after compact"
+             , Event now EAssistantReply "reply after"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr -> do
+        let conv = rrResumeContext rr
+            roles = map msgRole conv
+            contents = map msgContent conv
+        case contents of
+          memory : rest
+            | rrUsedCompactionBoundary rr
+              && roles == [System, User, Assistant]
+              && length conv == 3
+              && "compact memory" `T.isInfixOf` memory
+              && rest == ["after compact", "reply after"] ->
+                pure (Right ())
+          _ -> pure (Left $ "compaction boundary resume: roles=" ++ show roles
+                          ++ " contents=" ++ show contents
+                          ++ " used=" ++ show (rrUsedCompactionBoundary rr))
+
 -- | loadResumeEvents produces correct safe text context from a real JSONL file.
 testResumeEndToEnd :: Test
 testResumeEndToEnd = do
@@ -1846,6 +1950,26 @@ testFormatResumeSummaryNoResetBoundary = do
           then pure (Right ())
           else pure (Left $ "Expected 'Reset boundary: no': " ++ T.unpack (T.take 300 out))
 
+-- | formatResumeSummary reports accepted compaction boundaries.
+testFormatResumeSummaryCompactionBoundary :: Test
+testFormatResumeSummaryCompactionBoundary = do
+  tmpDir <- getTemporaryDirectory
+  let root = tmpDir </> "haskode-resume-format-compact"
+  now <- getCurrentTime
+  let evts = [ Event now EUserMessage "before"
+             , Event now EConversationCompacted "compact memory"
+             ]
+  withJsonlFile root evts $ \dir -> do
+    result <- loadResumeEvents dir
+    case result of
+      Nothing -> pure (Left "Expected Just")
+      Just rr -> do
+        let logPath = dir </> "session.jsonl"
+            out = formatResumeSummary logPath rr
+        if T.isInfixOf "Compact boundary: yes" out
+          then pure (Right ())
+          else pure (Left $ "Expected compaction boundary summary: " ++ T.unpack (T.take 300 out))
+
 -- | formatResumeSummary shows correct message count.
 testFormatResumeSummaryMessageCount :: Test
 testFormatResumeSummaryMessageCount = do
@@ -1930,6 +2054,9 @@ tests =
   , testConversationResetJSON
   , testSummarizeSessionConversationReset
   , testFormatSessionSummaryConversationReset
+  , testConversationCompactedJSON
+  , testSummarizeSessionConversationCompacted
+  , testFormatSessionSummaryConversationCompacted
   , testRecordSessionStartEvent
   , testRecordSessionStartWithResumeEvent
   , testRecordSessionEndEvent
@@ -1939,6 +2066,7 @@ tests =
   , testIsMeaningfulEmpty
   , testIsMeaningfulLifecycleOnly
   , testIsMeaningfulWithReset
+  , testIsMeaningfulWithCompaction
   , testIsMeaningfulWithUserMessage
   , testIsMeaningfulWithAssistantReply
   , testIsMeaningfulWithToolCall
@@ -1964,6 +2092,8 @@ tests =
   , testResumeCountsOnlySafeTextMessages
   , testResumeLoadsOnlySafeTextContext
   , testResumeRespectsConversationReset
+  , testResumeRespectsConversationCompaction
+  , testResumeLoadConversationCompactionBoundary
   , testResumeEndToEnd
   -- Resume accounting tests (phase zero polish)
   , testResumeParsedValidCount
@@ -1975,6 +2105,7 @@ tests =
   , testResumeAccountingWithMalformed
   , testFormatResumeSummarySections
   , testFormatResumeSummaryNoResetBoundary
+  , testFormatResumeSummaryCompactionBoundary
   , testFormatResumeSummaryMessageCount
   , testResumeZeroMessages
   ]

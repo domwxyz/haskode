@@ -460,6 +460,7 @@ testBuiltInCommandActionsUnchangedInFinalRegistry =
     Right reg ->
       let expected =
             [ ("new", CmdNew)
+            , ("compact", CmdCompact)
             , ("exit", CmdExit)
             , ("quit", CmdExit)
             , ("status", CmdStatus)

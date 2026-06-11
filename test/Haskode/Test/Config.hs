@@ -421,7 +421,7 @@ testContextGuardErrorText = do
   case result of
     Left ex -> do
       let errMsg = show ex
-      if "does not auto-truncate or summarize" `isInfixOf` errMsg
+      if "does not auto-truncate or auto-summarize" `isInfixOf` errMsg
         then pure $ Right ()
         else pure $ Left $ "Error text missing phrase: " ++ errMsg
     Right _ -> pure $ Left "Expected exception for over-limit"

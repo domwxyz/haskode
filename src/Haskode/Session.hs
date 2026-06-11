@@ -62,7 +62,7 @@ import System.Directory      (doesFileExist, getFileSize, renameFile)
 import System.FilePath       ((</>))
 
 import Haskode.Core          (Conversation,
-                              mkUserMessage, mkAssistantMessage)
+                              mkUserMessage, mkAssistantMessage, mkSystemMessage)
 
 -- ---------------------------------------------------------------------------
 -- Events
@@ -78,6 +78,8 @@ data EventType
   | ESessionStart
   | ESessionEnd
   | EConversationReset
+  | EConversationCompacted
+  | ERunLimitReached
   deriving stock (Show, Eq, Ord, Enum, Bounded)
 
 instance ToJSON EventType where
@@ -89,6 +91,8 @@ instance ToJSON EventType where
   toJSON ESessionStart       = String "session_start"
   toJSON ESessionEnd         = String "session_end"
   toJSON EConversationReset  = String "conversation_reset"
+  toJSON EConversationCompacted = String "conversation_compacted"
+  toJSON ERunLimitReached    = String "run_limit_reached"
 
 instance FromJSON EventType where
   parseJSON (String "user_message")    = pure EUserMessage
@@ -99,6 +103,8 @@ instance FromJSON EventType where
   parseJSON (String "session_start")       = pure ESessionStart
   parseJSON (String "session_end")         = pure ESessionEnd
   parseJSON (String "conversation_reset")  = pure EConversationReset
+  parseJSON (String "conversation_compacted") = pure EConversationCompacted
+  parseJSON (String "run_limit_reached")   = pure ERunLimitReached
   parseJSON other                      = fail $ "unknown EventType: " ++ show other
 
 -- | A single session event.
@@ -157,6 +163,8 @@ isMeaningfulSession = any isContentEvent . events
       ESessionStart      -> False
       ESessionEnd        -> False
       EConversationReset -> False
+      EConversationCompacted -> True
+      ERunLimitReached   -> True
 
 -- ---------------------------------------------------------------------------
 -- Persistence
@@ -294,6 +302,8 @@ formatSessionSummary ss =
         , (ESessionStart,      "session_start")
         , (ESessionEnd,        "session_end")
         , (EConversationReset, "conversation_reset")
+        , (EConversationCompacted, "conversation_compacted")
+        , (ERunLimitReached,   "run_limit_reached")
         ]
       fmtTypeCount (ety, label) =
         let n = Map.findWithDefault 0 ety (ssTypeCounts ss)
@@ -321,6 +331,7 @@ data ResumeResult = ResumeResult
   , rrParsedValid        :: !Int            -- ^ Total valid events parsed (all types)
   , rrSkipped            :: !Int            -- ^ Valid events skipped (tool, policy, lifecycle types)
   , rrUsedResetBoundary  :: !Bool           -- ^ True if a conversation_reset boundary was found
+  , rrUsedCompactionBoundary :: !Bool       -- ^ True if a conversation_compacted boundary was found
   , rrMessageCount       :: !Int            -- ^ Safe text messages in the resume context (after reset filter)
   } deriving stock (Show)
 
@@ -353,7 +364,9 @@ loadResumeEvents dir = do
                 ]
               -- Keep only events that can contribute to text resume context.
               -- Include EConversationReset so the converter can apply the
-              -- last-reset boundary correctly.
+              -- last-reset boundary correctly. Include EConversationCompacted
+              -- so resume can discard pre-compaction text and keep only the
+              -- compact memory.
               resumeContextEvents = filter isResumeContextEvent goodEvents
               malCount  = length badLines
               validCount = length goodEvents
@@ -362,6 +375,7 @@ loadResumeEvents dir = do
               -- (lifecycle, tool, and policy events are completely ignored).
               skippedCount = validCount - resumeContextEventCount
               hasReset = any (\ev -> evType ev == EConversationReset) goodEvents
+              hasCompaction = any (\ev -> evType ev == EConversationCompacted) goodEvents
               -- Count only actual conversation messages (not reset markers)
               messageEventCount = length
                 [ ev | ev <- resumeContextEvents
@@ -375,16 +389,22 @@ loadResumeEvents dir = do
             , rrParsedValid       = validCount
             , rrSkipped           = skippedCount
             , rrUsedResetBoundary = hasReset
+            , rrUsedCompactionBoundary = hasCompaction
             , rrMessageCount      = length conv
             }
   where
-    -- | Phase zero: user messages, assistant replies, and conversation
-    --   reset boundaries contribute to resume context.  Tool calls, tool
-    --   results, policy decisions, and lifecycle events are intentionally
-    --   skipped rather than replayed or restored.
+    -- | Phase zero: user messages, assistant replies, conversation reset
+    --   boundaries, and accepted compaction memories contribute to resume
+    --   context. Tool calls, tool results, policy decisions, and lifecycle
+    --   events are intentionally skipped rather than replayed or restored.
     isResumeContextEvent :: Event -> Bool
     isResumeContextEvent ev =
-      evType ev `elem` [EUserMessage, EAssistantReply, EConversationReset]
+      evType ev `elem`
+        [ EUserMessage
+        , EAssistantReply
+        , EConversationReset
+        , EConversationCompacted
+        ]
 
 -- | Convert resume-context events into safe text 'Conversation' messages.
 --
@@ -393,6 +413,9 @@ loadResumeEvents dir = do
 --     summary text that was recorded in the event data)
 --   * @EConversationReset@ clears the conversation (loads only events
 --     after the last reset)
+--   * @EConversationCompacted@ replaces the conversation with one safe
+--     system-memory message, so old pre-compaction messages do not resume
+--     as live context.
 --
 --   Events appear in the order provided (expected: chronological).
 resumeContextEventsToConversation :: [Event] -> Conversation
@@ -407,6 +430,8 @@ resumeContextEventsToConversation = foldl step []
       EConversationReset ->
         -- Clear conversation on reset; resume from this point forward
         []
+      EConversationCompacted ->
+        [mkSystemMessage ("Compacted conversation memory:\n\n" <> evData ev)]
       _ -> msgs
 
 -- | Format a concise resume summary for terminal output.
@@ -424,4 +449,5 @@ formatResumeSummary logPath rr =
     , "Skipped:        " <> T.pack (show (rrSkipped rr))
     , "Malformed:      " <> T.pack (show (rrMalformed rr))
     , "Reset boundary: " <> (if rrUsedResetBoundary rr then "yes" else "no")
+    , "Compact boundary: " <> (if rrUsedCompactionBoundary rr then "yes" else "no")
     ]

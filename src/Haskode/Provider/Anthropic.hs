@@ -77,7 +77,7 @@ import Haskode.Config           (Config (..), ProviderConfig (..))
 import Haskode.Core             (Message (..), Role (..), ToolCall (..))
 import Haskode.Provider         (CompletionRequest (..),
                                  CompletionResponse (..), Provider (..),
-                                 StreamHandler (..))
+                                 StreamHandler (..), ToolMode (..))
 import Haskode.Tools            (Tool (..), ToolRegistry, lookupTool,
                                  toolNames)
 
@@ -139,12 +139,12 @@ anthropicProvider cfg reg = do
         { providerName = "anthropic"
         , providerComplete = \req -> do
             body <- either throwIO pure $
-              buildRequestBody (crMessages req) model' maxTok reg
+              buildRequestBody (crMessages req) model' maxTok reg (crToolMode req)
             respBody <- sendRequest mgr url (T.pack apiKey) body
             either throwIO pure (parseResponseBody respBody)
         , providerStream = Just $ \req handler -> do
             body <- either throwIO pure $
-              buildStreamingRequestBody (crMessages req) model' maxTok reg
+              buildStreamingRequestBody (crMessages req) model' maxTok reg (crToolMode req)
             sendRequestStreaming mgr url (T.pack apiKey) body handler
         }
 
@@ -272,9 +272,9 @@ processOneLine stateRef handler doneRef line =
 -- Haskode keeps system messages in the conversation.  Anthropic expects
 -- them in a top-level @system@ field, so 'systemMessagesToText' extracts
 -- and joins them while 'messagesToJSON' omits them from @messages@.
-buildRequestBody :: [Message] -> Text -> Int -> ToolRegistry
+buildRequestBody :: [Message] -> Text -> Int -> ToolRegistry -> ToolMode
                  -> Either AnthropicError LBS.ByteString
-buildRequestBody msgs model' maxTok reg = do
+buildRequestBody msgs model' maxTok reg mode = do
   validateMessages msgs
   Right $ encode $ object $
       [ "model"      .= model'
@@ -287,6 +287,7 @@ buildRequestBody msgs model' maxTok reg = do
       sys -> [ "system" .= sys ]
 
     toolsField
+      | mode == NoTools        = []
       | null (toolNames reg) = []
       | otherwise            = [ "tools" .= toolsToJSON reg ]
 
@@ -294,9 +295,9 @@ buildRequestBody msgs model' maxTok reg = do
 --
 -- This is the same Messages API shape as 'buildRequestBody' with
 -- @"stream": true@ added.
-buildStreamingRequestBody :: [Message] -> Text -> Int -> ToolRegistry
+buildStreamingRequestBody :: [Message] -> Text -> Int -> ToolRegistry -> ToolMode
                           -> Either AnthropicError LBS.ByteString
-buildStreamingRequestBody msgs model' maxTok reg = do
+buildStreamingRequestBody msgs model' maxTok reg mode = do
   validateMessages msgs
   Right $ encode $ object $
       [ "model"      .= model'
@@ -310,6 +311,7 @@ buildStreamingRequestBody msgs model' maxTok reg = do
       sys -> [ "system" .= sys ]
 
     toolsField
+      | mode == NoTools        = []
       | null (toolNames reg) = []
       | otherwise            = [ "tools" .= toolsToJSON reg ]
 
