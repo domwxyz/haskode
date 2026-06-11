@@ -837,54 +837,40 @@ is not implemented.
 
 ## Roadmap
 
-### Phase 0 — Scaffold (this commit)
-- [x] Project structure, Cabal build, test suite
-- [x] Core data types with JSON instances
-- [x] Config loading with defaults
-- [x] Provider interface + stub provider
-- [x] Tool registry + 3 built-in tools (stubs)
-- [x] Policy gate with default rules
-- [x] Session event log
-- [x] Patch manager with diff display
-- [x] Agent loop (single-turn, no tool execution)
-- [x] CLI with interactive + single-shot modes
+### 1.0 candidate scope
 
-### Phase 1 — Working agent
-- [x] OpenAI-compatible provider (real HTTP, non-streaming)
-- [x] Provider selection from config / CLI
-- [x] Helpful errors for missing API key / unknown provider
-- [x] Tool execution in the agent loop (multi-step)
-- [x] Native OpenAI tool_calls / tool message format and Anthropic tool_use / tool_result blocks
-- [x] System prompt construction with tool schemas
-- [x] Interactive policy confirmation (y/n prompts for shell)
-- [x] Shell output with section markers and truncation metadata
-- [x] `max_completion_tokens` for OpenAI, `max_tokens` for local providers
-- [x] Anthropic provider (Messages API)
-- [x] `write_file` tool with patch integration
-- [x] `search` / `glob` tools
+- [x] CLI-first coding loop
+- [x] OpenAI-compatible provider
+- [x] Anthropic provider
+- [x] Native provider tool calls
+- [x] Streaming text output
+- [x] Read/search/glob/list tools
+- [x] Shell tool with confirmation
+- [x] Patch/write tools with confirmation
+- [x] Session log, summary, and conservative resume
+- [x] Manual `/compact`
+- [x] Minimal experimental TUI
+- [x] Compiled extension seam
+- [ ] Minimal `/delegate` or explicitly defer it
+- [ ] Basic inspectability polish
+- [ ] Release docs: changelog, example config, security notes
 
-### Phase 2 — Usable daily driver
-- [x] Streaming token output
-- [/] Rich diff display: colored unified diffs (done), side-by-side (not yet)
-- [x] Session save/resume (phase zero: conservative, non-replaying)
-- [x] `.agentignore` file support (root-level, shared by `glob` and `search`)
-- [x] Read-only batch preview (`preview_patch_batch`)
-- [x] Multi-file patch apply (`apply_patch_batch`)
-- [x] Environment variable expansion in config
+### Post-1.0 candidates
 
-### Phase 3 — TUI & polish
-- [x] Brick-based terminal UI (minimal experimental `--tui` skeleton)
-- [x] Minimal TUI confirmation dialog for tool/policy approvals
-- [ ] Conversation history browsing
-- [ ] Tool call inspector
-- [ ] Config TUI editor
-- [x] Compiled extension support for custom tools, policy rules, and pure text commands
+- [ ] Read-only delegate mode
+- [ ] Conversation/session browsing
+- [ ] Tool-call inspector
+- [ ] Side-by-side diffs
+- [ ] Packaging polish
 
-### Phase 4 — Advanced
-- [ ] Multi-agent orchestration
-- [ ] Token counting and context window management
-- [ ] Fine-tuning data export from session logs
-- [ ] Local model integration (llama.cpp / GGUF)
+### Intentionally out of core
+
+- Runtime plugin marketplace
+- Autonomous agent swarm
+- Background job dashboard
+- Hidden vector memory
+- Full executable replay
+- IDE workspace manager
 
 ## Philosophy
 
